@@ -7,7 +7,13 @@ from credentials import HF_TOKEN
 import tools
 
 # Instructions file located alongside this module
-INSTRUCTIONS_FILE = Path(__file__).parent / "instructions.md"
+INSTRUCTIONS_FILE = Path(__file__).parent / "agent_instructions/instructions.md"
+
+# Reviewer file located alongside this module
+REVIEWER_FILE = Path(__file__).parent / "agent_instructions/reviewer.md"
+
+# Cleaner file located alongside this module
+CLEANER_FILE = Path(__file__).parent / "agent_instructions/cleaner.md"
 
 # Model configuration
 MODEL_NAME = "mlx-community/Meta-Llama-3.1-8B-Instruct-8bit"
@@ -21,18 +27,66 @@ tokenizer = None
 # Global flag indicating whether the LLM is currently running (True) or idle (False)
 llm_running = False
 
-def generate_response(user_message: str, max_tokens: int = -1, loops: int = 2, verbose: bool = True) -> str:
+def generate_response(user_message: str, max_tokens: int = -1, max_loops: int = 3, verbose: bool = True) -> str:
 
-    messages = tools.get_conversation_history()
+    cleaned_output = ""
+    loops = 0
 
-    prompt = INSTRUCTIONS_FILE.read_text(encoding="utf-8") if INSTRUCTIONS_FILE.exists() else ""
-    prompt += f"\n\n{user_message}"
+    tools.append_history("user", user_message)
 
-    # Finally add the current user prompt as the latest user message
-    messages.append({"role": "user", "content": prompt})
+    while loops < max_loops:
+        messages = tools.get_conversation_history()
 
+        prompt = INSTRUCTIONS_FILE.read_text(encoding="utf-8") if INSTRUCTIONS_FILE.exists() else ""
+        prompt += f"\n\n{user_message}"
+
+        if loops > 0:
+            prompt += f"\n\nThe assistant's previous response was unsatisfactory. Please try again and provide a better response based on the conversation history and instructions. "
+
+        # Finally add the current user prompt as the latest user message
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            # Generate text from the model
+            text = _run_model(messages, max_tokens=max_tokens, verbose=verbose)
+
+            # Perform tool calls (search and code execution) on the generated text, which may append additional content to the result.
+            text += tools.search(text)
+            text += tools.run_python(text, verbose=verbose)
+
+            tools.append_history("llm", text)
+
+            # Build a chat-formatted review prompt: include the assistant's output
+            # and ask for a yes/no review using roles the model expects.
+            tools.append_history("user", REVIEWER_FILE.read_text(encoding="utf-8") if REVIEWER_FILE.exists() else "")
+            review = _run_model(tools.get_conversation_history(), max_tokens=-1, verbose=verbose)
+
+            tools.append_history("llm", review)
+
+            if "<yes>" in review.strip().lower():
+                break
+        except Exception as e:
+            # If any error occurs during generation or code execution, print it and return an error message.
+            print(f"\nError in generate_response: {e}")
+            text = f"Error in generate_response: {e}"
+            tools.append_history("llm", text)
+
+        loops += 1
+
+    cleaned_prompt = CLEANER_FILE.read_text(encoding="utf-8") if CLEANER_FILE.exists() else ""
+    cleaned_prompt += user_message
+    tools.append_history("user", cleaned_prompt)
+    cleaned_output = _run_model(tools.get_conversation_history(), max_tokens=-1, verbose=verbose).strip()
+    tools.append_history("llm", cleaned_output)
+
+    return cleaned_output
+
+def _run_model(messages, max_tokens: int = -1, verbose: bool = False) -> str:
     # Ensure model+tokenizer are loaded (lazy load on first call)
     global model, tokenizer, llm_running
+
+    text = ""
+
     # Mark LLM as running for the duration of this generation.
     llm_running = True
     print("Generating response... ")
@@ -45,39 +99,26 @@ def generate_response(user_message: str, max_tokens: int = -1, loops: int = 2, v
             os.environ.setdefault("HF_TOKEN", HF_TOKEN)
             model, tokenizer = load(MODEL_NAME)
 
-        # Make a sampler with temperature = 0.7 and min_p = 0.05 to balance creativity and coherence.
-        sampler = make_sampler(temp=0.25, top_p=0.9)
+        # Make a sampler with temperature = 0.5 for some randomness in generation (temperature=0.0 would be deterministic)
+        sampler = make_sampler(temp=0.5)
 
         # Apply the chat template to the messages, which formats them in a way the model expects.
         generation_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
         pieces = []
-        # Stream and print tokens as they're produced so the terminal shows progress
+        # Stream and collect tokens as they're produced so the terminal shows progress
         for response in stream_generate(model, tokenizer, generation_prompt, max_tokens=max_tokens, sampler=sampler):
-            text = response.text
-            if text:
+            text_piece = response.text
+            if text_piece:
                 if verbose:
-                    print(text, end="", flush=True)
-            pieces.append(text)
+                    print(text_piece, end="", flush=True)
+                pieces.append(text_piece)
 
-        full_text = "".join(pieces)
-
-        # Final cleanup: strip leading/trailing whitespace
-        result_text = full_text.strip()
-
-        # Perform tool calls (search and code execution) on the generated text, which may append additional content to the result.
-        result_text += tools.search(result_text)
-        result_text += tools.run_python(result_text, verbose=verbose)
-
-        # remove any tool calls from the final output before returning including the tags (e.g. <search>...</search>)
-        result_text = re.sub(r"<search>.*?</search>", "", result_text, flags=re.DOTALL | re.IGNORECASE)
-        result_text = re.sub(r"<think>.*?</think>", "", result_text, flags=re.DOTALL | re.IGNORECASE)
-    
-        return result_text
+        text = "".join(pieces).strip()
     except Exception as e:
-        # If any error occurs during generation or code execution, print it and return an error message.
-        print(f"\nError in generate_response: {e}")
-    finally:
-        # Always mark the LLM as not running when the function exits
-        llm_running = False
-        print("Finished generating... ")
+        print(f"\nError in _run_model: {e}")
+        return f"Error in model generation: {e}"
+    
+    llm_running = False
+    print("\nFinished generating.")
+    return text

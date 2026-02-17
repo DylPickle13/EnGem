@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import List, Dict
 from datetime import datetime, timezone
+from playwright.sync_api import Page, expect, sync_playwright
 
 # History file path (same directory as this module)
 HISTORY_FILE = Path(__file__).parent / "history.md"
@@ -157,3 +158,35 @@ def search(result_text: str) -> str:
 
     # Placeholder implementation - in a real implementation, this would call an API like Bing Search or Google Custom Search
     return f"\n\nSearch results for: {full_query}"
+
+if __name__ == "__main__":
+    with sync_playwright() as p:
+        browser = p.webkit.launch()
+        page = browser.new_page()
+        page.goto("https://playwright.dev/")
+        clickable_selector = """
+            a,
+            button,
+            input[type="button"],
+            input[type="submit"],
+            input[type="reset"],
+            [role="button"],
+            [onclick],
+            [tabindex]
+        """
+
+        elements = page.locator(clickable_selector)
+        count = elements.count()
+
+        print(f"\nFound {count} clickable elements:\n")
+
+        for i in range(count):
+            el = elements.nth(i)
+
+            text = el.inner_text().strip() if el.inner_text() else ""
+            tag = el.evaluate("el => el.tagName")
+            href = el.get_attribute("href")
+
+            print(f"{i+1}. <{tag}> Text: '{text}' Href: {href}")
+
+        browser.close()

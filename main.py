@@ -22,7 +22,6 @@ import contextlib
 WHISPER_MODEL = None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
     # Send response
     async def send_long_message(message_obj, text: str) -> None:
         try:
@@ -65,22 +64,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             # Log and store the error as the LLM response
             err_msg = f"Error generating response: {e}"
-            try:
-                await asyncio.to_thread(tools.append_history, "llm", err_msg)
-            except Exception:
-                pass
             await update.message.reply_text(err_msg)
             return
-
-        # Store the user prompt and the LLM reply (store once)
-        try:
-            await asyncio.to_thread(tools.append_history, "user", user_text)
-        except Exception:
-            pass
-        try:
-            await asyncio.to_thread(tools.append_history, "llm", llm_reply)
-        except Exception:
-            pass
 
         await send_long_message(update.message, llm_reply)
 
@@ -122,16 +107,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 typing_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await typing_task
-
-            # Store the transcription and the LLM response (store once)
-            try:
-                await asyncio.to_thread(tools.append_history, "user", transcription)
-            except Exception:
-                pass
-            try:
-                await asyncio.to_thread(tools.append_history, "llm", llm_reply)
-            except Exception:
-                pass
 
             await send_long_message(update.message, llm_reply)
 
