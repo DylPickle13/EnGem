@@ -1,55 +1,48 @@
-# Local LLM — Jarvis
+# JARVIS — Local Agent / Assistant
 
-A small local assistant that connects a streaming LLM to a Telegram bot and optional Whisper transcription. It wraps a local LLM loader, a simple toolset for executing and testing Python code blocks, and history tracking for conversational context.
+JARVIS is a compact local agent framework that connects a streaming LLM to a Telegram bot (with optional audio transcription and code-execution helpers). It's intended as a developer-focused starting point for building and testing LLM-powered assistants locally.
 
-**Key features:**
-- **Telegram bot interface:** message and voice handling via `main.py`.
-- **Streaming LLM integration:** model loading and generation in `llm.py` (uses `mlx-lm`).
-- **Audio transcription:** optional Whisper transcription for voice messages.
-- **Execution tools:** `tools.py` can extract and run Python code blocks and append outputs to responses.
-- **Conversation history:** `history.md` stores message history used as context by the LLM.
+**Quick Start**
 
-**Important:** this project contains a `credentials.py` file for convenience during local development. Do NOT commit real tokens to version control.
-
-**Quick start**
-
-Prerequisites:
-- Python 3.10+ recommended
-- Install dependencies:
+- **Requirements:** Python 3.10+ and a working virtual environment
+- Create and activate a venv, then install deps:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Configure credentials (one of the following):
-- Set environment variable `TELEGRAM_BOT_TOKEN` (recommended), or
-- Edit [credentials.py](credentials.py) to add your `TELEGRAM_BOT_TOKEN` and optionally `HF_TOKEN` for Hugging Face access.
+- Provide credentials (recommended: use environment variables):
+	- `TELEGRAM_BOT_TOKEN` — Telegram bot token for `main.py`
+	- Optionally `HF_TOKEN` or other provider tokens if configured
 
-Run the bot locally:
+- Run the agent locally:
 
 ```bash
 python main.py
 ```
 
-The bot runs in polling mode and will respond to text and voice messages sent to the configured Telegram bot.
+**Project Structure**
 
-**Files of interest**
-- [main.py](main.py) — entrypoint and Telegram handlers.
-- [llm.py](llm.py) — loads the model, composes prompts, and runs generation.
-- [tools.py](tools.py) — helper utilities: history management, code execution, and a placeholder search.
-- [history.md](history.md) — conversational history log used as context.
-- [agent_instructions/instructions.md](agent_instructions/instructions.md) — in-repo agent behavior and tool usage guidelines.
-- [credentials.py](credentials.py) — local credentials (do not commit secrets).
+- [main.py](main.py): Telegram handlers and the program entrypoint.
+- [llm.py](llm.py): LLM loader, prompt composition, and generation logic.
+- [tools.py](tools.py): Utility helpers (history management, code extraction/execution, search placeholders).
+- [credentials.py](credentials.py): Local credentials shim (keep out of VCS; prefer env vars).
+- [history.md](history.md): Message history used to build conversational context.
+- [agent_instructions/](agent_instructions/): Human-readable instruction files that shape agent behavior (e.g., [agent_instructions/instructions.md](agent_instructions/instructions.md)).
+- [sandbox/memory_system/memory_system.py](sandbox/memory_system/memory_system.py): Example memory subsystem.
 
-**Design notes & behavior**
-- `llm.generate_response()` composes prompts from `agent_instructions` and `history.md`, runs the model, invokes `tools.search()` and `tools.run_python()` on generated content, and runs a reviewer pass.
-- `tools.run_python()` extracts fenced Python blocks from model output and runs them in a temporary subprocess, appending captured stdout/stderr to the response.
-- The project uses lazy loading for heavyweight models (LLM + Whisper) to avoid allocating memory at import time.
+**How it works (high-level)**
 
-**Security & privacy**
-- Never commit `credentials.py` with real tokens. Prefer environment variables or a secure secrets manager.
-- `tools.run_python()` executes code blocks with the local Python interpreter — treat model-generated code as untrusted. Consider sandboxing or disabling code execution in untrusted environments.
+- Incoming messages are handled in `main.py` and converted into prompts.
+- `llm.py` composes prompts from `agent_instructions` + `history.md`, runs generation, and returns streamed output.
+- `tools.py` can post-process model output: run searches, extract fenced Python code, execute it locally, and append outputs to the reply.
 
-**Development & testing**
-- To iterate locally, run `python main.py` and send messages to the Telegram bot.
-- `tools.py` contains a `__main__` Playwright demo — only run it if you have Playwright installed and configured.
+Security note: code execution is performed with the local Python interpreter. Treat model-generated code as untrusted. Use sandboxing or disable `tools.run_python()` in risky environments.
+
+**Development Tips**
+
+- Prefer environment variables for tokens instead of editing `credentials.py`.
+- Use the virtual environment workflow above when iterating.
+- To add features: add new instruction files under `agent_instructions/`, implement helper functions in `tools.py`, or swap the LLM backend in `llm.py`.

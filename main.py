@@ -20,6 +20,32 @@ import contextlib
 
 # Whisper model will be loaded lazily on first audio/voice message
 WHISPER_MODEL = None
+# Minutes between periodic test prompts to the LLM. Change as needed.
+HEARTBEAT_LENGTH = 5
+# Prompt sent to the LLM on each heartbeat. Change as needed.
+HEARTBEAT_PROMPT = Path(__file__).parent / "agent_instructions/tasks.md"
+
+
+async def _heartbeat(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        prompt = None
+        try:
+            prompt = context.job.data
+        except Exception:
+            prompt = None
+
+        if not prompt:
+            prompt = HEARTBEAT_PROMPT
+
+        try:
+            tools.init_history()
+        except Exception as e:
+            logging.error(f"Failed to initialize history in heartbeat: {e}")
+            return
+
+        await asyncio.to_thread(llm.generate_response, prompt)
+    except Exception as e:
+        logging.error(f"Error in heartbeat job: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Send response
@@ -64,7 +90,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             # Log and store the error as the LLM response
             err_msg = f"Error generating response: {e}"
-            await update.message.reply_text(err_msg)
             return
 
         await send_long_message(update.message, llm_reply)
@@ -112,7 +137,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         except Exception as e:
             err_msg = f"Error processing audio: {e}"
-            await update.message.reply_text(err_msg)
 
 def main() -> None:
     token = TELEGRAM_BOT_TOKEN
@@ -131,6 +155,22 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_message))
 
     print("Jarvis is starting!")
+
+    # Flag to control whether the heartbeat job should run. Set to False to disable periodic prompts to the LLM.
+    run_heartbeat = False
+
+    if run_heartbeat:
+        # Register repeating job (first run after 10 seconds)
+        if getattr(app, "job_queue", None) is not None:
+            try:
+                app.job_queue.run_repeating(_heartbeat, interval=HEARTBEAT_LENGTH * 60, first=10, data=HEARTBEAT_PROMPT.read_text(encoding="utf-8") if HEARTBEAT_PROMPT.exists() else "")
+            except Exception as e:
+                logging.error(f"Failed to schedule periodic job: {e}")
+        else:
+            logging.warning(
+                "No JobQueue available; to enable scheduled jobs install python-telegram-bot with the job-queue extras: pip install \"python-telegram-bot[job-queue]\""
+            )
+
     try:
         tools.init_history()
     except Exception as e:

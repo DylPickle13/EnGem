@@ -77,6 +77,14 @@ def get_conversation_history() -> List[Dict[str, str]]:
     return messages
 
 
+def get_conversation_history_text() -> str:
+    """Get the conversation history as raw text."""
+    try:
+        return HISTORY_FILE.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
 def init_history() -> None:
     """Create or truncate the history file when the bot starts."""
     try:
@@ -164,29 +172,48 @@ if __name__ == "__main__":
         browser = p.webkit.launch()
         page = browser.new_page()
         page.goto("https://playwright.dev/")
-        clickable_selector = """
-            a,
-            button,
-            input[type="button"],
-            input[type="submit"],
-            input[type="reset"],
-            [role="button"],
-            [onclick],
-            [tabindex]
-        """
+        clickables = page.evaluate("""
+        () => {
+            function isVisible(el) {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return (
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    style.visibility !== "hidden" &&
+                    style.display !== "none" &&
+                    !el.disabled
+                );
+            }
 
-        elements = page.locator(clickable_selector)
-        count = elements.count()
+            function getSelector(el) {
+                if (el.id) return `#${el.id}`;
+                if (el.name) return `${el.tagName.toLowerCase()}[name="${el.name}"]`;
+                return el.tagName.toLowerCase();
+            }
 
-        print(f"\nFound {count} clickable elements:\n")
+            const selector = `
+                a,
+                button,
+                input[type="button"],
+                input[type="submit"],
+                input[type="reset"],
+                [role="button"],
+                [onclick],
+                [tabindex]
+            `;
 
-        for i in range(count):
-            el = elements.nth(i)
+            return Array.from(document.querySelectorAll(selector))
+                .filter(isVisible)
+                .map((el, index) => ({
+                    index: index,
+                    tag: el.tagName.toLowerCase(),
+                    text: el.innerText?.trim() || el.value || "",
+                    ariaLabel: el.getAttribute("aria-label"),
+                    href: el.href || null,
+                    selector: getSelector(el)
+                }));
+        }
+        """)
 
-            text = el.inner_text().strip() if el.inner_text() else ""
-            tag = el.evaluate("el => el.tagName")
-            href = el.get_attribute("href")
-
-            print(f"{i+1}. <{tag}> Text: '{text}' Href: {href}")
-
-        browser.close()
+        print(clickables)
