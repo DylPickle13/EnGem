@@ -81,24 +81,3 @@ def archive_history() -> None:
     except Exception:
         # Swallow errors to avoid breaking the flow
         pass
-
-
-def parse_execution_order(execution_order_data: dict) -> dict:
-    """Parse execution_order.json data into a dictionary keyed by task name."""
-    sub_agents = execution_order_data.get("sub_agents", [])
-    if not isinstance(sub_agents, list):
-        return {}
-
-    execution_order_dict = {}
-    for item in sub_agents:
-        if not isinstance(item, dict):
-            continue
-        task_name = item.get("task_name")
-        if not task_name:
-            continue
-        execution_order_dict[task_name] = {
-            "instruction": item.get("instruction", ""),
-            "tool": item.get("tool", ""),
-            "expected_output": item.get("expected_output", ""),
-        }
-    return execution_order_dict

@@ -12,6 +12,9 @@ MANAGER_FILE = Path(__file__).parent / "agent_instructions/manager.md"
 # Followup file located alongside this module
 FOLLOWUP_FILE = Path(__file__).parent / "agent_instructions/followup.md"
 
+# Sub-agent file located alongside this module
+SUB_AGENT_FILE = Path(__file__).parent / "agent_instructions/sub_agent.md"
+
 # Reviewer file located alongside this module
 REVIEWER_FILE = Path(__file__).parent / "agent_instructions/reviewer.md"
 
@@ -21,7 +24,7 @@ TEXTER_FILE = Path(__file__).parent / "agent_instructions/texter.md"
 # Execution order file path
 EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
 
-model = "gemini-3.1-pro-preview"  # Specify the model to use for generating responses
+model = "gemini-2.5-pro"  # Specify the model to use for generating responses
 
 # Global flag indicating whether the LLM is currently running (True) or idle (False)
 llm_running = False
@@ -33,36 +36,72 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
     llm_running = True
     exit_string = ""
     tools.append_history(role="user", text=user_message)
+    print("User message appended to history. Starting response generation...")
 
-    while exit_string != "<yes>":
+    while True:
         # clear the 'sub-agents/execution_order.json' file at the start of each loop iteration
         if EXECUTION_ORDER_FILE.exists():
-            EXECUTION_ORDER_FILE.unlink()
+            try:
+                EXECUTION_ORDER_FILE.unlink()
+                print("Cleared existing execution order file.")
+            except Exception as e:
+                print(f"Warning: could not clear execution order file: {e}")
 
         # Get the manager's response based on the conversation history and the new user message
-        manager_response = _run_model_api(user_message, tools.get_conversation_history() + MANAGER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+        print("Getting manager response...")
+        try:
+            manager_response = _run_model_api(user_message, tools.get_conversation_history() + MANAGER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+        except Exception as e:
+            err_msg = f"Error generating manager response: {e}"
+            print(err_msg)
+            return err_msg
 
         # Check for the file 'sub-agents/execution_order.json' to determine if the manager has issued an execution order
-        if EXECUTION_ORDER_FILE.exists():
-            tools.append_history(role="llm", text=manager_response)
+        tools.append_history(role="Manager", text=manager_response)
 
-            # read the execution order from the .json file
-            with EXECUTION_ORDER_FILE.open("r", encoding="utf-8") as f:
-                execution_order_dict = tools.parse_execution_order(json.load(f))
-            for task_name, task_info in execution_order_dict.items():
-                sub_agent_response = _run_model_api(task_info["instruction"], system_instructions="You are the " + task_name + "sub-agent. ", model=model, verbose=verbose)
-                tools.append_history(role="llm", text=sub_agent_response)
-
-        else:
-            exit_string = ""
+        # read the execution order from the .json file
+        if not EXECUTION_ORDER_FILE.exists():
+            print("No execution order file found. Assuming manager has completed their response.")
             continue
+        else:
+            try:
+                with EXECUTION_ORDER_FILE.open("r", encoding="utf-8") as f:
+                    execution_order_dict = json.load(f)
+            except Exception as e:
+                err_msg = f"Error reading execution order file: {e}"
+                print(err_msg)
+                return err_msg
 
-        print("Revewing")
-        exit_string = _run_model_api(tools.get_conversation_history(), REVIEWER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
-        tools.append_history(role="llm", text=exit_string)
+        for agent in execution_order_dict['sub_agents']:
+            try:
+                print(f"Running sub-agent '{agent['task_name']}'")
+                sub_agent_response = _run_model_api(agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), model=model, verbose=verbose)
+            except Exception as e:
+                err_msg = f"Error generating response for sub-agent '{agent['task_name']}': {e}"
+                print(err_msg)
+                sub_agent_response = err_msg
+            tools.append_history(role=agent['task_name'], text=sub_agent_response)
 
-    text_response = _run_model_api(tools.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
-    tools.append_history(role="llm", text=text_response)
+        print("Getting reviewer response...")
+        try:
+            exit_string = _run_model_api(tools.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+        except Exception as e:
+            err_msg = f"Error generating reviewer response: {e}"
+            print(err_msg)
+            return err_msg
+        tools.append_history(role="Reviewer", text=exit_string)
+        if exit_string == "<yes>":
+            print("Review complete. User's request has been fulfilled.")
+            break
+
+    print("Generating final response for the user...")
+    try:
+        text_response = _run_model_api(tools.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+    except Exception as e:
+        err_msg = f"Error generating final response: {e}"
+        print(err_msg)
+        return err_msg
+    tools.append_history(role="Texter", text=text_response)
     tools.archive_history()
     llm_running = False
     return text_response
@@ -84,7 +123,6 @@ def _run_google_search(query: str) -> str:
         contents=query,
         config=config,
     )
-    print("Used Google Search tool with query:", query)
     return response.candidates[0].content.parts[0].text or ""
 
 
@@ -120,6 +158,7 @@ def _run_model_api(text: str, system_instructions: str, model: str, verbose: boo
                     function_output += _run_google_search(part.function_call.args['query'])
 
     output = ""
+    follow_up_response = ""
 
     if function_output == "":
         output = response.text or ""
@@ -128,14 +167,28 @@ def _run_model_api(text: str, system_instructions: str, model: str, verbose: boo
             system_instruction=FOLLOWUP_FILE.read_text(encoding="utf-8")
         )
 
-        print("Running follow-up Gemini API call...")
-        followup_response = client.models.generate_content(
+        if verbose:
+            print("Running follow-up Gemini API call...")
+        follow_up_response = client.models.generate_content(
             model=model,
             config=config,
             contents=text + "\n\nTool output:\n\n" + function_output,
         )
-    output = function_output + "\n\n" + (followup_response.text or "")
+        output = function_output + "\n\n" + (follow_up_response.text or "")
     if verbose:
-        print(output)
         print("Gemini API call complete.")
     return output
+
+
+if __name__ == "__main__":
+    # open the sub-agents/execution_order.json file and print its contents (for debugging)
+    if EXECUTION_ORDER_FILE.exists():
+        try:
+            with EXECUTION_ORDER_FILE.open("r", encoding="utf-8") as f:
+                execution_order_dict = json.load(f)
+        except Exception as e:
+            print(f"Error reading execution order file: {e}")
+        
+        for agent in execution_order_dict['sub_agents']:
+            print(f"Agent name: {agent['task_name']}")
+            print(f"Agent instruction: {agent['instruction']}")
