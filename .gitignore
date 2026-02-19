@@ -1,6 +1,6 @@
 /.venv
 /__pycache__
 /credentials.py
-/history.md
-/agent_instructions
 /sandbox
+/memory
+/sub-agents

@@ -1,0 +1,1 @@
+Review the conversation history, and determine whether or not the users' last request has been correctly fulfilled. If it has, respond with "<yes>". If it has not, and provide a brief explanation of what is missing or incorrect in the response.
