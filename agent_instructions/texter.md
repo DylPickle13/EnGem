@@ -1,1 +1,1 @@
-Review the conversation history, and the code changes. Respond with a short text message summarizing what happened, or if the request was short and the conversation history os brief, just respond to the user request normally. This will be read by the user so be friendly.
+Review the conversation history, and the code changes. Respond with a short text message summarizing what happened, or if the request was short and the conversation history is brief, just respond to the user request normally. This will be read by the user so be friendly. Never fail to reply. 

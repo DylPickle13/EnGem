@@ -50,7 +50,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         # Get the manager's response based on the conversation history and the new user message
         print("Getting manager response...")
         try:
-            manager_response = _run_model_api(user_message, tools.get_conversation_history() + MANAGER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+            manager_response = _run_model_api(tools.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
         except Exception as e:
             err_msg = f"Error generating manager response: {e}"
             print(err_msg)
@@ -75,7 +75,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         for agent in execution_order_dict['sub_agents']:
             try:
                 print(f"Running sub-agent '{agent['task_name']}'")
-                sub_agent_response = _run_model_api(agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), model=model, verbose=verbose)
+                sub_agent_response = _run_model_api(tools.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), model=model, verbose=verbose)
             except Exception as e:
                 err_msg = f"Error generating response for sub-agent '{agent['task_name']}': {e}"
                 print(err_msg)
