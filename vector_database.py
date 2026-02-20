@@ -2,13 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
+import math
 from pathlib import Path
+import re
 from typing import Any
 from uuid import uuid4
 
 import chromadb
 from chromadb.api.models.Collection import Collection
+from chromadb.config import Settings
 from chromadb.utils import embedding_functions
+
+
+logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "vector_database"
@@ -50,7 +57,10 @@ class VectorMemoryStore:
 
         self.db_path = db_path
         self.collection_name = collection_name
-        self.client = chromadb.PersistentClient(path=str(db_path))
+        self.client = chromadb.PersistentClient(
+            path=str(db_path),
+            settings=Settings(anonymized_telemetry=False),
+        )
         self.embedding_function = embedding_function or _build_embedding_function()
         try:
             self.collection: Collection = self.client.get_or_create_collection(
@@ -78,40 +88,6 @@ class VectorMemoryStore:
         )
         return final_id
 
-    def write_memories(self, items: list[dict[str, Any]]) -> list[str]:
-        """Write multiple memory entries in one call.
-
-        Expected item format:
-        {
-            "text": "memory text",
-            "metadata": {"source": "chat"},  # optional
-            "id": "optional-custom-id"
-        }
-        """
-        if not items:
-            return []
-
-        ids: list[str] = []
-        documents: list[str] = []
-        metadatas: list[dict[str, Any]] = []
-
-        for item in items:
-            text = str(item.get("text", "")).strip()
-            if not text:
-                continue
-            memory_id = str(item.get("id") or uuid4())
-            metadata = dict(item.get("metadata") or {})
-            metadata.setdefault("created_at", datetime.now(timezone.utc).isoformat())
-
-            ids.append(memory_id)
-            documents.append(text)
-            metadatas.append(metadata)
-
-        if not ids:
-            return []
-
-        self.collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-        return ids
 
     def read_memory(self, memory_id: str) -> MemoryItem | None:
         """Read one memory by id."""
@@ -188,6 +164,74 @@ class VectorMemoryStore:
         self.collection.delete(ids=[memory_id])
         return True
 
+    def deduplicate_memories(
+        self,
+        similarity_threshold: float = 0.9999,
+    ) -> None:
+        """Remove semantic duplicates and keep the oldest memory."""
+        if not 0.0 <= similarity_threshold <= 1.0:
+            raise ValueError("similarity_threshold must be between 0.0 and 1.0")
+
+        memories = self.read_all_memories()
+        if not memories:
+            print(
+                "Dedup summary:",
+                "before=0",
+                "removed=0",
+                "kept=0",
+                f"threshold={similarity_threshold}",
+            )
+            return
+
+        def _created_at_value(item: MemoryItem) -> datetime:
+            raw_created_at = item.metadata.get("created_at")
+            if isinstance(raw_created_at, str):
+                normalized = raw_created_at.replace("Z", "+00:00")
+                try:
+                    parsed = datetime.fromisoformat(normalized)
+                    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pass
+            return datetime.max.replace(tzinfo=timezone.utc)
+
+        memories.sort(key=lambda item: (_created_at_value(item), item.memory_id))
+        embeddings: Any = self.embedding_function([item.text for item in memories])
+        if not isinstance(embeddings, list) or len(embeddings) != len(memories):
+            raise ValueError("Embedding function returned unexpected output")
+
+        def _cosine_similarity(a: list[float], b: list[float]) -> float:
+            dot = sum(x * y for x, y in zip(a, b))
+            norm_a = math.sqrt(sum(x * x for x in a))
+            norm_b = math.sqrt(sum(y * y for y in b))
+            if norm_a == 0.0 or norm_b == 0.0:
+                return 0.0
+            return dot / (norm_a * norm_b)
+
+        kept_indices: list[int] = []
+        removed_ids: list[str] = []
+        for index, memory in enumerate(memories):
+            is_duplicate = any(
+                _cosine_similarity(embeddings[index], embeddings[kept_index]) >= similarity_threshold
+                for kept_index in kept_indices
+            )
+            if is_duplicate:
+                removed_ids.append(memory.memory_id)
+            else:
+                kept_indices.append(index)
+
+        if removed_ids:
+            self.collection.delete(ids=removed_ids)
+
+        print(
+            "Dedup summary:",
+            f"before={len(memories)}",
+            f"removed={len(removed_ids)}",
+            f"kept={len(memories) - len(removed_ids)}",
+            f"threshold={similarity_threshold}",
+        )
+        if removed_ids:
+            print("Removed IDs:", ", ".join(removed_ids))
+
 
     def count(self) -> int:
         """Return number of items in the collection."""
@@ -200,9 +244,3 @@ def get_default_store() -> VectorMemoryStore:
         db_path=DEFAULT_DB_PATH,
         collection_name=DEFAULT_COLLECTION_NAME,
     )
-
-
-if __name__ == "__main__":
-    store = get_default_store()
-    print(f"Memory store initialized at {store.db_path} with collection '{store.collection_name}'")
-    print(f"Current memory count: {store.count()}")

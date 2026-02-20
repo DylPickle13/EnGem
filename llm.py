@@ -4,7 +4,10 @@ import os
 import json
 from pathlib import Path
 from credentials import GEMINI_API_KEY as GEMINI_API_KEY
-import tools
+import tools, vector_database
+
+# Memory Retriever file located alongside this module
+MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
 
 # Intent file located alongside this module
 INTENT_FILE = Path(__file__).parent / "agent_instructions/intent.md"
@@ -24,6 +27,9 @@ REVIEWER_FILE = Path(__file__).parent / "agent_instructions/reviewer.md"
 # Summarize file located alongside this module
 TEXTER_FILE = Path(__file__).parent / "agent_instructions/texter.md"
 
+# Memory Extractor file located alongside this module
+MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extractor.md"
+
 # Execution order file path
 EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
 
@@ -41,6 +47,18 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
     tools.append_history(role="user", text=user_message)
     print("User message appended to history. Starting response generation...")
 
+    relevant_memories = vector_database.get_default_store().search_memories(tools.get_conversation_history(), limit=5)
+    relevant_memories_text = "\n\n".join([f"Memory: {memory.text}\nMetadata: {json.dumps(memory.metadata)}" for memory in relevant_memories])
+    try:
+        memory_retriever_response = _run_model_api(tools.get_conversation_history() + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=False, verbose=verbose)
+        if memory_retriever_response.strip() != "<NO_RELEVANT_MEMORY>":
+            tools.append_history(role="MemoryRetriever", text=memory_retriever_response)
+            print("Memory retriever response generated and appended to history.")
+    except Exception as e:
+        err_msg = f"Error generating memory retriever response: {e}"
+        print(err_msg)
+        return err_msg
+
     try:
         intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=False, verbose=verbose)
     except Exception as e:
@@ -51,6 +69,13 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
     if intent_response != "<complex>":
         print("Intent classified as simple. Returning direct response.")
         tools.append_history(role="IntentClassifier", text=intent_response)
+        memory_extractor_response = _run_model_api(tools.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=False, verbose=verbose)
+        if memory_extractor_response.strip() != "<NO_MEMORY>":
+            print("Extracted memory from user message. Writing to vector database.")
+            try:
+                vector_database.get_default_store().write_memory(memory_extractor_response)
+            except Exception as e:
+                print(f"Error writing memory to vector database: {e}")
         return intent_response
 
     while True:
@@ -117,6 +142,13 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         print(err_msg)
         return err_msg
     tools.append_history(role="Texter", text=text_response)
+    memory_extractor_response = _run_model_api(tools.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=False, verbose=verbose)
+    if memory_extractor_response.strip() != "<NO_MEMORY>":
+        print("Extracted memory from sub-agent execution. Writing to vector database.")
+        try:
+            vector_database.get_default_store().write_memory(memory_extractor_response)
+        except Exception as e:
+            print(f"Error writing memory to vector database: {e}")
     llm_running = False
     return text_response
 

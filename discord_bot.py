@@ -11,22 +11,16 @@ import discord
 import tools
 import llm
 import whisper
-
-
-def _load_discord_token() -> Optional[str]:
-	token = os.getenv("DISCORD_BOT_TOKEN", DISCORD_BOT_TOKEN)
-	if token:
-		return token
+import vector_database
 
 
 class DiscordBotWrapper:
 	def __init__(
 		self,
-		token: Optional[str] = None,
 		responder: Optional[Callable[[str, discord.Message], Awaitable[str]]] = None,
 		command_prefix: str = "!",
 	) -> None:
-		self.token = token or _load_discord_token()
+		self.token = os.getenv("DISCORD_BOT_TOKEN", DISCORD_BOT_TOKEN)
 		self.command_prefix = command_prefix
 		self.allowed_channel = os.getenv("DISCORD_ALLOWED_CHANNEL", DISCORD_BOT_CHANNEL)
 		self.whisper_model = None

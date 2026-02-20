@@ -37,7 +37,7 @@ def get_conversation_history() -> str:
     try:
         return HISTORY_FILE.read_text(encoding="utf-8")
     except Exception:
-        return ""
+        return "No history available."
 
 
 def init_history() -> None:
@@ -47,8 +47,7 @@ def init_history() -> None:
         with HISTORY_FILE.open("w", encoding="utf-8") as f:
             f.write("")  # Start with an empty file
     except Exception:
-        # Don't crash if history file can't be initialized
-        pass
+        return "Failed to initialize history file."
 
 
 def append_history(role: str, text: str) -> None:
@@ -62,8 +61,7 @@ def append_history(role: str, text: str) -> None:
             f.write(f"## {ts} - {role}\n\n")
             f.write(text.rstrip() + "\n\n---\n\n")
     except Exception:
-        # Swallow file-write errors to avoid breaking the flow
-        pass
+        return "Failed to append to history file."
 
 def archive_history() -> None:
     """Archive history by copying into memory/conversations and renaming the copy."""
@@ -82,5 +80,4 @@ def archive_history() -> None:
             archive_name = archive_dir / f"history_{ts}.md"
             copied_file.rename(archive_name)
     except Exception:
-        # Swallow errors to avoid breaking the flow
-        pass
+        return "Failed to archive history file."
