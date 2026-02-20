@@ -42,7 +42,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
     print("User message appended to history. Starting response generation...")
 
     try:
-        intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+        intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=False, verbose=verbose)
     except Exception as e:
         err_msg = f"Error generating response: {e}"
         print(err_msg)
@@ -65,7 +65,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         # Get the manager's response based on the conversation history and the new user message
         print("Getting manager response...")
         try:
-            manager_response = _run_model_api(tools.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+            manager_response = _run_model_api(tools.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=True, verbose=verbose)
         except Exception as e:
             err_msg = f"Error generating manager response: {e}"
             print(err_msg)
@@ -90,7 +90,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         for agent in execution_order_dict['sub_agents']:
             try:
                 print(f"Running sub-agent '{agent['task_name']}'")
-                sub_agent_response = _run_model_api(tools.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), model=model, verbose=verbose)
+                sub_agent_response = _run_model_api(tools.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), model=model, tool_use_allowed=True, verbose=verbose)
             except Exception as e:
                 err_msg = f"Error generating response for sub-agent '{agent['task_name']}': {e}"
                 print(err_msg)
@@ -99,7 +99,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
 
         print("Getting reviewer response...")
         try:
-            exit_string = _run_model_api(tools.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+            exit_string = _run_model_api(tools.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=False, verbose=verbose)
         except Exception as e:
             err_msg = f"Error generating reviewer response: {e}"
             print(err_msg)
@@ -111,13 +111,12 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
 
     print("Generating final response for the user...")
     try:
-        text_response = _run_model_api(tools.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+        text_response = _run_model_api(tools.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=False, verbose=verbose)
     except Exception as e:
         err_msg = f"Error generating final response: {e}"
         print(err_msg)
         return err_msg
     tools.append_history(role="Texter", text=text_response)
-    tools.archive_history()
     llm_running = False
     return text_response
 
@@ -141,7 +140,7 @@ def _run_google_search(query: str) -> str:
     return response.candidates[0].content.parts[0].text or ""
 
 
-def _run_model_api(text: str, system_instructions: str, model: str, verbose: bool = True) -> str:
+def _run_model_api(text: str, system_instructions: str, model: str, tool_use_allowed: bool = True, verbose: bool = True) -> str:
     os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
 
     client = genai.Client()
@@ -150,7 +149,7 @@ def _run_model_api(text: str, system_instructions: str, model: str, verbose: boo
         types.FunctionDeclaration.from_callable(client=client, callable=_run_google_search)])
     config = types.GenerateContentConfig(
         system_instruction=system_instructions,
-        tools=[agent_tools]
+        tools=[agent_tools] if tool_use_allowed else []
         )
 
     function_output = ""

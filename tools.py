@@ -45,7 +45,7 @@ def init_history() -> None:
     try:
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with HISTORY_FILE.open("w", encoding="utf-8") as f:
-            f.write("# Conversation history\n\n")
+            f.write("")  # Start with an empty file
     except Exception:
         # Don't crash if history file can't be initialized
         pass
@@ -69,6 +69,9 @@ def archive_history() -> None:
     """Archive history by copying into memory/conversations and renaming the copy."""
     try:
         if HISTORY_FILE.exists():
+            if not HISTORY_FILE.read_text(encoding="utf-8").strip():
+                return
+
             archive_dir = Path(__file__).parent / "memory" / "conversations"
             archive_dir.mkdir(parents=True, exist_ok=True)
 

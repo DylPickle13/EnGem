@@ -132,5 +132,6 @@ class DiscordBotWrapper:
 
 
 if __name__ == "__main__":
+	tools.archive_history()
 	tools.init_history()
 	DiscordBotWrapper().run()
