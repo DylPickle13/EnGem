@@ -10,6 +10,7 @@ import skills.vector_database as vector_database
 import skills.run_python as run_python
 import skills.run_google_search as run_google_search
 import skills.git_push as git_push
+import skills.read_file as read_file
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -38,6 +39,9 @@ MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extra
 # Execution order file path
 EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
 
+# Tool list file located alongside this module
+TOOLS_LIST_FILE = Path(__file__).parent / "agent_instructions/tool_list.md"
+
 
 def generate_response(user_message: str, verbose: bool = True) -> str:
 
@@ -54,7 +58,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         print(f"Error generating memory retriever response: {e}")
 
     try:
-        intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
+        intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
     except Exception as e:
         print(f"Error generating intent response: {e}")
 
@@ -75,7 +79,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
 
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(tools.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
+            manager_response = _run_model_api(tools.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
         except Exception as e:
             print(f"Error generating manager response: {e}")
 
@@ -96,7 +100,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
 
         for agent in execution_order_dict['sub_agents']:
             try:
-                sub_agent_response = _run_model_api(tools.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
+                sub_agent_response = _run_model_api(tools.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
             except Exception as e:
                 print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
             tools.append_history(role=agent['task_name'], text=sub_agent_response)
@@ -134,6 +138,7 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
         types.FunctionDeclaration.from_callable(client=client, callable=run_python.run_python),
         types.FunctionDeclaration.from_callable(client=client, callable=run_google_search.run_google_search),
         types.FunctionDeclaration.from_callable(client=client, callable=git_push.commit_and_push),
+        types.FunctionDeclaration.from_callable(client=client, callable=read_file.read_file),
     ])
     config = types.GenerateContentConfig(
         system_instruction=system_instructions,
@@ -158,6 +163,8 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
                     function_output += run_google_search.run_google_search(part.function_call.args['query'])
                 if part.function_call.name == "commit_and_push":
                     function_output += git_push.commit_and_push(part.function_call.args['message'])
+                if part.function_call.name == "read_file":
+                    function_output += read_file.read_file(part.function_call.args['file_path'])
 
     output = ""
     follow_up_response = ""
