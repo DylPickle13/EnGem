@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
+import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -11,7 +12,7 @@ import chromadb
 from chromadb.api.models.Collection import Collection
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
-
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
@@ -117,6 +118,9 @@ class VectorMemoryStore:
         """Semantic search memories by query text."""
         if not query or not query.strip():
             return []
+        
+        if self.count() < limit:
+            return self.read_all_memories()
 
         result = self.collection.query(
             query_texts=[query.strip()],

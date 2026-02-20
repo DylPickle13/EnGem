@@ -43,7 +43,6 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
 
     exit_string = ""
     tools.append_history(role="user", text=user_message)
-    print("User message appended to history. Starting response generation...")
 
     relevant_memories = vector_database.get_default_store().search_memories(tools.get_conversation_history(), limit=5)
     relevant_memories_text = "\n\n".join([f"Memory: {memory.text}\nMetadata: {json.dumps(memory.metadata)}" for memory in relevant_memories])
@@ -51,29 +50,19 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         memory_retriever_response = _run_model_api(tools.get_conversation_history() + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
         if memory_retriever_response != "<NO_RELEVANT_MEMORIES>":
             tools.append_history(role="MemoryRetriever", text=memory_retriever_response)
-            print("Memory retriever response generated and appended to history.")
     except Exception as e:
-        err_msg = f"Error generating memory retriever response: {e}"
-        print(err_msg)
-        return err_msg
+        print(f"Error generating memory retriever response: {e}")
 
     try:
         intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
     except Exception as e:
-        err_msg = f"Error generating response: {e}"
-        print(err_msg)
-        return err_msg
+        print(f"Error generating intent response: {e}")
 
     if intent_response != "<complex>":
-        print("Intent classified as simple. Returning direct response.")
         tools.append_history(role="IntentClassifier", text=intent_response)
         memory_extractor_response = _run_model_api(tools.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
         if memory_extractor_response.strip() != "<NO_MEMORY>":
-            print("Extracted memory from user message. Writing to vector database.")
-            try:
-                vector_database.get_default_store().write_memory(memory_extractor_response)
-            except Exception as e:
-                print(f"Error writing memory to vector database: {e}")
+            vector_database.get_default_store().write_memory(memory_extractor_response)
         return intent_response
 
     while True:
@@ -81,72 +70,53 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         if EXECUTION_ORDER_FILE.exists():
             try:
                 EXECUTION_ORDER_FILE.unlink()
-                print("Cleared existing execution order file.")
             except Exception as e:
-                print(f"Warning: could not clear execution order file: {e}")
+                print(f"Error clearing execution order file: {e}")
 
         # Get the manager's response based on the conversation history and the new user message
-        print("Getting manager response...")
         try:
             manager_response = _run_model_api(tools.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
         except Exception as e:
-            err_msg = f"Error generating manager response: {e}"
-            print(err_msg)
-            return err_msg
+            print(f"Error generating manager response: {e}")
 
         # Check for the file 'sub-agents/execution_order.json' to determine if the manager has issued an execution order
         tools.append_history(role="Manager", text=manager_response)
 
         # read the execution order from the .json file
         if not EXECUTION_ORDER_FILE.exists():
-            print("No execution order file found. Assuming manager has completed their response.")
-            continue
+            print("No execution order file found. ")
+            break
         else:
             try:
                 with EXECUTION_ORDER_FILE.open("r", encoding="utf-8") as f:
                     execution_order_dict = json.load(f)
             except Exception as e:
-                err_msg = f"Error reading execution order file: {e}"
-                print(err_msg)
-                return err_msg
+                print(f"Error reading execution order file: {e}")
+                continue
 
         for agent in execution_order_dict['sub_agents']:
             try:
-                print(f"Running sub-agent '{agent['task_name']}'")
                 sub_agent_response = _run_model_api(tools.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
             except Exception as e:
-                err_msg = f"Error generating response for sub-agent '{agent['task_name']}': {e}"
-                print(err_msg)
-                sub_agent_response = err_msg
+                print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
             tools.append_history(role=agent['task_name'], text=sub_agent_response)
 
-        print("Getting reviewer response...")
         try:
             exit_string = _run_model_api(tools.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
         except Exception as e:
-            err_msg = f"Error generating reviewer response: {e}"
-            print(err_msg)
-            return err_msg
+            print(f"Error generating reviewer response: {e}")
         tools.append_history(role="Reviewer", text=exit_string)
         if exit_string == "<yes>":
-            print("Review complete. User's request has been fulfilled.")
             break
 
-    print("Generating final response for the user...")
     try:
         text_response = _run_model_api(tools.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
     except Exception as e:
-        err_msg = f"Error generating final response: {e}"
-        print(err_msg)
-        return err_msg
+        print(f"Error generating texter response: {e}")
     tools.append_history(role="Texter", text=text_response)
     memory_extractor_response = _run_model_api(tools.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
     if memory_extractor_response.strip() != "<NO_MEMORY>":
-        print("Extracted memory from sub-agent execution. Writing to vector database.")
-        try:
-            vector_database.get_default_store().write_memory(memory_extractor_response)
-        except Exception as e:
-            print(f"Error writing memory to vector database: {e}")
+        vector_database.get_default_store().write_memory(memory_extractor_response)
     return text_response
 
 
@@ -161,7 +131,6 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
 
     client = genai.Client()
     agent_tools = types.Tool(function_declarations=[
-        types.FunctionDeclaration.from_callable(client=client, callable=_run_model_api),
         types.FunctionDeclaration.from_callable(client=client, callable=run_python.run_python),
         types.FunctionDeclaration.from_callable(client=client, callable=run_google_search.run_google_search),
         types.FunctionDeclaration.from_callable(client=client, callable=git_push.commit_and_push),
@@ -182,8 +151,6 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
         for part in response.candidates[0].content.parts:
             if part.function_call:
-                if part.function_call.name == "_run_model_api":
-                    function_output += _run_model_api(part.function_call.args['text'], part.function_call.args['system_instructions'], part.function_call.args['tool_use_allowed'])
                 if part.function_call.name == "run_python":
                     function_output += part.function_call.args['code'] + "\nOutput:\n"
                     function_output += run_python.run_python(part.function_call.args['code'])
