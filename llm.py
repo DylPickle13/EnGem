@@ -6,6 +6,9 @@ from pathlib import Path
 from credentials import GEMINI_API_KEY as GEMINI_API_KEY
 import tools
 
+# Intent file located alongside this module
+INTENT_FILE = Path(__file__).parent / "agent_instructions/intent.md"
+
 # Manager file located alongside this module
 MANAGER_FILE = Path(__file__).parent / "agent_instructions/manager.md"
 
@@ -37,6 +40,18 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
     exit_string = ""
     tools.append_history(role="user", text=user_message)
     print("User message appended to history. Starting response generation...")
+
+    try:
+        intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8"), model, verbose=verbose)
+    except Exception as e:
+        err_msg = f"Error generating response: {e}"
+        print(err_msg)
+        return err_msg
+
+    if intent_response != "<complex>":
+        print("Intent classified as simple. Returning direct response.")
+        tools.append_history(role="IntentClassifier", text=intent_response)
+        return intent_response
 
     while True:
         # clear the 'sub-agents/execution_order.json' file at the start of each loop iteration
