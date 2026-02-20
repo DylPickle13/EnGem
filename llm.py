@@ -33,7 +33,7 @@ MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extra
 # Execution order file path
 EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
 
-model = "gemini-2.5-pro"  # Specify the model to use for generating responses
+model = "gemini-3.1-pro-preview"  # Specify the model to use for generating responses
 
 # Global flag indicating whether the LLM is currently running (True) or idle (False)
 llm_running = False

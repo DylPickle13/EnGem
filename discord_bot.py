@@ -11,7 +11,6 @@ import discord
 import tools
 import llm
 import whisper
-import vector_database
 
 
 class DiscordBotWrapper:

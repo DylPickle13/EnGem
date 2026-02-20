@@ -244,3 +244,7 @@ def get_default_store() -> VectorMemoryStore:
         db_path=DEFAULT_DB_PATH,
         collection_name=DEFAULT_COLLECTION_NAME,
     )
+
+if __name__ == "__main__":
+    store = get_default_store()
+    store.deduplicate_memories()
