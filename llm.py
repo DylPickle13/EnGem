@@ -167,6 +167,7 @@ def _run_model_api(text: str, system_instructions: str, model: str, tool_use_all
         for part in response.candidates[0].content.parts:
             if part.function_call:
                 if part.function_call.name == "run_python":
+                    function_output += part.function_call.args['code'] + "\nOutput:\n"
                     function_output += tools.run_python(part.function_call.args['code'])
                 if part.function_call.name == "_run_google_search":
                     function_output += _run_google_search(part.function_call.args['query'])
