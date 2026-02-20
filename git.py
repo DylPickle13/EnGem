@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-import argparse
 import importlib
 import os
 import sys
 from pathlib import Path
+
+DEFAULT_COMMIT_MESSAGE = os.getenv("DEFAULT_COMMIT_MESSAGE", "Update content")
+REPO_PATH = "/Users/jarvis/PICKLEBOT/DylPickle13.github.io"
+COMMIT_MESSAGE = DEFAULT_COMMIT_MESSAGE
+BRANCH = "master"
+REMOTE_NAME = "origin"
+SSH_KEY_PATH = os.getenv("DEPLOY_SSH_KEY", "~/.ssh/id_ed25519")
 
 
 def _load_gitpython():
@@ -67,48 +73,12 @@ def commit_and_push(
 
 	return f"Committed and pushed to {remote_name}/{branch}."
 
-
-def _build_parser() -> argparse.ArgumentParser:
-	parser = argparse.ArgumentParser(
-		description="Commit and push changes using GitPython and an optional SSH key."
-	)
-	parser.add_argument(
-		"--repo-path",
-		default=".",
-		help="Path to the local git repository (default: current directory).",
-	)
-	parser.add_argument(
-		"--message",
-		required=True,
-		help="Commit message.",
-	)
-	parser.add_argument(
-		"--branch",
-		default="main",
-		help="Branch to push to (default: main).",
-	)
-	parser.add_argument(
-		"--remote",
-		default="origin",
-		help="Remote name (default: origin).",
-	)
-	parser.add_argument(
-		"--ssh-key",
-		default=os.getenv("DEPLOY_SSH_KEY", "~/.ssh/id_ed25519"),
-		help="Path to SSH private key (default: DEPLOY_SSH_KEY or ~/.ssh/id_ed25519).",
-	)
-	return parser
-
-
 if __name__ == "__main__":
-	parser = _build_parser()
-	args = parser.parse_args()
-
 	result = commit_and_push(
-		repo_path=args.repo_path,
-		message=args.message,
-		branch=args.branch,
-		remote_name=args.remote,
-		ssh_key_path=args.ssh_key,
+		repo_path=REPO_PATH,
+		message=COMMIT_MESSAGE,
+		branch=BRANCH,
+		remote_name=REMOTE_NAME,
+		ssh_key_path=SSH_KEY_PATH,
 	)
 	print(result)
