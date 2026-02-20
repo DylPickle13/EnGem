@@ -119,7 +119,7 @@ class DiscordBotWrapper:
 
 		logging.basicConfig(
 			format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-			level=logging.INFO,
+			level=logging.WARNING,
 		)
 		self.client.run(self.token, log_level=logging.WARNING)
 
@@ -133,4 +133,5 @@ if __name__ == "__main__":
 		logging.info("Creating vector database...")
 		vector_database.get_default_store()
 
+	print("Starting PICKLEBOT...")
 	DiscordBotWrapper().run()
