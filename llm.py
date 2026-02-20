@@ -3,8 +3,13 @@ from google.genai import types
 import os
 import json
 from pathlib import Path
-from credentials import GEMINI_API_KEY as GEMINI_API_KEY
-import tools, vector_database
+from config import GEMINI_API_KEY as GEMINI_API_KEY
+from config import model as model
+import tools
+import skills.vector_database as vector_database
+import skills.run_python as run_python
+import skills.run_google_search as run_google_search
+import skills.git_push as git_push
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -32,8 +37,6 @@ MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extra
 
 # Execution order file path
 EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
-
-model = "gemini-3.1-pro-preview"  # Specify the model to use for generating responses
 
 # Global flag indicating whether the LLM is currently running (True) or idle (False)
 llm_running = False
@@ -152,33 +155,16 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
     llm_running = False
     return text_response
 
-def _run_google_search(query: str) -> str:
-    """Run a Google Search using the Gemini API's Google Search tool."""
-    os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
-
-    client = genai.Client()
-    grounding_tool = types.Tool(
-        google_search=types.GoogleSearch()
-    )
-    config = types.GenerateContentConfig(
-        tools=[grounding_tool]
-    )
-
-    response = client.models.generate_content(
-        model=model,
-        contents=query,
-        config=config,
-    )
-    return response.candidates[0].content.parts[0].text or ""
-
 
 def _run_model_api(text: str, system_instructions: str, model: str, tool_use_allowed: bool = True, verbose: bool = True) -> str:
     os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
 
     client = genai.Client()
     agent_tools = types.Tool(function_declarations=[
-        types.FunctionDeclaration.from_callable(client=client, callable=tools.run_python),
-        types.FunctionDeclaration.from_callable(client=client, callable=_run_google_search)])
+        types.FunctionDeclaration.from_callable(client=client, callable=run_python.run_python),
+        types.FunctionDeclaration.from_callable(client=client, callable=run_google_search.run_google_search),
+        types.FunctionDeclaration.from_callable(client=client, callable=git_push.commit_and_push),
+    ])
     config = types.GenerateContentConfig(
         system_instruction=system_instructions,
         tools=[agent_tools] if tool_use_allowed else []
@@ -200,9 +186,11 @@ def _run_model_api(text: str, system_instructions: str, model: str, tool_use_all
             if part.function_call:
                 if part.function_call.name == "run_python":
                     function_output += part.function_call.args['code'] + "\nOutput:\n"
-                    function_output += tools.run_python(part.function_call.args['code'])
-                if part.function_call.name == "_run_google_search":
-                    function_output += _run_google_search(part.function_call.args['query'])
+                    function_output += run_python.run_python(part.function_call.args['code'])
+                if part.function_call.name == "run_google_search":
+                    function_output += run_google_search.run_google_search(part.function_call.args['query'])
+                if part.function_call.name == "commit_and_push":
+                    function_output += git_push.commit_and_push(part.function_call.args['message'])
 
     output = ""
     follow_up_response = ""

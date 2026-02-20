@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
-import math
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -17,7 +16,7 @@ from chromadb.utils import embedding_functions
 logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parent / "vector_database"
+DEFAULT_DB_PATH = Path(__file__).parent.parent / "memory" / "vector_db"
 DEFAULT_COLLECTION_NAME = "picklebot_memory"
 
 
@@ -174,6 +173,3 @@ def get_default_store() -> VectorMemoryStore:
         db_path=DEFAULT_DB_PATH,
         collection_name=DEFAULT_COLLECTION_NAME,
     )
-
-if __name__ == "__main__":
-    store = get_default_store()

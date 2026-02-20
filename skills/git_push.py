@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import importlib
-import os
 import sys
 from pathlib import Path
+from config import SSH_KEY_PATH, REPO_PATH
 
-DEFAULT_COMMIT_MESSAGE = os.getenv("DEFAULT_COMMIT_MESSAGE", "Update content")
-REPO_PATH = "/Users/jarvis/PICKLEBOT/DylPickle13.github.io"
-COMMIT_MESSAGE = DEFAULT_COMMIT_MESSAGE
 BRANCH = "master"
 REMOTE_NAME = "origin"
-SSH_KEY_PATH = os.getenv("DEPLOY_SSH_KEY", "~/.ssh/id_ed25519")
+# SSH_KEY_PATH is provided by config.py (reads DEPLOY_SSH_KEY env var)
 
 
 def _load_gitpython():
@@ -31,15 +28,12 @@ def _load_gitpython():
 	return git_module.Repo, git_exc_module.GitCommandError
 
 
-def commit_and_push(
-	repo_path: str,
-	message: str,
-	branch: str = "main",
-	remote_name: str = "origin",
-	ssh_key_path: str | None = None,
-) -> str:
+def commit_and_push(message: str) -> str:
+	"""
+	Commit all changes in the repository with the given message and push to the remote.
+	"""
 	Repo, GitCommandError = _load_gitpython()
-	repo = Repo(repo_path)
+	repo = Repo(REPO_PATH)
 
 	if repo.bare:
 		raise ValueError("Repository is bare and cannot be committed/pushed.")
@@ -52,33 +46,23 @@ def commit_and_push(
 	repo.index.commit(message)
 
 	ssh_command = None
-	if ssh_key_path:
-		expanded_key_path = str(Path(ssh_key_path).expanduser().resolve())
+	if SSH_KEY_PATH:
+		expanded_key_path = str(Path(SSH_KEY_PATH).expanduser().resolve())
 		ssh_command = (
 			f"ssh -i {expanded_key_path} "
 			"-o IdentitiesOnly=yes "
 			"-o StrictHostKeyChecking=accept-new"
 		)
 
-	push_ref = f"HEAD:{branch}"
+	push_ref = f"HEAD:{BRANCH}"
 
 	try:
 		if ssh_command:
 			with repo.git.custom_environment(GIT_SSH_COMMAND=ssh_command):
-				repo.remote(remote_name).push(push_ref)
+				repo.remote(REMOTE_NAME).push(push_ref)
 		else:
-			repo.remote(remote_name).push(push_ref)
+			repo.remote(REMOTE_NAME).push(push_ref)
 	except GitCommandError as error:
 		raise RuntimeError(f"Push failed: {error}") from error
 
-	return f"Committed and pushed to {remote_name}/{branch}."
-
-if __name__ == "__main__":
-	result = commit_and_push(
-		repo_path=REPO_PATH,
-		message=COMMIT_MESSAGE,
-		branch=BRANCH,
-		remote_name=REMOTE_NAME,
-		ssh_key_path=SSH_KEY_PATH,
-	)
-	print(result)
+	return f"Committed and pushed to {REMOTE_NAME}/{BRANCH}."

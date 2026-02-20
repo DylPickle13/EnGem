@@ -1,8 +1,7 @@
 /.venv
 /__pycache__
-/credentials.py
-/sandbox
+config.py
 /memory
 /sub-agents
 /vector_database
-/DylPickle13.github.io
+/.vscode

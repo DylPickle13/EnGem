@@ -1,16 +1,16 @@
 import asyncio
 import logging
-import os
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
-from credentials import DISCORD_BOT_TOKEN as DISCORD_BOT_TOKEN, DISCORD_BOT_CHANNEL as DISCORD_BOT_CHANNEL
+from config import DISCORD_BOT_TOKEN as DISCORD_BOT_TOKEN, DISCORD_BOT_CHANNEL as DISCORD_BOT_CHANNEL
 
 import discord
 import tools
 import llm
-import whisper, vector_database
+import whisper
+import skills.vector_database as vector_database
 
 
 class DiscordBotWrapper:
@@ -19,9 +19,9 @@ class DiscordBotWrapper:
 		responder: Optional[Callable[[str, discord.Message], Awaitable[str]]] = None,
 		command_prefix: str = "!",
 	) -> None:
-		self.token = os.getenv("DISCORD_BOT_TOKEN", DISCORD_BOT_TOKEN)
+		self.token = DISCORD_BOT_TOKEN
 		self.command_prefix = command_prefix
-		self.allowed_channel = os.getenv("DISCORD_ALLOWED_CHANNEL", DISCORD_BOT_CHANNEL)
+		self.allowed_channel = DISCORD_BOT_CHANNEL
 		self.whisper_model = None
 
 		intents = discord.Intents.default()
