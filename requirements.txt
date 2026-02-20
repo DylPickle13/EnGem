@@ -4,3 +4,4 @@ discord.py==2.6.3
 torch==2.10.0
 chromadb==0.5.23
 sentence-transformers
+GitPython==3.1.43
