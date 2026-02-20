@@ -10,7 +10,7 @@ from credentials import DISCORD_BOT_TOKEN as DISCORD_BOT_TOKEN, DISCORD_BOT_CHAN
 import discord
 import tools
 import llm
-import whisper
+import whisper, vector_database
 
 
 class DiscordBotWrapper:
@@ -127,4 +127,10 @@ class DiscordBotWrapper:
 if __name__ == "__main__":
 	tools.archive_history()
 	tools.init_history()
+
+	# if vector_db is not there, create it
+	if not Path(vector_database.DEFAULT_DB_PATH).exists():
+		logging.info("Creating vector database...")
+		vector_database.get_default_store()
+
 	DiscordBotWrapper().run()

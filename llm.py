@@ -60,7 +60,7 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         return err_msg
 
     try:
-        intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=False, verbose=verbose)
+        intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8"), model, tool_use_allowed=True, verbose=verbose)
     except Exception as e:
         err_msg = f"Error generating response: {e}"
         print(err_msg)

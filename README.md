@@ -1,48 +1,60 @@
-# JARVIS — Local Agent / Assistant
+# PICKLEBOT
 
-JARVIS is a compact local agent framework that connects a streaming LLM to a Telegram bot (with optional audio transcription and code-execution helpers). It's intended as a developer-focused starting point for building and testing LLM-powered assistants locally.
+PICKLEBOT is a personal/local assistant framework that connects a streaming LLM to host-side tooling and a Discord bot interface. It's a developer-first codebase for experimenting with LLMs, vector memory, and lightweight sub-agents.
 
-**Quick Start**
+**Current project state (2026-02-20)**
 
-- **Requirements:** Python 3.10+ and a working virtual environment
-- Create and activate a venv, then install deps:
+- **Virtual environment:** `.venv` created at the repository root using Homebrew Python 3.12 (Python 3.12.12).
+- **Dependencies:** Installed from `requirements.txt` into the project venv. A full install was completed; pip may show a newer version available.
+- **Bot runtime:** `discord_bot.py` was started and logged in successfully as `PICKLEBOT#9572` during testing.
+- **Voice support:** `PyNaCl` was installed in the venv to satisfy `discord.py` voice dependencies (the previous warning about missing `PyNaCl` was resolved).
+
+**Quick Start / Repro steps**
+
+- Create (if needed) and activate the project virtualenv:
 
 ```bash
-python -m venv .venv
+# Use your preferred Python; this project uses Python 3.12
+/opt/homebrew/bin/python3.12 -m venv .venv
 source .venv/bin/activate
+```
+
+- Install dependencies (already done in this workspace):
+
+```bash
 pip install -r requirements.txt
 ```
 
-- Provide credentials (recommended: use environment variables):
-	- `TELEGRAM_BOT_TOKEN` — Telegram bot token for `main.py`
-	- Optionally `HF_TOKEN` or other provider tokens if configured
-
-- Run the agent locally:
+- Run the bot:
 
 ```bash
-python main.py
+source .venv/bin/activate
+python discord_bot.py
 ```
 
-**Project Structure**
+**Notes & tips**
 
-- [main.py](main.py): Telegram handlers and the program entrypoint.
-- [llm.py](llm.py): LLM loader, prompt composition, and generation logic.
-- [tools.py](tools.py): Utility helpers (history management, code extraction/execution, search placeholders).
-- [credentials.py](credentials.py): Local credentials shim (keep out of VCS; prefer env vars).
-- [history.md](history.md): Message history used to build conversational context.
-- [agent_instructions/](agent_instructions/): Human-readable instruction files that shape agent behavior (e.g., [agent_instructions/instructions.md](agent_instructions/instructions.md)).
-- [sandbox/memory_system/memory_system.py](sandbox/memory_system/memory_system.py): Example memory subsystem.
+- If your shell does not auto-activate the venv, run `source .venv/bin/activate` before running commands in this repo.
+- To recreate the venv with a specific Python version, remove `./.venv` then run the `python3.12 -m venv .venv` command above.
+- Pip suggested an update at the time of installing requirements; update with `pip install --upgrade pip` if desired.
 
-**How it works (high-level)**
+**Project layout (short)**
 
-- Incoming messages are handled in `main.py` and converted into prompts.
-- `llm.py` composes prompts from `agent_instructions` + `history.md`, runs generation, and returns streamed output.
-- `tools.py` can post-process model output: run searches, extract fenced Python code, execute it locally, and append outputs to the reply.
+- `discord_bot.py` — Discord bot entrypoint and handlers.
+- `llm.py` — LLM provider wiring and response composition.
+- `vector_database.py` and `vector_database/` — Chroma DB helpers and persistence.
+- `tools.py` — Local helper utilities used by agents.
+- `credentials.py` — Credentials shim (prefer environment variables).
 
-Security note: code execution is performed with the local Python interpreter. Treat model-generated code as untrusted. Use sandboxing or disable `tools.run_python()` in risky environments.
+**Data & persistence**
 
-**Development Tips**
+- The Chroma DB and related files live under `vector_database/` (e.g., `chroma.sqlite3`). Back these up if you need to preserve embeddings.
+- Conversation logs are under `memory/`.
 
-- Prefer environment variables for tokens instead of editing `credentials.py`.
-- Use the virtual environment workflow above when iterating.
-- To add features: add new instruction files under `agent_instructions/`, implement helper functions in `tools.py`, or swap the LLM backend in `llm.py`.
+**Next actions I can take**
+
+- Re-run `discord_bot.py` and confirm no startup warnings (including voice).  
+- Add a short VS Code dev setup note (auto-select `./.venv` interpreter).  
+- Add a `Makefile` or `dev` script to simplify venv creation and run commands.
+
+If you want any of the above, tell me which and I'll implement it.
