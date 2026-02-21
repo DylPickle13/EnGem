@@ -101,9 +101,9 @@ def generate_response(user_message: str, verbose: bool = True) -> str:
         for agent in execution_order_dict['sub_agents']:
             try:
                 sub_agent_response = _run_model_api(tools.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
+                tools.append_history(role=agent['task_name'], text=sub_agent_response)
             except Exception as e:
                 print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
-            tools.append_history(role=agent['task_name'], text=sub_agent_response)
 
         try:
             exit_string = _run_model_api(tools.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
@@ -137,8 +137,7 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     agent_tools = types.Tool(function_declarations=[
         types.FunctionDeclaration.from_callable(client=client, callable=run_python.run_python),
         types.FunctionDeclaration.from_callable(client=client, callable=run_google_search.run_google_search),
-        types.FunctionDeclaration.from_callable(client=client, callable=git_push.commit_and_push),
-        types.FunctionDeclaration.from_callable(client=client, callable=read_file.read_file),
+        types.FunctionDeclaration.from_callable(client=client, callable=git_push.commit_and_push)
     ])
     config = types.GenerateContentConfig(
         system_instruction=system_instructions,
@@ -157,14 +156,14 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
         for part in response.candidates[0].content.parts:
             if part.function_call:
                 if part.function_call.name == "run_python":
-                    function_output += part.function_call.args['code'] + "\nOutput:\n"
+                    function_output += part.function_call.args['code'] + part.function_call.name + " output:\n"
                     function_output += run_python.run_python(part.function_call.args['code'])
                 if part.function_call.name == "run_google_search":
+                    function_output += part.function_call.name + " output:\n"
                     function_output += run_google_search.run_google_search(part.function_call.args['query'])
                 if part.function_call.name == "commit_and_push":
+                    function_output += part.function_call.name + " output:\n"
                     function_output += git_push.commit_and_push(part.function_call.args['message'])
-                if part.function_call.name == "read_file":
-                    function_output += read_file.read_file(part.function_call.args['file_path'])
 
     output = ""
     follow_up_response = ""
