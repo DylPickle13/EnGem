@@ -28,7 +28,7 @@ def _load_gitpython():
 	return git_module.Repo, git_exc_module.GitCommandError
 
 
-def commit_and_push(message: str) -> str:
+def git_push(message: str) -> str:
 	"""
 	Commit all changes in the repository with the given message and push to the remote.
 	"""

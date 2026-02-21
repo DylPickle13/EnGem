@@ -142,7 +142,7 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     agent_tools = types.Tool(function_declarations=[
         types.FunctionDeclaration.from_callable(client=client, callable=run_python.run_python),
         types.FunctionDeclaration.from_callable(client=client, callable=run_google_search.run_google_search),
-        types.FunctionDeclaration.from_callable(client=client, callable=git_push.commit_and_push)
+        types.FunctionDeclaration.from_callable(client=client, callable=git_push.git_push)
     ])
     config = types.GenerateContentConfig(
         system_instruction=system_instructions,
@@ -161,14 +161,11 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
         for part in response.candidates[0].content.parts:
             if part.function_call:
                 if part.function_call.name == "run_python":
-                    function_output += part.function_call.args['code'] + part.function_call.name + " output:\n"
                     function_output += run_python.run_python(part.function_call.args['code'])
                 if part.function_call.name == "run_google_search":
-                    function_output += part.function_call.name + " output:\n"
                     function_output += run_google_search.run_google_search(part.function_call.args['query'])
-                if part.function_call.name == "commit_and_push":
-                    function_output += part.function_call.name + " output:\n"
-                    function_output += git_push.commit_and_push(part.function_call.args['message'])
+                if part.function_call.name == "git_push":
+                    function_output += git_push.git_push(part.function_call.args['message'])
 
     output = ""
     follow_up_response = ""

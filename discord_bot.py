@@ -4,12 +4,13 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
+
 from config import (
-	DISCORD_BOT_TOKEN as DISCORD_BOT_TOKEN,
-	DISCORD_BOT_CHANNEL as DISCORD_BOT_CHANNEL,
-	DISCORD_UPDATES_CHANNEL as DISCORD_UPDATES_CHANNEL,
-	DISCORD_UPDATES_ENABLED as DISCORD_UPDATES_ENABLED,
-	DISCORD_UPDATES_INTERVAL_SECONDS as DISCORD_UPDATES_INTERVAL_SECONDS,
+	DISCORD_BOT_CHANNEL,
+	DISCORD_BOT_TOKEN,
+	DISCORD_UPDATES_CHANNEL,
+	DISCORD_UPDATES_ENABLED,
+	DISCORD_UPDATES_INTERVAL_SECONDS,
 )
 
 import discord
@@ -20,6 +21,8 @@ import skills.vector_database as vector_database
 
 # Tasker file located alongside this module
 TASKER_FILE = Path(__file__).parent / "agent_instructions/tasker.md"
+DISCORD_MESSAGE_LIMIT = 2000
+DEFAULT_UPDATES_INTERVAL_SECONDS = 86400.0
 
 
 class DiscordBotWrapper:
@@ -52,9 +55,23 @@ class DiscordBotWrapper:
 		return await asyncio.to_thread(llm.generate_response, text)
 
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
-		max_len = 2000
-		for start in range(0, len(text), max_len):
-			await channel.send(text[start : start + max_len])
+		for start in range(0, len(text), DISCORD_MESSAGE_LIMIT):
+			await channel.send(text[start : start + DISCORD_MESSAGE_LIMIT])
+
+	@staticmethod
+	def _to_bool(value: object) -> bool:
+		return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+	@staticmethod
+	def _build_prompt(content: str, attachment_text: str) -> str:
+		if not content:
+			return attachment_text
+		return f"{content}\n\n{attachment_text}".strip()
+
+	async def _respond_and_send(self, channel: discord.abc.Messageable, prompt: str, message: discord.Message) -> None:
+		async with channel.typing():
+			reply = await self.responder(prompt, message)
+		await self._send_long_message(channel, reply)
 
 	async def _get_whisper_model(self):
 		if self.whisper_model is None:
@@ -89,21 +106,23 @@ class DiscordBotWrapper:
 			interval_seconds = float(self.updates_interval_seconds)
 		except (ValueError, TypeError):
 			logging.warning(
-				"Invalid DISCORD_UPDATES_INTERVAL_SECONDS '%s'; defaulting to 86400",
+				"Invalid DISCORD_UPDATES_INTERVAL_SECONDS '%s'; defaulting to %s",
 				self.updates_interval_seconds,
+				int(DEFAULT_UPDATES_INTERVAL_SECONDS),
 			)
-			interval_seconds = 86400.0
+			interval_seconds = DEFAULT_UPDATES_INTERVAL_SECONDS
 
 		if interval_seconds <= 0:
 			logging.warning(
-				"DISCORD_UPDATES_INTERVAL_SECONDS must be > 0; defaulting to 86400"
+				"DISCORD_UPDATES_INTERVAL_SECONDS must be > 0; defaulting to %s",
+				int(DEFAULT_UPDATES_INTERVAL_SECONDS),
 			)
-			interval_seconds = 86400.0
+			interval_seconds = DEFAULT_UPDATES_INTERVAL_SECONDS
 
 		return interval_seconds
 
 	def _updates_are_enabled(self) -> bool:
-		return str(self.updates_enabled).strip().lower() in {"1", "true", "yes", "on"}
+		return self._to_bool(self.updates_enabled)
 
 	def _find_channel_by_name(self, channel_name: str) -> Optional[discord.abc.Messageable]:
 		for guild in self.client.guilds:
@@ -166,10 +185,15 @@ class DiscordBotWrapper:
 			None,
 		)
 
-		if content == f"{self.command_prefix}clear":
-			tools.archive_history()
-			tools.init_history()
-			await message.channel.send("History cleared.")
+		if content == f"{self.command_prefix}history":
+			history = tools.get_conversation_history()
+			if len(history) == 0:
+				history = "No conversation history available."
+			await message.channel.send(history)
+			return
+		elif content == f"{self.command_prefix}clear history":
+			tools.clear_history()
+			await message.channel.send("Conversation history cleared.")
 			return
 
 		if not content and audio_attachment is None and text_attachment is None:
@@ -183,11 +207,8 @@ class DiscordBotWrapper:
 				await message.channel.send("Could not read .txt attachment (empty result).")
 				return
 
-			prompt = f"{content}\n\n{attachment_text}".strip() if content else attachment_text
-
-			async with message.channel.typing():
-				reply = await self.responder(prompt, message)
-			await self._send_long_message(message.channel, reply)
+			prompt = self._build_prompt(content, attachment_text)
+			await self._respond_and_send(message.channel, prompt, message)
 			return
 
 		if audio_attachment is not None and not content:
@@ -198,14 +219,10 @@ class DiscordBotWrapper:
 				await message.channel.send("Could not transcribe audio (empty result).")
 				return
 
-			async with message.channel.typing():
-				reply = await self.responder(transcription, message)
-			await self._send_long_message(message.channel, reply)
+			await self._respond_and_send(message.channel, transcription, message)
 			return
 
-		async with message.channel.typing():
-			reply = await self.responder(content, message)
-		await self._send_long_message(message.channel, reply)
+		await self._respond_and_send(message.channel, content, message)
 
 	def _register_events(self) -> None:
 		@self.client.event
@@ -236,7 +253,7 @@ class DiscordBotWrapper:
 
 	def run(self) -> None:
 		if not self.token:
-			raise ValueError("Set DISCORD_BOT_TOKEN in env or credentials.py")
+			raise ValueError("Set DISCORD_BOT_TOKEN in environment configuration")
 
 		logging.basicConfig(
 			format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -246,9 +263,6 @@ class DiscordBotWrapper:
 
 
 if __name__ == "__main__":
-	tools.archive_history()
-	tools.init_history()
-
 	# if vector_db is not there, create it
 	if not Path(vector_database.DEFAULT_DB_PATH).exists():
 		logging.info("Creating vector database...")

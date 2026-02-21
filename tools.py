@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 # History file path located in memory/history.md alongside this module
 HISTORY_FILE = Path(__file__).parent / "memory" / "history.md"
+HISTORY_MAX_CHARS = 100_000
 
 
 def get_conversation_history() -> str:
@@ -12,16 +13,14 @@ def get_conversation_history() -> str:
         return HISTORY_FILE.read_text(encoding="utf-8")
     except Exception:
         return "No history available."
+    
 
-
-def init_history() -> None:
-    """Create or truncate the history file when the bot starts."""
+def clear_history() -> None:
+    """Clear the conversation history by clearing the contents of the history file."""
     try:
-        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with HISTORY_FILE.open("w", encoding="utf-8") as f:
-            f.write("")  # Start with an empty file
+        HISTORY_FILE.write_text("", encoding="utf-8")
     except Exception:
-        return "Failed to initialize history file."
+        return "Failed to clear history file."
 
 
 def append_history(role: str, text: str) -> None:
@@ -34,24 +33,35 @@ def append_history(role: str, text: str) -> None:
         with HISTORY_FILE.open("a", encoding="utf-8") as f:
             f.write(f"## {ts} - {role}\n\n")
             f.write(text.rstrip() + "\n\n---\n\n")
+        _prune_history()
     except Exception:
         return "Failed to append to history file."
 
-def archive_history() -> None:
-    """Archive history by copying into memory/conversations and renaming the copy."""
+
+def _prune_history(max_chars: int = HISTORY_MAX_CHARS) -> None:
+    """Trim history.md from the top when it exceeds max_chars.
+
+    Keeps the most recent history content and attempts to align to the next
+    message boundary ("\n\n---\n\n") so entries are not cut mid-block.
+    """
     try:
-        if HISTORY_FILE.exists():
-            if not HISTORY_FILE.read_text(encoding="utf-8").strip():
-                return
+        if max_chars <= 0:
+            return
 
-            archive_dir = Path(__file__).parent / "memory" / "conversations"
-            archive_dir.mkdir(parents=True, exist_ok=True)
+        if not HISTORY_FILE.exists():
+            return
 
-            copied_file = archive_dir / HISTORY_FILE.name
-            shutil.copy2(HISTORY_FILE, copied_file)
+        history_text = HISTORY_FILE.read_text(encoding="utf-8")
+        if len(history_text) <= max_chars:
+            return
 
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            archive_name = archive_dir / f"history_{ts}.md"
-            copied_file.rename(archive_name)
+        trimmed = history_text[-max_chars:]
+        boundary = "\n\n---\n\n"
+        boundary_index = trimmed.find(boundary)
+
+        if boundary_index != -1:
+            trimmed = trimmed[boundary_index + len(boundary) :]
+
+        HISTORY_FILE.write_text(trimmed.lstrip(), encoding="utf-8")
     except Exception:
-        return "Failed to archive history file."
+        return "Failed to prune history file."
