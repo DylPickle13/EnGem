@@ -10,7 +10,6 @@ import skills.vector_database as vector_database
 import skills.run_python as run_python
 import skills.run_google_search as run_google_search
 import skills.git_push as git_push
-import skills.read_file as read_file
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -43,7 +42,7 @@ EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
 TOOLS_LIST_FILE = Path(__file__).parent / "agent_instructions/tool_list.md"
 
 
-def generate_response(user_message: str, verbose: bool = True) -> str:
+def generate_response(user_message: str) -> str:
 
     exit_string = ""
     tools.append_history(role="user", text=user_message)

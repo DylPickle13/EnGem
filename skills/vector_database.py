@@ -87,18 +87,6 @@ class VectorMemoryStore:
         )
         return final_id
 
-
-    def read_memory(self, memory_id: str) -> MemoryItem | None:
-        """Read one memory by id."""
-        result = self.collection.get(ids=[memory_id], include=["documents", "metadatas"])
-        if not result.get("ids"):
-            return None
-
-        item_id = result["ids"][0]
-        text = (result.get("documents") or [""])[0]
-        metadata = (result.get("metadatas") or [{}])[0] or {}
-        return MemoryItem(memory_id=item_id, text=text, metadata=metadata)
-
     def read_all_memories(self, limit: int | None = None) -> list[MemoryItem]:
         """Read all stored memories, optionally limited."""
         result = self.collection.get(include=["documents", "metadatas"], limit=limit)
@@ -139,36 +127,20 @@ class VectorMemoryStore:
             memories.append(MemoryItem(memory_id=memory_id, text=text, metadata=metadata))
         return memories
 
-    def update_memory(self, memory_id: str, text: str | None = None, metadata: dict[str, Any] | None = None) -> bool:
-        """Update text and/or metadata for an existing memory."""
-        current = self.read_memory(memory_id)
-        if current is None:
-            return False
-
-        final_text = text.strip() if text is not None else current.text
-        if not final_text:
-            raise ValueError("Updated memory text cannot be empty")
-
-        final_metadata = dict(current.metadata)
-        if metadata:
-            final_metadata.update(metadata)
-        final_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-        self.collection.upsert(ids=[memory_id], documents=[final_text], metadatas=[final_metadata])
-        return True
-
-    def delete_memory(self, memory_id: str) -> bool:
-        """Delete one memory by id. Returns True if it existed."""
-        existing = self.read_memory(memory_id)
-        if existing is None:
-            return False
-
-        self.collection.delete(ids=[memory_id])
-        return True
-
     def count(self) -> int:
         """Return number of items in the collection."""
         return self.collection.count()
+
+    def clear_memories(self) -> int:
+        """Delete all stored memories and return how many were removed."""
+        result = self.collection.get(include=[])
+        ids = result.get("ids") or []
+
+        if not ids:
+            return 0
+
+        self.collection.delete(ids=ids)
+        return len(ids)
 
 
 def get_default_store() -> VectorMemoryStore:
@@ -177,3 +149,8 @@ def get_default_store() -> VectorMemoryStore:
         db_path=DEFAULT_DB_PATH,
         collection_name=DEFAULT_COLLECTION_NAME,
     )
+
+
+if __name__ == "__main__":
+    store = get_default_store()
+    store.clear_memories()

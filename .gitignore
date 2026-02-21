@@ -7,3 +7,5 @@ config.py
 /sub-agents
 /vector_database
 /.vscode
+/agent_instructions/tasker.md
+/sandbox
