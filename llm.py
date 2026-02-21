@@ -56,6 +56,7 @@ def generate_response(user_message: str) -> str:
     except Exception as e:
         print(f"Error generating memory retriever response: {e}")
 
+    intent_response = ""
     try:
         intent_response = _run_model_api(tools.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
     except Exception as e:
@@ -76,19 +77,18 @@ def generate_response(user_message: str) -> str:
             except Exception as e:
                 print(f"Error clearing execution order file: {e}")
 
+        manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
             manager_response = _run_model_api(tools.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
+            tools.append_history(role="Manager", text=manager_response)
         except Exception as e:
             print(f"Error generating manager response: {e}")
-
-        # Check for the file 'sub-agents/execution_order.json' to determine if the manager has issued an execution order
-        tools.append_history(role="Manager", text=manager_response)
 
         # read the execution order from the .json file
         if not EXECUTION_ORDER_FILE.exists():
             print("No execution order file found. ")
-            break
+            continue
         else:
             try:
                 with EXECUTION_ORDER_FILE.open("r", encoding="utf-8") as f:
@@ -98,6 +98,7 @@ def generate_response(user_message: str) -> str:
                 continue
 
         for agent in execution_order_dict['sub_agents']:
+            sub_agent_response = ""
             try:
                 sub_agent_response = _run_model_api(tools.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
                 tools.append_history(role=agent['task_name'], text=sub_agent_response)
@@ -106,20 +107,25 @@ def generate_response(user_message: str) -> str:
 
         try:
             exit_string = _run_model_api(tools.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
+            tools.append_history(role="Reviewer", text=exit_string)
         except Exception as e:
             print(f"Error generating reviewer response: {e}")
-        tools.append_history(role="Reviewer", text=exit_string)
         if exit_string == "<yes>":
             break
 
+    text_response = ""
     try:
         text_response = _run_model_api(tools.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
+        tools.append_history(role="Texter", text=text_response)
     except Exception as e:
         print(f"Error generating texter response: {e}")
-    tools.append_history(role="Texter", text=text_response)
-    memory_extractor_response = _run_model_api(tools.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
-    if memory_extractor_response.strip() != "<NO_MEMORY>":
-        vector_database.get_default_store().write_memory(memory_extractor_response)
+
+    try:
+        memory_extractor_response = _run_model_api(tools.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
+        if memory_extractor_response.strip() != "<NO_MEMORY>":
+            vector_database.get_default_store().write_memory(memory_extractor_response)
+    except Exception as e:
+        print(f"Error generating memory extractor response: {e}")
     return text_response
 
 
