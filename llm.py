@@ -50,7 +50,7 @@ def generate_response(user_message: str) -> str:
     relevant_memories = vector_database.get_default_store().search_memories(history.get_conversation_history(), limit=5)
     relevant_memories_text = "\n\n".join([f"Memory: {memory.text}\nMetadata: {json.dumps(memory.metadata)}" for memory in relevant_memories])
     try:
-        memory_retriever_response = _run_model_api(history.get_conversation_history() + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
+        memory_retriever_response = _run_model_api(history.get_conversation_history() + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
         if memory_retriever_response != "<NO_RELEVANT_MEMORIES>":
             history.append_history(role="MemoryRetriever", text=memory_retriever_response)
     except Exception as e:
@@ -58,15 +58,16 @@ def generate_response(user_message: str) -> str:
 
     intent_response = ""
     try:
-        intent_response = _run_model_api(history.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
+        intent_response = _run_model_api(history.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False)
     except Exception as e:
         print(f"Error generating intent response: {e}")
 
     if intent_response != "<complex>":
         history.append_history(role="IntentClassifier", text=intent_response)
-        memory_extractor_response = _run_model_api(history.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
+        memory_extractor_response = _run_model_api(history.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
         if memory_extractor_response.strip() != "<NO_MEMORY>":
             vector_database.get_default_store().write_memory(memory_extractor_response)
+            history.append_history(role="MemoryExtractor", text=memory_extractor_response)
         return intent_response
 
     while True:
@@ -80,7 +81,7 @@ def generate_response(user_message: str) -> str:
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(history.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
+            manager_response = _run_model_api(history.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=True)
             history.append_history(role="Manager", text=manager_response)
         except Exception as e:
             print(f"Error generating manager response: {e}")
@@ -100,13 +101,13 @@ def generate_response(user_message: str) -> str:
         for agent in execution_order_dict['sub_agents']:
             sub_agent_response = ""
             try:
-                sub_agent_response = _run_model_api(history.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True)
+                sub_agent_response = _run_model_api(history.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False)
                 history.append_history(role=agent['task_name'], text=sub_agent_response)
             except Exception as e:
                 print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
 
         try:
-            exit_string = _run_model_api(history.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
+            exit_string = _run_model_api(history.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
             history.append_history(role="Reviewer", text=exit_string)
         except Exception as e:
             print(f"Error generating reviewer response: {e}")
@@ -115,22 +116,23 @@ def generate_response(user_message: str) -> str:
 
     text_response = ""
     try:
-        text_response = _run_model_api(history.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
+        text_response = _run_model_api(history.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
         history.append_history(role="Texter", text=text_response)
     except Exception as e:
         print(f"Error generating texter response: {e}")
 
     relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in vector_database.get_default_store().search_memories(history.get_conversation_history(), limit=10)])
     try:
-        memory_extractor_response = _run_model_api("History: " + history.get_conversation_history() + "\n\nRelevant memories: \n\n" + relevant_memories_history, MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False)
+        memory_extractor_response = _run_model_api("History: " + history.get_conversation_history() + "\n\nRelevant memories: \n\n" + relevant_memories_history, MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
         if memory_extractor_response.strip() != "<NO_MEMORY>":
             vector_database.get_default_store().write_memory(memory_extractor_response)
+            history.append_history(role="MemoryExtractor", text=memory_extractor_response)
     except Exception as e:
         print(f"Error generating memory extractor response: {e}")
     return text_response
 
 
-def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool = True) -> str:
+def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool = True, force_tool: bool = False) -> str:
     """
     Helper function to call the model API with the given text and system instructions, and return the generated response.
     text: the input text to generate a response for
@@ -145,18 +147,29 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
         types.FunctionDeclaration.from_callable(client=client, callable=run_google_search.run_google_search),
         types.FunctionDeclaration.from_callable(client=client, callable=git_push.git_push)
     ])
+    tool_config = types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(
+            mode="ANY", allowed_function_names=["run_python"]
+        )
+    )
     config = types.GenerateContentConfig(
         system_instruction=system_instructions,
+        tool_config=tool_config if force_tool else None,
         tools=[agent_tools] if tool_use_allowed else []
-        )
+    )
 
     function_output = ""
 
-    response = client.models.generate_content(
-        model=model,
-        config=config,
-        contents=text,
-    )
+    while True:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                config=config,
+                contents=text,
+            )
+            break
+        except Exception as e:
+            print(f"Error calling model API: {e}")
 
     if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
         for part in response.candidates[0].content.parts:
@@ -174,14 +187,17 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     if function_output == "":
         output = response.text or ""
     else:
-        config = types.GenerateContentConfig(
-            system_instruction=FOLLOWUP_FILE.read_text(encoding="utf-8")
-        )
-
-        follow_up_response = client.models.generate_content(
-            model=model,
-            config=config,
-            contents=text + "\n\nTool output:\n\n" + function_output,
-        )
-        output = function_output + "\n\n" + (follow_up_response.text or "")
+        while True:
+            try:
+                follow_up_response = client.models.generate_content(
+                    model=model,
+                    config=types.GenerateContentConfig(
+                        system_instruction=FOLLOWUP_FILE.read_text(encoding="utf-8")
+                    ),
+                    contents=text + "\n\nTool output:\n\n" + function_output,
+                )
+                break
+            except Exception as e:
+                print(f"Error calling model API for follow-up response: {e}")
+        output = follow_up_response.text or ""
     return output

@@ -166,8 +166,6 @@ class DiscordBotWrapper:
 				continue
 
 			try:
-				history.archive_history()
-				history.init_history()
 				reply = await asyncio.to_thread(llm.generate_response, self.updates_prompt)
 				await self._send_long_message(channel, reply)
 			except Exception as exc:
