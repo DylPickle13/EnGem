@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
+import sys
 from typing import Any
 from uuid import uuid4
 
@@ -12,6 +13,11 @@ import chromadb
 from chromadb.api.models.Collection import Collection
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 logging.getLogger("chromadb.telemetry.product.posthog").disabled = True

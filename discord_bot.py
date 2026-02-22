@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -14,7 +16,7 @@ from config import (
 )
 
 import discord
-import tools
+import history
 import llm
 import whisper
 import skills.vector_database as vector_database
@@ -72,6 +74,10 @@ class DiscordBotWrapper:
 		async with channel.typing():
 			reply = await self.responder(prompt, message)
 		await self._send_long_message(channel, reply)
+
+	async def _reload_bot_process(self) -> None:
+		await asyncio.sleep(0.5)
+		os.execv(sys.executable, [sys.executable, *sys.argv])
 
 	async def _get_whisper_model(self):
 		if self.whisper_model is None:
@@ -141,8 +147,8 @@ class DiscordBotWrapper:
 				continue
 
 			try:
-				tools.archive_history()
-				tools.init_history()
+				history.archive_history()
+				history.init_history()
 				reply = await asyncio.to_thread(llm.generate_response, self.updates_prompt)
 				await self._send_long_message(channel, reply)
 			except Exception as exc:
@@ -185,15 +191,17 @@ class DiscordBotWrapper:
 			None,
 		)
 
-		if content == f"{self.command_prefix}history":
-			history = tools.get_conversation_history()
-			if len(history) == 0:
-				history = "No conversation history available."
-			await message.channel.send(history)
+		if content == f"{self.command_prefix}history length":
+			history = history.get_conversation_history()
+			await message.channel.send(f"Conversation history length: {len(history)}")
 			return
 		elif content == f"{self.command_prefix}clear history":
-			tools.clear_history()
+			history.clear_history()
 			await message.channel.send("Conversation history cleared.")
+			return
+		elif content == f"{self.command_prefix}reload":
+			await message.channel.send("Reloading bot...")
+			asyncio.create_task(self._reload_bot_process())
 			return
 
 		if not content and audio_attachment is None and text_attachment is None:
