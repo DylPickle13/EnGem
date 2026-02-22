@@ -153,6 +153,23 @@ class DiscordBotWrapper:
 					return channel
 		return None
 
+	def _start_updates_task_if_needed(self) -> bool:
+		if self._updates_task is not None and not self._updates_task.done():
+			return False
+
+		self._updates_task = asyncio.create_task(self._run_updates_scheduler())
+		return True
+
+	async def _stop_updates_task_if_running(self) -> bool:
+		if self._updates_task is None or self._updates_task.done():
+			self._updates_task = None
+			return False
+
+		self._updates_task.cancel()
+		await asyncio.gather(self._updates_task, return_exceptions=True)
+		self._updates_task = None
+		return True
+
 	async def _run_updates_scheduler(self) -> None:
 		while True:
 			try:
@@ -195,8 +212,55 @@ class DiscordBotWrapper:
 			finally:
 				self._message_queue.task_done()
 
+	async def _try_handle_command(self, message: discord.Message) -> bool:
+		content = (message.content or "").strip()
+
+		if content == f"{self.command_prefix}commands":
+			await message.channel.send(
+				"Available commands:\n"
+				f"- {self.command_prefix}commands\n"
+				f"- {self.command_prefix}history length\n"
+				f"- {self.command_prefix}clear history\n"
+				f"- {self.command_prefix}start updates\n"
+				f"- {self.command_prefix}stop updates\n"
+				f"- {self.command_prefix}reload"
+			)
+			return True
+
+		if content == f"{self.command_prefix}history length":
+			history_text = history.get_conversation_history()
+			await message.channel.send(f"Conversation history length: {len(history_text)}")
+			return True
+		if content == f"{self.command_prefix}clear history":
+			history.clear_history()
+			await message.channel.send("Conversation history cleared.")
+			return True
+		if content == f"{self.command_prefix}reload":
+			await message.channel.send("Reloading bot...")
+			await self._request_reload()
+			return True
+		if content == f"{self.command_prefix}start updates":
+			started = self._start_updates_task_if_needed()
+			if started:
+				await message.channel.send("Updates scheduler started.")
+			else:
+				await message.channel.send("Updates scheduler is already running.")
+			return True
+		if content == f"{self.command_prefix}stop updates":
+			stopped = await self._stop_updates_task_if_running()
+			if stopped:
+				await message.channel.send("Updates scheduler stopped.")
+			else:
+				await message.channel.send("Updates scheduler is not running.")
+			return True
+
+		return False
+
 	async def _process_message(self, message: discord.Message) -> None:
 		content = (message.content or "").strip()
+		if await self._try_handle_command(message):
+			return
+
 		audio_attachment = next(
 			(
 				attachment
@@ -213,19 +277,6 @@ class DiscordBotWrapper:
 			),
 			None,
 		)
-
-		if content == f"{self.command_prefix}history length":
-			history_text = history.get_conversation_history()
-			await message.channel.send(f"Conversation history length: {len(history_text)}")
-			return
-		elif content == f"{self.command_prefix}clear history":
-			history.clear_history()
-			await message.channel.send("Conversation history cleared.")
-			return
-		elif content == f"{self.command_prefix}reload":
-			await message.channel.send("Reloading bot...")
-			await self._request_reload()
-			return
 
 		if not content and audio_attachment is None and text_attachment is None:
 			return
@@ -262,8 +313,7 @@ class DiscordBotWrapper:
 			if shutil.which("ffmpeg") is None:
 				logging.warning("ffmpeg not found: voice transcription will be unavailable until installed.")
 			if self._updates_are_enabled():
-				if self._updates_task is None or self._updates_task.done():
-					self._updates_task = asyncio.create_task(self._run_updates_scheduler())
+				self._start_updates_task_if_needed()
 			else:
 				logging.info("Automatic updates are disabled by DISCORD_UPDATES_ENABLED")
 
@@ -278,6 +328,9 @@ class DiscordBotWrapper:
 
 			# If allowed_channel is set, ignore messages not in that channel
 			if getattr(message.channel, "name", None) != self.allowed_channel:
+				return
+
+			if await self._try_handle_command(message):
 				return
 
 			await self._enqueue_message(message)

@@ -45,12 +45,14 @@ TOOLS_LIST_FILE = Path(__file__).parent / "agent_instructions/tool_list.md"
 def generate_response(user_message: str) -> str:
 
     exit_string = ""
+    default_temperature = 1.0
+    temperature = default_temperature
     history.append_history(role="user", text=user_message)
 
     relevant_memories = vector_database.get_default_store().search_memories(history.get_conversation_history(), limit=5)
     relevant_memories_text = "\n\n".join([f"Memory: {memory.text}\nMetadata: {json.dumps(memory.metadata)}" for memory in relevant_memories])
     try:
-        memory_retriever_response = _run_model_api(history.get_conversation_history() + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
+        memory_retriever_response = _run_model_api(history.get_conversation_history() + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         if memory_retriever_response != "<NO_RELEVANT_MEMORIES>":
             history.append_history(role="MemoryRetriever", text=memory_retriever_response)
     except Exception as e:
@@ -58,13 +60,13 @@ def generate_response(user_message: str) -> str:
 
     intent_response = ""
     try:
-        intent_response = _run_model_api(history.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False)
+        intent_response = _run_model_api(history.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=default_temperature)
     except Exception as e:
         print(f"Error generating intent response: {e}")
 
     if intent_response != "<complex>":
         history.append_history(role="IntentClassifier", text=intent_response)
-        memory_extractor_response = _run_model_api(history.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
+        memory_extractor_response = _run_model_api(history.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         if memory_extractor_response.strip() != "<NO_MEMORY>":
             vector_database.get_default_store().write_memory(memory_extractor_response)
             history.append_history(role="MemoryExtractor", text=memory_extractor_response)
@@ -81,7 +83,7 @@ def generate_response(user_message: str) -> str:
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(history.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=True)
+            manager_response = _run_model_api(history.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=True, temperature=temperature)
             history.append_history(role="Manager", text=manager_response)
         except Exception as e:
             print(f"Error generating manager response: {e}")
@@ -101,29 +103,32 @@ def generate_response(user_message: str) -> str:
         for agent in execution_order_dict['sub_agents']:
             sub_agent_response = ""
             try:
-                sub_agent_response = _run_model_api(history.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False)
+                sub_agent_response = _run_model_api(history.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=temperature)
                 history.append_history(role=agent['task_name'], text=sub_agent_response)
             except Exception as e:
                 print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
 
         try:
-            exit_string = _run_model_api(history.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
+            exit_string = _run_model_api(history.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
             history.append_history(role="Reviewer", text=exit_string)
         except Exception as e:
             print(f"Error generating reviewer response: {e}")
         if exit_string == "<yes>":
             break
+        else:
+            if temperature < 2.0:
+                temperature += 0.1
 
     text_response = ""
     try:
-        text_response = _run_model_api(history.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
+        text_response = _run_model_api(history.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         history.append_history(role="Texter", text=text_response)
     except Exception as e:
         print(f"Error generating texter response: {e}")
 
     relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in vector_database.get_default_store().search_memories(history.get_conversation_history(), limit=10)])
     try:
-        memory_extractor_response = _run_model_api("History: " + history.get_conversation_history() + "\n\nRelevant memories: \n\n" + relevant_memories_history, MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False)
+        memory_extractor_response = _run_model_api("History: " + history.get_conversation_history() + "\n\nRelevant memories: \n\n" + relevant_memories_history, MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         if memory_extractor_response.strip() != "<NO_MEMORY>":
             vector_database.get_default_store().write_memory(memory_extractor_response)
             history.append_history(role="MemoryExtractor", text=memory_extractor_response)
@@ -132,12 +137,13 @@ def generate_response(user_message: str) -> str:
     return text_response
 
 
-def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool = True, force_tool: bool = False) -> str:
+def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool = True, force_tool: bool = False, temperature: float = 1) -> str:
     """
     Helper function to call the model API with the given text and system instructions, and return the generated response.
     text: the input text to generate a response for
     system_instructions: the system instructions to provide to the model for this generation
     tool_use_allowed: whether to allow the model to use tools for this generation (default: True)
+    temperature: the temperature to use for this generation (default: 1)
     """
     os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
 
@@ -155,7 +161,8 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     config = types.GenerateContentConfig(
         system_instruction=system_instructions,
         tool_config=tool_config if force_tool else None,
-        tools=[agent_tools] if tool_use_allowed else []
+        tools=[agent_tools] if tool_use_allowed else [],
+        temperature=temperature,
     )
 
     function_output = ""
@@ -170,6 +177,7 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
             break
         except Exception as e:
             print(f"Error calling model API: {e}")
+        print("Retrying...")
 
     if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
         for part in response.candidates[0].content.parts:
@@ -199,5 +207,6 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
                 break
             except Exception as e:
                 print(f"Error calling model API for follow-up response: {e}")
+            print("Retrying for follow-up response...")
         output = follow_up_response.text or ""
     return output

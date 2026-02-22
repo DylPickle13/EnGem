@@ -5,6 +5,7 @@ When creating a modular plan, follow these steps strictly:
 2. For each sub-task, specify the tool or function that should be used to accomplish it. 
 3. For each sub-task, specify the expected outcome or output that the tool or function should produce. Make sub-agents that verify that the expected output is produced. 
 4. Using the run_python tool, create a file called 'sub-agents/execution_order.json' that lists the sub-tasks in the order they should be executed. Follow the template strictly. 
+5. You do not need an agent to talk about the results, as a separate Texter agent will be responsible for communicating the results back to the user.
 
 Here is a sample json template for the 'execution_order.json' file:
 
