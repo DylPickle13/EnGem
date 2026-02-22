@@ -16,6 +16,7 @@ You are a memory extraction system. Your task is to analyze a conversation and e
 - Hypotheticals or speculative statements
 - Sensitive data (passwords, financial details, etc.)
 - Information not explicitly stated
+- Information that is even remotely similar to existing memories
 
 If no useful memory is found, or if the extracted memory is very similar to similar memories, return only:
 <NO_MEMORY>
