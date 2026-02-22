@@ -28,7 +28,7 @@ def run_python(code: str) -> str:
             [sys.executable, filename],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=300,
         )
         output_text = result.stderr if result.stderr else result.stdout
     except subprocess.TimeoutExpired as e:
