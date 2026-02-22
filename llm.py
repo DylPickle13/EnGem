@@ -10,6 +10,7 @@ import skills.vector_database as vector_database
 import skills.run_python as run_python
 import skills.run_google_search as run_google_search
 import skills.git_push as git_push
+import skills.launch_browser as launch_browser
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -151,7 +152,8 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     agent_tools = types.Tool(function_declarations=[
         types.FunctionDeclaration.from_callable(client=client, callable=run_python.run_python),
         types.FunctionDeclaration.from_callable(client=client, callable=run_google_search.run_google_search),
-        types.FunctionDeclaration.from_callable(client=client, callable=git_push.git_push)
+        types.FunctionDeclaration.from_callable(client=client, callable=git_push.git_push),
+        types.FunctionDeclaration.from_callable(client=client, callable=launch_browser.launch_browser)
     ])
     tool_config = types.ToolConfig(
         function_calling_config=types.FunctionCallingConfig(
@@ -188,6 +190,8 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
                     function_output += run_google_search.run_google_search(part.function_call.args['query'])
                 if part.function_call.name == "git_push":
                     function_output += git_push.git_push(part.function_call.args['message'])
+                if part.function_call.name == "launch_browser":
+                    launch_browser.launch_browser(part.function_call.args['url'])
 
     output = ""
     follow_up_response = ""

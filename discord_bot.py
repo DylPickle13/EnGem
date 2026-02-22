@@ -44,6 +44,7 @@ class DiscordBotWrapper:
 		self._message_queue: asyncio.Queue[discord.Message] = asyncio.Queue()
 		self._worker_task: asyncio.Task[None] | None = None
 		self._updates_task: asyncio.Task[None] | None = None
+		self._updates_stop_event: asyncio.Event | None = None
 		self._restart_requested = False
 		self._queue_lock = asyncio.Lock()
 
@@ -153,27 +154,52 @@ class DiscordBotWrapper:
 					return channel
 		return None
 
-	def _start_updates_task_if_needed(self) -> bool:
+	def _start_updates_task_if_needed(self, *, run_immediately: bool = False) -> bool:
 		if self._updates_task is not None and not self._updates_task.done():
 			return False
 
-		self._updates_task = asyncio.create_task(self._run_updates_scheduler())
+		self._updates_stop_event = asyncio.Event()
+		self._updates_task = asyncio.create_task(self._run_updates_scheduler(run_immediately=run_immediately))
 		return True
 
 	async def _stop_updates_task_if_running(self) -> bool:
 		if self._updates_task is None or self._updates_task.done():
 			self._updates_task = None
+			self._updates_stop_event = None
 			return False
+
+		if self._updates_stop_event is not None:
+			self._updates_stop_event.set()
 
 		self._updates_task.cancel()
 		await asyncio.gather(self._updates_task, return_exceptions=True)
 		self._updates_task = None
+		self._updates_stop_event = None
 		return True
 
-	async def _run_updates_scheduler(self) -> None:
+	async def _run_updates_scheduler(self, run_immediately: bool = False) -> None:
+		if run_immediately:
+			channel = self._find_channel_by_name(self.updates_channel)
+			if channel is None:
+				logging.warning("Updates channel '%s' not found; skipping scheduled message.", self.updates_channel)
+			else:
+				try:
+					reply = await asyncio.to_thread(llm.generate_response, self.updates_prompt)
+					await self._send_long_message(channel, reply)
+				except Exception as exc:
+					logging.exception("Error running scheduled updates message: %s", exc)
+
 		while True:
 			try:
+				if self._updates_stop_event is not None:
+					await asyncio.wait_for(
+						self._updates_stop_event.wait(),
+						timeout=self._get_updates_interval_seconds(),
+					)
+					break
 				await asyncio.sleep(self._get_updates_interval_seconds())
+			except asyncio.TimeoutError:
+				pass
 			except asyncio.CancelledError:
 				break
 
@@ -240,9 +266,9 @@ class DiscordBotWrapper:
 			await self._request_reload()
 			return True
 		if content == f"{self.command_prefix}start updates":
-			started = self._start_updates_task_if_needed()
+			started = self._start_updates_task_if_needed(run_immediately=True)
 			if started:
-				await message.channel.send("Updates scheduler started.")
+				await message.channel.send("Updates scheduler started and ran immediately.")
 			else:
 				await message.channel.send("Updates scheduler is already running.")
 			return True

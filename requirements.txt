@@ -5,3 +5,4 @@ torch==2.10.0
 chromadb==0.5.23
 sentence-transformers
 GitPython==3.1.43
+playwright==1.55.0
