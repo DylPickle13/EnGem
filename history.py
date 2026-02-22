@@ -1,9 +1,11 @@
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # History file path located in memory/history.md alongside this module
 HISTORY_FILE = Path(__file__).parent / "memory" / "history.md"
-HISTORY_MAX_CHARS = 100_000
+HISTORY_MAX_CHARS = 200_000
+TORONTO_TZ = ZoneInfo("America/Toronto")
 
 
 def get_conversation_history() -> str:
@@ -28,7 +30,7 @@ def append_history(role: str, text: str) -> None:
     Role should be something like 'user' or 'llm'.
     """
     try:
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(TORONTO_TZ).isoformat()
         with HISTORY_FILE.open("a", encoding="utf-8") as f:
             f.write(f"## {ts} - {role}\n\n")
             f.write(text.rstrip() + "\n\n---\n\n")

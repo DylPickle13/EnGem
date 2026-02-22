@@ -44,6 +44,7 @@ class DiscordBotWrapper:
 		self._message_queue: asyncio.Queue[discord.Message] = asyncio.Queue()
 		self._worker_task: asyncio.Task[None] | None = None
 		self._updates_task: asyncio.Task[None] | None = None
+		self._restart_requested = False
 		self._queue_lock = asyncio.Lock()
 
 		intents = discord.Intents.default()
@@ -75,9 +76,24 @@ class DiscordBotWrapper:
 			reply = await self.responder(prompt, message)
 		await self._send_long_message(channel, reply)
 
-	async def _reload_bot_process(self) -> None:
-		await asyncio.sleep(0.5)
-		os.execv(sys.executable, [sys.executable, *sys.argv])
+	async def _shutdown_background_tasks(self) -> None:
+		tasks = [task for task in (self._updates_task, self._worker_task) if task is not None and not task.done()]
+		for task in tasks:
+			task.cancel()
+
+		if tasks:
+			await asyncio.gather(*tasks, return_exceptions=True)
+
+		self._updates_task = None
+		self._worker_task = None
+
+	async def _request_reload(self) -> None:
+		if self._restart_requested:
+			return
+
+		self._restart_requested = True
+		await self._shutdown_background_tasks()
+		await self.client.close()
 
 	async def _get_whisper_model(self):
 		if self.whisper_model is None:
@@ -139,7 +155,10 @@ class DiscordBotWrapper:
 
 	async def _run_updates_scheduler(self) -> None:
 		while True:
-			await asyncio.sleep(self._get_updates_interval_seconds())
+			try:
+				await asyncio.sleep(self._get_updates_interval_seconds())
+			except asyncio.CancelledError:
+				break
 
 			channel = self._find_channel_by_name(self.updates_channel)
 			if channel is None:
@@ -163,9 +182,15 @@ class DiscordBotWrapper:
 
 	async def _queue_worker(self) -> None:
 		while True:
-			message = await self._message_queue.get()
+			try:
+				message = await self._message_queue.get()
+			except asyncio.CancelledError:
+				break
+
 			try:
 				await self._process_message(message)
+			except asyncio.CancelledError:
+				raise
 			except Exception as exc:
 				logging.exception("Error handling Discord message: %s", exc)
 				await message.channel.send("Error processing your message: " + str(exc))
@@ -192,8 +217,8 @@ class DiscordBotWrapper:
 		)
 
 		if content == f"{self.command_prefix}history length":
-			history = history.get_conversation_history()
-			await message.channel.send(f"Conversation history length: {len(history)}")
+			history_text = history.get_conversation_history()
+			await message.channel.send(f"Conversation history length: {len(history_text)}")
 			return
 		elif content == f"{self.command_prefix}clear history":
 			history.clear_history()
@@ -201,7 +226,7 @@ class DiscordBotWrapper:
 			return
 		elif content == f"{self.command_prefix}reload":
 			await message.channel.send("Reloading bot...")
-			asyncio.create_task(self._reload_bot_process())
+			await self._request_reload()
 			return
 
 		if not content and audio_attachment is None and text_attachment is None:
@@ -268,6 +293,8 @@ class DiscordBotWrapper:
 			level=logging.WARNING,
 		)
 		self.client.run(self.token, log_level=logging.WARNING)
+		if self._restart_requested:
+			os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 if __name__ == "__main__":
