@@ -2,15 +2,16 @@ from google import genai
 from google.genai import types
 import os
 import json
+import inspect
 from pathlib import Path
 from config import GEMINI_API_KEY as GEMINI_API_KEY
 from config import model as model
 import history
-import skills.vector_database as vector_database
+import vector_database as vector_database
 import skills.run_python as run_python
 import skills.run_google_search as run_google_search
 import skills.git_push as git_push
-import skills.launch_browser as launch_browser
+import skills.browser as browser
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -65,7 +66,7 @@ def generate_response(user_message: str) -> str:
     except Exception as e:
         print(f"Error generating intent response: {e}")
 
-    if intent_response != "<complex>":
+    if intent_response != "<complex>" and intent_response.strip() != "":
         history.append_history(role="IntentClassifier", text=intent_response)
         memory_extractor_response = _run_model_api(history.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         if memory_extractor_response.strip() != "<NO_MEMORY>":
@@ -84,7 +85,7 @@ def generate_response(user_message: str) -> str:
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(history.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=True, temperature=temperature)
+            manager_response = _run_model_api(history.get_conversation_history() + user_message, MANAGER_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=True, temperature=temperature)
             history.append_history(role="Manager", text=manager_response)
         except Exception as e:
             print(f"Error generating manager response: {e}")
@@ -138,6 +139,26 @@ def generate_response(user_message: str) -> str:
     return text_response
 
 
+def _get_function_declarations(client: genai.Client = None) -> list[types.FunctionDeclaration]:
+    """
+    Helper function to return a list of available tools for the agent to use, based on the functions defined in the skills directory.
+    
+    """
+    # get all modules in the skills directory and return only functions defined in those modules
+    function_declarations = []
+    skills_dir = Path(__file__).parent / "skills"
+    for skill_file in skills_dir.glob("*.py"):
+        module_name = skill_file.stem
+        try:
+            module = __import__(f"skills.{module_name}", fromlist=[module_name])
+            for _, attr in inspect.getmembers(module, inspect.isfunction):
+                if attr.__module__ == module.__name__ and not attr.__name__.startswith("_"):
+                    function_declarations.append(types.FunctionDeclaration.from_callable(client=client, callable=attr))
+        except Exception as e:
+            print(f"Error importing skill module '{module_name}': {e}")
+    return function_declarations
+
+
 def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool = True, force_tool: bool = False, temperature: float = 1) -> str:
     """
     Helper function to call the model API with the given text and system instructions, and return the generated response.
@@ -149,12 +170,7 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
 
     client = genai.Client()
-    agent_tools = types.Tool(function_declarations=[
-        types.FunctionDeclaration.from_callable(client=client, callable=run_python.run_python),
-        types.FunctionDeclaration.from_callable(client=client, callable=run_google_search.run_google_search),
-        types.FunctionDeclaration.from_callable(client=client, callable=git_push.git_push),
-        types.FunctionDeclaration.from_callable(client=client, callable=launch_browser.launch_browser)
-    ])
+    agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
     tool_config = types.ToolConfig(
         function_calling_config=types.FunctionCallingConfig(
             mode="ANY", allowed_function_names=["run_python"]
@@ -191,7 +207,7 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
                 if part.function_call.name == "git_push":
                     function_output += git_push.git_push(part.function_call.args['message'])
                 if part.function_call.name == "launch_browser":
-                    launch_browser.launch_browser(part.function_call.args['url'])
+                    browser.start_browser(part.function_call.args['url'])
 
     output = ""
     follow_up_response = ""

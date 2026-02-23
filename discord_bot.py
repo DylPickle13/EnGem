@@ -19,7 +19,7 @@ import discord
 import history
 import llm
 import whisper
-import skills.vector_database as vector_database
+import vector_database as vector_database
 
 # Tasker file located alongside this module
 TASKER_FILE = Path(__file__).parent / "agent_instructions/tasker.md"
@@ -178,16 +178,21 @@ class DiscordBotWrapper:
 		return True
 
 	async def _run_updates_scheduler(self, run_immediately: bool = False) -> None:
-		if run_immediately:
+		async def send_scheduled_update() -> None:
 			channel = self._find_channel_by_name(self.updates_channel)
 			if channel is None:
 				logging.warning("Updates channel '%s' not found; skipping scheduled message.", self.updates_channel)
-			else:
-				try:
+				return
+
+			try:
+				async with channel.typing():
 					reply = await asyncio.to_thread(llm.generate_response, self.updates_prompt)
-					await self._send_long_message(channel, reply)
-				except Exception as exc:
-					logging.exception("Error running scheduled updates message: %s", exc)
+				await self._send_long_message(channel, reply)
+			except Exception as exc:
+				logging.exception("Error running scheduled updates message: %s", exc)
+
+		if run_immediately:
+			await send_scheduled_update()
 
 		while True:
 			try:
@@ -203,16 +208,7 @@ class DiscordBotWrapper:
 			except asyncio.CancelledError:
 				break
 
-			channel = self._find_channel_by_name(self.updates_channel)
-			if channel is None:
-				logging.warning("Updates channel '%s' not found; skipping scheduled message.", self.updates_channel)
-				continue
-
-			try:
-				reply = await asyncio.to_thread(llm.generate_response, self.updates_prompt)
-				await self._send_long_message(channel, reply)
-			except Exception as exc:
-				logging.exception("Error running scheduled updates message: %s", exc)
+			await send_scheduled_update()
 
 	async def _enqueue_message(self, message: discord.Message) -> None:
 		async with self._queue_lock:

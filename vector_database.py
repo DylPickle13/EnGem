@@ -18,7 +18,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 
-DEFAULT_DB_PATH = Path(__file__).parent.parent / "memory" / "vector_db"
+DEFAULT_DB_PATH = Path(__file__).parent / "memory" / "vector_db"
 DEFAULT_COLLECTION_NAME = "picklebot_memory"
 
 

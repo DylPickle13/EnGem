@@ -10,7 +10,11 @@ REMOTE_NAME = "origin"
 # SSH_KEY_PATH is provided by config.py (reads DEPLOY_SSH_KEY env var)
 
 
-def _load_gitpython():
+def git_push(message: str) -> str:
+	"""
+	Commit all changes in the repository with the given message and push to the remote.
+	"""
+	# Load GitPython while avoiding importing from this package's directory
 	current_dir = Path(__file__).resolve().parent
 	original_sys_path = list(sys.path)
 
@@ -25,14 +29,9 @@ def _load_gitpython():
 	finally:
 		sys.path = original_sys_path
 
-	return git_module.Repo, git_exc_module.GitCommandError
+	Repo = git_module.Repo
+	GitCommandError = git_exc_module.GitCommandError
 
-
-def git_push(message: str) -> str:
-	"""
-	Commit all changes in the repository with the given message and push to the remote.
-	"""
-	Repo, GitCommandError = _load_gitpython()
 	repo = Repo(REPO_PATH)
 
 	if repo.bare:
