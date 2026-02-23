@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 # History file path located in memory/history.md alongside this module
 HISTORY_FILE = Path(__file__).parent / "memory" / "history.md"
-HISTORY_MAX_CHARS = 200_000
+HISTORY_MAX_CHARS = 100_000
 TORONTO_TZ = ZoneInfo("America/Toronto")
 
 

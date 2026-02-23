@@ -243,6 +243,7 @@ class DiscordBotWrapper:
 				f"- {self.command_prefix}commands\n"
 				f"- {self.command_prefix}history length\n"
 				f"- {self.command_prefix}clear history\n"
+				f"- {self.command_prefix}clear memory\n"
 				f"- {self.command_prefix}start updates\n"
 				f"- {self.command_prefix}stop updates\n"
 				f"- {self.command_prefix}reload"
@@ -256,6 +257,11 @@ class DiscordBotWrapper:
 		if content == f"{self.command_prefix}clear history":
 			history.clear_history()
 			await message.channel.send("Conversation history cleared.")
+			return True
+		if content in {f"{self.command_prefix}clear memory", f"{self.command_prefix}clear_memory"}:
+			store = vector_database.get_default_store()
+			cleared_count = store.clear_memories()
+			await message.channel.send(f"Memory cleared. Removed {cleared_count} entr{'y' if cleared_count == 1 else 'ies'}.")
 			return True
 		if content == f"{self.command_prefix}reload":
 			await message.channel.send("Reloading bot...")

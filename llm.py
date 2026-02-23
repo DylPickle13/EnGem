@@ -11,7 +11,6 @@ import vector_database as vector_database
 import skills.run_python as run_python
 import skills.run_google_search as run_google_search
 import skills.git_push as git_push
-import sandbox.browser as browser
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -66,10 +65,10 @@ def generate_response(user_message: str) -> str:
     except Exception as e:
         print(f"Error generating intent response: {e}")
 
-    if intent_response != "<complex>" and intent_response.strip() != "":
+    if intent_response != "<complex>":
         history.append_history(role="IntentClassifier", text=intent_response)
         memory_extractor_response = _run_model_api(history.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
-        if memory_extractor_response.strip() != "<NO_MEMORY>":
+        if memory_extractor_response.strip() != "<NO_MEMORY>" and memory_extractor_response.strip() != "":
             vector_database.get_default_store().write_memory(memory_extractor_response)
             history.append_history(role="MemoryExtractor", text=memory_extractor_response)
         return intent_response
