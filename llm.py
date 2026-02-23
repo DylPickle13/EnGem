@@ -11,7 +11,7 @@ import vector_database as vector_database
 import skills.run_python as run_python
 import skills.run_google_search as run_google_search
 import skills.git_push as git_push
-import skills.browser as browser
+import sandbox.browser as browser
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -206,9 +206,7 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
                     function_output += run_google_search.run_google_search(part.function_call.args['query'])
                 if part.function_call.name == "git_push":
                     function_output += git_push.git_push(part.function_call.args['message'])
-                if part.function_call.name == "launch_browser":
-                    browser.start_browser(part.function_call.args['url'])
-
+                    
     output = ""
     follow_up_response = ""
 
