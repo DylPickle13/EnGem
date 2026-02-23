@@ -8,9 +8,7 @@ from config import GEMINI_API_KEY as GEMINI_API_KEY
 from config import model as model
 import history
 import vector_database as vector_database
-import skills.run_python as run_python
-import skills.run_google_search as run_google_search
-import skills.git_push as git_push
+import skills
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -106,8 +104,13 @@ def generate_response(user_message: str) -> str:
             try:
                 sub_agent_response = _run_model_api(history.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=temperature)
                 history.append_history(role=agent['task_name'], text=sub_agent_response)
+                if sub_agent_response.strip() == "<CANNOT_PROCEED>":
+                    break
             except Exception as e:
                 print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
+
+        if sub_agent_response.strip() == "<CANNOT_PROCEED>":
+            continue
 
         try:
             exit_string = _run_model_api(history.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
@@ -199,12 +202,13 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
         for part in response.candidates[0].content.parts:
             if part.function_call:
-                if part.function_call.name == "run_python":
-                    function_output += run_python.run_python(part.function_call.args['code'])
-                if part.function_call.name == "run_google_search":
-                    function_output += run_google_search.run_google_search(part.function_call.args['query'])
-                if part.function_call.name == "git_push":
-                    function_output += git_push.git_push(part.function_call.args['message'])
+                for skill_file in (Path(__file__).parent / "skills").glob("*.py"):
+                    module_name = skill_file.stem
+                    module = __import__(f"skills.{module_name}", fromlist=[module_name])
+                    for _, attr in inspect.getmembers(module, inspect.isfunction):
+                        if attr.__module__ == module.__name__ and attr.__name__ == part.function_call.name:
+                            result = attr(part.function_call.args[next(iter(part.function_call.args))])
+                            function_output += result
                     
     output = ""
     follow_up_response = ""
