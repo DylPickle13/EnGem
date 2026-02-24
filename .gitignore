@@ -1,11 +1,9 @@
 *.pyc
-
 /.venv
 **/__pycache__/
 config.py
 /memory
 /sub-agents
-/vector_database
 /.vscode
-/agent_instructions/tasker.md
+/agent_instructions/cron_jobs
 /sandbox

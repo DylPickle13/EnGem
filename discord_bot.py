@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from config import (
-	DISCORD_BOT_CHANNEL,
+	DISCORD_BOT_CHANNELS,
 	DISCORD_BOT_TOKEN,
 	DISCORD_UPDATES_CHANNEL,
 	DISCORD_UPDATES_ENABLED,
@@ -19,10 +19,9 @@ import discord
 import history
 import llm
 import whisper
-import vector_database as vector_database
+import memory as memory
 
-# Tasker file located alongside this module
-TASKER_FILE = Path(__file__).parent / "agent_instructions/tasker.md"
+CRON_JOBS_DIR = Path(__file__).parent / "agent_instructions/cron_jobs"
 DISCORD_MESSAGE_LIMIT = 2000
 DEFAULT_UPDATES_INTERVAL_SECONDS = 86400.0
 
@@ -35,10 +34,13 @@ class DiscordBotWrapper:
 	) -> None:
 		self.token = DISCORD_BOT_TOKEN
 		self.command_prefix = command_prefix
-		self.allowed_channel = DISCORD_BOT_CHANNEL
+		self.allowed_channels = {
+			channel.strip()
+			for channel in str(DISCORD_BOT_CHANNELS).split(",")
+			if channel.strip()
+		}
 		self.updates_channel = DISCORD_UPDATES_CHANNEL
 		self.updates_enabled = DISCORD_UPDATES_ENABLED
-		self.updates_prompt = TASKER_FILE.read_text(encoding="utf-8")
 		self.updates_interval_seconds = DISCORD_UPDATES_INTERVAL_SECONDS
 		self.whisper_model = None
 		self._message_queue: asyncio.Queue[discord.Message] = asyncio.Queue()
@@ -154,6 +156,24 @@ class DiscordBotWrapper:
 					return channel
 		return None
 
+	def _load_update_tasks(self) -> list[tuple[str, str]]:
+		tasks: list[tuple[str, str]] = []
+
+		for task_file in sorted(CRON_JOBS_DIR.glob("*.md")):
+			try:
+				task_prompt = task_file.read_text(encoding="utf-8").strip()
+			except Exception as exc:
+				logging.exception("Error reading scheduled task file '%s': %s", task_file, exc)
+				continue
+
+			if task_prompt:
+				tasks.append((task_file.name, task_prompt))
+
+		return tasks
+
+	def _list_update_task_names(self) -> list[str]:
+		return [task_name for task_name, _ in self._load_update_tasks()]
+
 	def _start_updates_task_if_needed(self, *, run_immediately: bool = False) -> bool:
 		if self._updates_task is not None and not self._updates_task.done():
 			return False
@@ -184,12 +204,18 @@ class DiscordBotWrapper:
 				logging.warning("Updates channel '%s' not found; skipping scheduled message.", self.updates_channel)
 				return
 
-			try:
-				async with channel.typing():
-					reply = await asyncio.to_thread(llm.generate_response, self.updates_prompt)
-				await self._send_long_message(channel, reply)
-			except Exception as exc:
-				logging.exception("Error running scheduled updates message: %s", exc)
+			tasks = self._load_update_tasks()
+			if not tasks:
+				logging.warning("No scheduled update tasks found in '%s'.", CRON_JOBS_DIR)
+				return
+
+			for task_name, task_prompt in tasks:
+				try:
+					async with channel.typing():
+						reply = await asyncio.to_thread(llm.generate_response, task_prompt)
+					await self._send_long_message(channel, reply)
+				except Exception as exc:
+					logging.exception("Error running scheduled updates task '%s': %s", task_name, exc)
 
 		if run_immediately:
 			await send_scheduled_update()
@@ -244,6 +270,7 @@ class DiscordBotWrapper:
 				f"- {self.command_prefix}history length\n"
 				f"- {self.command_prefix}clear history\n"
 				f"- {self.command_prefix}clear memory\n"
+				f"- {self.command_prefix}list updates tasks\n"
 				f"- {self.command_prefix}start updates\n"
 				f"- {self.command_prefix}stop updates\n"
 				f"- {self.command_prefix}reload"
@@ -259,9 +286,18 @@ class DiscordBotWrapper:
 			await message.channel.send("Conversation history cleared.")
 			return True
 		if content in {f"{self.command_prefix}clear memory", f"{self.command_prefix}clear_memory"}:
-			store = vector_database.get_default_store()
+			store = memory.get_default_store()
 			cleared_count = store.clear_memories()
 			await message.channel.send(f"Memory cleared. Removed {cleared_count} entr{'y' if cleared_count == 1 else 'ies'}.")
+			return True
+		if content == f"{self.command_prefix}list updates tasks":
+			task_names = self._list_update_task_names()
+			if not task_names:
+				await message.channel.send(f"No .md update tasks found in {CRON_JOBS_DIR}.")
+				return True
+
+			formatted_tasks = "\n".join(f"- {name}" for name in task_names)
+			await message.channel.send("Scheduled update tasks (run in this order):\n" + formatted_tasks)
 			return True
 		if content == f"{self.command_prefix}reload":
 			await message.channel.send("Reloading bot...")
@@ -354,8 +390,8 @@ class DiscordBotWrapper:
 			if getattr(message.channel, "name", None) == self.updates_channel:
 				return
 
-			# If allowed_channel is set, ignore messages not in that channel
-			if getattr(message.channel, "name", None) != self.allowed_channel:
+			# If allowed_channels are set, ignore messages not in those channels
+			if self.allowed_channels and getattr(message.channel, "name", None) not in self.allowed_channels:
 				return
 
 			if await self._try_handle_command(message):
@@ -378,9 +414,9 @@ class DiscordBotWrapper:
 
 if __name__ == "__main__":
 	# if vector_db is not there, create it
-	if not Path(vector_database.DEFAULT_DB_PATH).exists():
+	if not Path(memory.DEFAULT_DB_PATH).exists():
 		logging.info("Creating vector database...")
-		vector_database.get_default_store()
+		memory.get_default_store()
 
 	print("Starting PICKLEBOT...")
 	DiscordBotWrapper().run()

@@ -7,7 +7,7 @@ from pathlib import Path
 from config import GEMINI_API_KEY as GEMINI_API_KEY
 from config import model as model
 import history
-import vector_database as vector_database
+import memory as memory
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -44,7 +44,7 @@ def generate_response(user_message: str) -> str:
     temperature = default_temperature
     history.append_history(role="user", text=user_message)
 
-    relevant_memories = vector_database.get_default_store().search_memories(history.get_conversation_history(), limit=5)
+    relevant_memories = memory.get_default_store().search_memories(history.get_conversation_history(), limit=5)
     relevant_memories_text = "\n\n".join([f"Memory: {memory.text}\nMetadata: {json.dumps(memory.metadata)}" for memory in relevant_memories])
     try:
         memory_retriever_response = _run_model_api(history.get_conversation_history() + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
@@ -63,7 +63,7 @@ def generate_response(user_message: str) -> str:
         history.append_history(role="IntentClassifier", text=intent_response)
         memory_extractor_response = _run_model_api(history.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         if memory_extractor_response.strip() != "<NO_MEMORY>" and memory_extractor_response.strip() != "":
-            vector_database.get_default_store().write_memory(memory_extractor_response)
+            memory.get_default_store().write_memory(memory_extractor_response)
             history.append_history(role="MemoryExtractor", text=memory_extractor_response)
         return intent_response
 
@@ -128,11 +128,11 @@ def generate_response(user_message: str) -> str:
     except Exception as e:
         print(f"Error generating texter response: {e}")
 
-    relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in vector_database.get_default_store().search_memories(history.get_conversation_history(), limit=10)])
+    relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in memory.get_default_store().search_memories(history.get_conversation_history(), limit=10)])
     try:
         memory_extractor_response = _run_model_api("History: " + history.get_conversation_history() + "\n\nRelevant memories: \n\n" + relevant_memories_history, MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         if memory_extractor_response.strip() != "<NO_MEMORY>":
-            vector_database.get_default_store().write_memory(memory_extractor_response)
+            memory.get_default_store().write_memory(memory_extractor_response)
             history.append_history(role="MemoryExtractor", text=memory_extractor_response)
     except Exception as e:
         print(f"Error generating memory extractor response: {e}")
@@ -180,6 +180,7 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     temperature: the temperature to use for this generation (default: 1)
     """
     os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
+    print(model)
 
     client = genai.Client()
     agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
