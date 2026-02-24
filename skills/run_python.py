@@ -3,16 +3,15 @@ import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 
 def run_python(code: str) -> str:
     """
-    Run Python code safely and return a single string containing:
-    1) the code that was executed, and
-    2) either stderr (if present) or stdout.
-
-    code: the Python code to execute
+    Run Python code safely. 
+    Use print statements to ensure code execution is visible in the output.
     """
+    os.chdir(Path(__file__).resolve().parent.parent)
     try:
         ast.parse(code, mode="exec")
     except SyntaxError as e:

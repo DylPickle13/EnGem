@@ -8,7 +8,6 @@ from config import GEMINI_API_KEY as GEMINI_API_KEY
 from config import model as model
 import history
 import vector_database as vector_database
-import skills
 
 # Memory Retriever file located alongside this module
 MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retriever.md"
@@ -37,9 +36,6 @@ MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extra
 # Execution order file path
 EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
 
-# Tool list file located alongside this module
-TOOLS_LIST_FILE = Path(__file__).parent / "agent_instructions/tool_list.md"
-
 
 def generate_response(user_message: str) -> str:
 
@@ -59,7 +55,7 @@ def generate_response(user_message: str) -> str:
 
     intent_response = ""
     try:
-        intent_response = _run_model_api(history.get_conversation_history() + user_message, INTENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=default_temperature)
+        intent_response = _run_model_api(history.get_conversation_history(), INTENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=default_temperature)
     except Exception as e:
         print(f"Error generating intent response: {e}")
 
@@ -99,10 +95,12 @@ def generate_response(user_message: str) -> str:
                 print(f"Error reading execution order file: {e}")
                 continue
 
+        last_sub_agent_response = ""
         for agent in execution_order_dict['sub_agents']:
             sub_agent_response = ""
             try:
-                sub_agent_response = _run_model_api(history.get_conversation_history() + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8") + TOOLS_LIST_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=temperature)
+                sub_agent_response = _run_model_api(last_sub_agent_response + "\n\n" + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=temperature)
+                last_sub_agent_response = sub_agent_response
                 history.append_history(role=agent['task_name'], text=sub_agent_response)
                 if sub_agent_response.strip() == "<CANNOT_PROCEED>":
                     break
@@ -144,7 +142,6 @@ def generate_response(user_message: str) -> str:
 def _get_function_declarations(client: genai.Client = None) -> list[types.FunctionDeclaration]:
     """
     Helper function to return a list of available tools for the agent to use, based on the functions defined in the skills directory.
-    
     """
     # get all modules in the skills directory and return only functions defined in those modules
     function_declarations = []
@@ -159,6 +156,19 @@ def _get_function_declarations(client: genai.Client = None) -> list[types.Functi
         except Exception as e:
             print(f"Error importing skill module '{module_name}': {e}")
     return function_declarations
+
+
+def _get_skill(function_name: str, function_args: dict) -> str:
+    """Helper function to execute a tool function based on its name and arguments, and return the output as a string."""
+    function_output = ""
+    for skill_file in (Path(__file__).parent / "skills").glob("*.py"):
+        module_name = skill_file.stem
+        module = __import__(f"skills.{module_name}", fromlist=[module_name])
+        for _, attr in inspect.getmembers(module, inspect.isfunction):
+            if attr.__module__ == module.__name__ and attr.__name__ == function_name:
+                result = attr(function_args[next(iter(function_args))])
+                function_output += result
+    return function_output
 
 
 def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool = True, force_tool: bool = False, temperature: float = 1) -> str:
@@ -202,15 +212,13 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
         for part in response.candidates[0].content.parts:
             if part.function_call:
-                for skill_file in (Path(__file__).parent / "skills").glob("*.py"):
-                    module_name = skill_file.stem
-                    module = __import__(f"skills.{module_name}", fromlist=[module_name])
-                    for _, attr in inspect.getmembers(module, inspect.isfunction):
-                        if attr.__module__ == module.__name__ and attr.__name__ == part.function_call.name:
-                            result = attr(part.function_call.args[next(iter(part.function_call.args))])
-                            function_output += result
+                function_output += _get_skill(part.function_call.name, part.function_call.args)
                     
     output = ""
+
+    if force_tool:
+        return output
+
     follow_up_response = ""
 
     if function_output == "":
