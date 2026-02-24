@@ -58,7 +58,7 @@ class DiscordBotWrapper:
 		self._register_events()
 
 	async def _default_responder(self, text: str, _: discord.Message) -> str:
-		return await asyncio.to_thread(llm.generate_response, text)
+		return await asyncio.to_thread(llm.generate_response, text, False)
 
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
 		for start in range(0, len(text), DISCORD_MESSAGE_LIMIT):
@@ -212,7 +212,7 @@ class DiscordBotWrapper:
 			for task_name, task_prompt in tasks:
 				try:
 					async with channel.typing():
-						reply = await asyncio.to_thread(llm.generate_response, task_prompt)
+						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
 					logging.exception("Error running scheduled updates task '%s': %s", task_name, exc)
