@@ -1,6 +1,6 @@
 import os
 import time
-
+from pathlib import Path
 from google import genai
 from google.genai import types
 from google.genai.types import Content, Part
@@ -8,7 +8,7 @@ from playwright.sync_api import Browser, Page, Playwright, sync_playwright
 
 from config import GEMINI_API_KEY
 
-
+BROWSER_FILE = Path(__file__).parent / "agent_instructions/browser.md"
 SCREEN_WIDTH = 1440
 SCREEN_HEIGHT = 900
 TURN_LIMIT = 25
@@ -16,6 +16,9 @@ MODEL_NAME = "gemini-2.5-computer-use-preview-10-2025"
 DEBUG_SCROLL = False
 DEFAULT_SCROLL_DELTA = 600
 DEFAULT_DOCUMENT_SCROLL_AMOUNT = 800
+
+_PLAYWRIGHT_INSTANCE: Playwright | None = None
+_BROWSER_INSTANCE: Browser | None = None
 
 
 def denormalize_x(x: int, screen_width: int) -> int:
@@ -225,6 +228,62 @@ def _execute_single_action(
         page.goto(target_url)
         return {}
 
+    if fname in {"retrieve_url", "get_current_url", "current_url"}:
+        return {"retrieved_url": page.url}
+
+    if fname == "extract_elements":
+        selector = args.get("selector")
+        if not selector:
+            return {"error": "Missing selector argument"}
+
+        raw_attributes = args.get("attributes", [])
+        if isinstance(raw_attributes, str):
+            attributes = [raw_attributes]
+        elif isinstance(raw_attributes, (list, tuple)):
+            attributes = [str(attribute) for attribute in raw_attributes if attribute]
+        else:
+            attributes = []
+
+        include_text = bool(args.get("include_text", not attributes))
+        limit = int(args.get("limit", args.get("max_elements", 50)))
+        if limit < 1:
+            limit = 1
+
+        extracted = _evaluate_with_navigation_retry(
+            page,
+            """({selector, attributes, includeText, limit}) => {
+            const nodes = Array.from(document.querySelectorAll(selector)).slice(0, limit);
+            return nodes.map((node) => {
+                const item = {};
+                if (includeText) {
+                    item.text = (node.textContent || '').trim();
+                }
+
+                for (const attribute of attributes) {
+                    item[attribute] = node.getAttribute(attribute);
+                }
+
+                if (!includeText && attributes.length === 0) {
+                    item.text = (node.textContent || '').trim();
+                }
+
+                return item;
+            });
+        }""",
+            {
+                "selector": selector,
+                "attributes": attributes,
+                "includeText": include_text,
+                "limit": limit,
+            },
+        )
+
+        return {
+            "selector": selector,
+            "count": len(extracted),
+            "elements": extracted,
+        }
+
     if fname == "click_at":
         actual_x, actual_y = _actual_coordinates(args, screen_width, screen_height)
         button = args.get("button", "left")
@@ -312,24 +371,16 @@ def _execute_single_action(
                     if DEBUG_SCROLL:
                         print(f"[scroll-debug] programmatic scroll failed: {error}")
 
-        if DEBUG_SCROLL:
-            final_state = _capture_scroll_state(page, target_x, target_y)
-            print(
-                "[scroll-debug]"
-                f" name={fname}"
-                f" args={dict(args)}"
-                f" deltas=({delta_x},{delta_y})"
-                f" wheel_moved={wheel_moved}"
-                f" before={before_state}"
-                f" after_wheel={after_state}"
-                f" final={final_state}"
-            )
 
         return {}
 
     if fname == "wait":
         seconds = float(args.get("seconds", 1))
         time.sleep(max(0, seconds))
+        return {}
+
+    if fname == "wait_5_seconds":
+        time.sleep(5)
         return {}
 
     if fname == "go_back":
@@ -374,7 +425,6 @@ def execute_function_calls(candidate, page: Page, screen_width: int, screen_heig
 
             # Wait for potential navigations/renders
             page.wait_for_load_state(timeout=5000)
-            time.sleep(1)
 
         except Exception as e:
             print(f"Error executing {fname}: {e}")
@@ -418,22 +468,41 @@ def create_model_config() -> types.GenerateContentConfig:
             environment=types.Environment.ENVIRONMENT_BROWSER
         ))],
         thinking_config=types.ThinkingConfig(include_thoughts=True),
+        system_instruction=BROWSER_FILE.read_text(encoding="utf-8")
     )
     return config
 
 
-def setup_browser() -> tuple[Playwright, Browser, Page]:
-    print("Initializing browser...")
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=False)
-    context = browser.new_context(viewport={"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT})
+def _get_existing_open_page(browser: Browser) -> Page | None:
+    for context in reversed(browser.contexts):
+        for page in reversed(context.pages):
+            if not page.is_closed():
+                return page
+    return None
+
+
+def setup_browser(reuse_existing: bool = True) -> tuple[Playwright, Browser, Page]:
+    global _PLAYWRIGHT_INSTANCE, _BROWSER_INSTANCE
+
+    if reuse_existing and _PLAYWRIGHT_INSTANCE and _BROWSER_INSTANCE and _BROWSER_INSTANCE.is_connected():
+        existing_page = _get_existing_open_page(_BROWSER_INSTANCE)
+        if existing_page:
+            return _PLAYWRIGHT_INSTANCE, _BROWSER_INSTANCE, existing_page
+
+    if _PLAYWRIGHT_INSTANCE is None:
+        _PLAYWRIGHT_INSTANCE = sync_playwright().start()
+
+    if _BROWSER_INSTANCE is None or not _BROWSER_INSTANCE.is_connected():
+        _BROWSER_INSTANCE = _PLAYWRIGHT_INSTANCE.chromium.launch(headless=False)
+
+    context = _BROWSER_INSTANCE.new_context(viewport={"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT})
     page = context.new_page()
-    return playwright, browser, page
+    return _PLAYWRIGHT_INSTANCE, _BROWSER_INSTANCE, page
 
 
-def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> None:
+def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
+    print("Prompt:", prompt)
     config = create_model_config()
-
     initial_screenshot = page.screenshot(type="png")
 
     contents = [
@@ -445,7 +514,6 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> None:
 
     for i in range(TURN_LIMIT):
         print(f"\n--- Turn {i+1} ---")
-        print("Thinking...")
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=contents,
@@ -457,16 +525,13 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> None:
 
         has_function_calls = any(part.function_call for part in candidate.content.parts)
         if not has_function_calls:
-            text_response = " ".join([part.text for part in candidate.content.parts if part.text])
-            print("Agent finished:", text_response)
-            break
+            return " ".join([part.text for part in candidate.content.parts if part.text])
 
-        print("Executing actions...")
         results = execute_function_calls(candidate, page, SCREEN_WIDTH, SCREEN_HEIGHT)
 
-        print("Capturing state...")
         function_responses = get_function_responses(page, results)
 
         contents.append(
             Content(role="user", parts=[Part(function_response=fr) for fr in function_responses])
         )
+    return " ".join([part.text for part in contents[-1].parts if part.text])

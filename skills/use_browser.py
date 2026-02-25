@@ -7,24 +7,22 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import computer_use
 
-def run_browser(prompt: str) -> str:
+def use_browser(prompt: str) -> str:
     """
-    Opens a browser and automates interactions based on the provided prompt using the computer_use agent.
+    Runs actions based on the provided prompt using the computer_use agent.
+    Returns the output of the agent's actions as a string.
     """
     output = ""
     client = computer_use.create_client()
-    playwright, browser, page = computer_use.setup_browser()
+    _playwright, _browser, page = computer_use.setup_browser(reuse_existing=True)
 
     try:
         output = computer_use.run_agent_loop(client, page, prompt=prompt)
     except Exception as e:
         output = f"An error occurred: {str(e)}"
-    finally:
-        browser.close()
-        playwright.stop()
     return output
 
 if __name__ == "__main__":
     prompt = "Find data scientist jobs on indeed.com and compile me a list of 5. Make sure the job is in canada. Summarize the job description for each role in 1-2 sentences."
-    result = run_browser(prompt)
+    result = use_browser(prompt)
     print(result)
