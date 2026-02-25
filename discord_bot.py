@@ -245,7 +245,7 @@ class DiscordBotWrapper:
 
 				try:
 					async with channel.typing():
-						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True)
+						reply = await asyncio.to_thread(llm.generate_response, task_prompt, job=True)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
 					logging.exception("Error running cron job task '%s': %s", task_name, exc)
@@ -289,7 +289,7 @@ class DiscordBotWrapper:
 
 				try:
 					async with channel.typing():
-						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True)
+						reply = await asyncio.to_thread(llm.generate_response, task_prompt, job=True)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
 					logging.exception("Error running heartbeat task '%s': %s", task_name, exc)

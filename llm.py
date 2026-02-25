@@ -34,14 +34,14 @@ MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extra
 EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
 
 
-def generate_response(user_message: str, cron_job: bool) -> str:
+def generate_response(user_message: str, job: bool) -> str:
 
     exit_string = ""
-    default_temperature = 0.1
+    default_temperature = 1.0
     temperature = default_temperature
     history.append_history(role="user", text=user_message)
 
-    if not cron_job:
+    if not job:
         relevant_memories = memory.get_default_store().search_memories(history.get_conversation_history(), limit=5)
         relevant_memories_text = "\n\n".join([f"Memory: {memory.text}\nMetadata: {json.dumps(memory.metadata)}" for memory in relevant_memories])
         try:
@@ -59,7 +59,7 @@ def generate_response(user_message: str, cron_job: bool) -> str:
 
         if intent_response != "<complex>":
             history.append_history(role="IntentClassifier", text=intent_response)
-            if not cron_job:
+            if not job:
                 memory_extractor_response = _run_model_api(history.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
                 if memory_extractor_response.strip() != "<NO_MEMORY>" and memory_extractor_response.strip() != "":
                     memory.get_default_store().write_memory(memory_extractor_response)
@@ -125,7 +125,7 @@ def generate_response(user_message: str, cron_job: bool) -> str:
     except Exception as e:
         print(f"Error generating texter response: {e}")
 
-    if not cron_job:
+    if not job:
         relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in memory.get_default_store().search_memories(history.get_conversation_history(), limit=10)])
         try:
             memory_extractor_response = _run_model_api("History: " + history.get_conversation_history() + "\n\nRelevant memories: \n\n" + relevant_memories_history, MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
