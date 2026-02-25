@@ -428,3 +428,4 @@ if __name__ == "__main__":
 
 	print("Starting PICKLEBOT...")
 	DiscordBotWrapper().run()
+	print("PICKLEBOT stopped.")
