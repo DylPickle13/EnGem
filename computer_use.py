@@ -498,7 +498,7 @@ def setup_browser(reuse_existing: bool = True) -> tuple[Playwright, Browser, Pag
 
 
 def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
-    print("Prompt:", prompt)
+    # print("Prompt:", prompt)
     config = create_model_config()
     initial_screenshot = page.screenshot(type="png")
 
@@ -511,7 +511,7 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
 
     responses = ""
     for i in range(TURN_LIMIT):
-        print(f"\n--- Turn {i+1} ---")
+        # print(f"\n--- Turn {i+1} ---")
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=contents,
@@ -523,7 +523,7 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
 
         has_function_calls = any(part.function_call for part in candidate.content.parts)
         if not has_function_calls:
-            print("No function calls detected, ending agent loop.")
+            # print("No function calls detected, ending agent loop.")
             responses += "".join(part.text for part in candidate.content.parts if part.text)
             break
 

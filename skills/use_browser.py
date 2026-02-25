@@ -5,7 +5,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Browser Summarizer file located alongside this module
+BROWSER_SUMMARIZER_FILE = Path(__file__).parent / "agent_instructions/browser_summarizer.md"
+
 import computer_use
+import llm
 
 def use_browser(prompt: str) -> str:
     """
@@ -18,6 +22,8 @@ def use_browser(prompt: str) -> str:
 
     try:
         output = computer_use.run_agent_loop(client, page, prompt=prompt)
+
+        output = llm._run_model_api(output, system_instructions="", tool_use_allowed=False, force_tool=False, temperature=1.0)
     except Exception as e:
         output = f"An error occurred: {str(e)}"
     return output

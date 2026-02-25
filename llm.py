@@ -34,36 +34,36 @@ MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extra
 EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
 
 
-def generate_response(user_message: str, job: bool) -> str:
+def generate_response(user_message: str, job: bool, history_file: str = "picklebot-test") -> str:
 
     exit_string = ""
     default_temperature = 1.0
     temperature = default_temperature
-    history.append_history(role="user", text=user_message)
+    history.append_history(role="user", text=user_message, history_file=history_file)
 
     if not job:
-        relevant_memories = memory.get_default_store().search_memories(history.get_conversation_history(), limit=5)
+        relevant_memories = memory.get_default_store().search_memories(history.get_conversation_history(history_file=history_file), limit=5)
         relevant_memories_text = "\n\n".join([f"Memory: {memory.text}\nMetadata: {json.dumps(memory.metadata)}" for memory in relevant_memories])
         try:
-            memory_retriever_response = _run_model_api(history.get_conversation_history() + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+            memory_retriever_response = _run_model_api(history.get_conversation_history(history_file=history_file) + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
             if memory_retriever_response != "<NO_RELEVANT_MEMORIES>":
-                history.append_history(role="MemoryRetriever", text=memory_retriever_response)
+                history.append_history(role="MemoryRetriever", text=memory_retriever_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating memory retriever response: {e}")
 
         intent_response = ""
         try:
-            intent_response = _run_model_api(history.get_conversation_history(), INTENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=default_temperature)
+            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=default_temperature)
         except Exception as e:
             print(f"Error generating intent response: {e}")
 
         if intent_response != "<complex>":
-            history.append_history(role="IntentClassifier", text=intent_response)
+            history.append_history(role="IntentClassifier", text=intent_response, history_file=history_file)
             if not job:
-                memory_extractor_response = _run_model_api(history.get_conversation_history(), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+                memory_extractor_response = _run_model_api(history.get_conversation_history(history_file=history_file), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
                 if memory_extractor_response.strip() != "<NO_MEMORY>" and memory_extractor_response.strip() != "":
                     memory.get_default_store().write_memory(memory_extractor_response)
-                    history.append_history(role="MemoryExtractor", text=memory_extractor_response)
+                    history.append_history(role="MemoryExtractor", text=memory_extractor_response, history_file=history_file)
             return intent_response
 
     while True:
@@ -77,8 +77,8 @@ def generate_response(user_message: str, job: bool) -> str:
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(history.get_conversation_history(), MANAGER_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=True, temperature=temperature)
-            history.append_history(role="Manager", text=manager_response)
+            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=True, temperature=temperature)
+            history.append_history(role="Manager", text=manager_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating manager response: {e}")
 
@@ -97,8 +97,8 @@ def generate_response(user_message: str, job: bool) -> str:
         for agent in execution_order_dict['sub_agents']:
             sub_agent_response = ""
             try:
-                sub_agent_response = _run_model_api(history.get_conversation_history() + "\n\n" + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=temperature)
-                history.append_history(role=agent['task_name'], text=sub_agent_response)
+                sub_agent_response = _run_model_api(history.get_conversation_history(history_file=history_file) + "\n\n" + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=temperature)
+                history.append_history(role=agent['task_name'], text=sub_agent_response, history_file=history_file)
                 if sub_agent_response.strip() == "<CANNOT_PROCEED>":
                     break
             except Exception as e:
@@ -108,8 +108,8 @@ def generate_response(user_message: str, job: bool) -> str:
             continue
 
         try:
-            exit_string = _run_model_api(history.get_conversation_history() + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
-            history.append_history(role="Reviewer", text=exit_string)
+            exit_string = _run_model_api(history.get_conversation_history(history_file=history_file) + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+            history.append_history(role="Reviewer", text=exit_string, history_file=history_file)
         except Exception as e:
             print(f"Error generating reviewer response: {e}")
         if exit_string == "<yes>":
@@ -120,18 +120,18 @@ def generate_response(user_message: str, job: bool) -> str:
 
     text_response = ""
     try:
-        text_response = _run_model_api(history.get_conversation_history(), TEXTER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
-        history.append_history(role="Texter", text=text_response)
+        text_response = _run_model_api(history.get_conversation_history(history_file=history_file), TEXTER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+        history.append_history(role="Texter", text=text_response, history_file=history_file)
     except Exception as e:
         print(f"Error generating texter response: {e}")
 
     if not job:
-        relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in memory.get_default_store().search_memories(history.get_conversation_history(), limit=10)])
+        relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in memory.get_default_store().search_memories(history.get_conversation_history(history_file=history_file), limit=10)])
         try:
-            memory_extractor_response = _run_model_api("History: " + history.get_conversation_history() + "\n\nRelevant memories: \n\n" + relevant_memories_history, MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+            memory_extractor_response = _run_model_api("History: " + history.get_conversation_history(history_file=history_file) + "\n\nRelevant memories: \n\n" + relevant_memories_history, MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
             if memory_extractor_response.strip() != "<NO_MEMORY>":
                 memory.get_default_store().write_memory(memory_extractor_response)
-                history.append_history(role="MemoryExtractor", text=memory_extractor_response)
+                history.append_history(role="MemoryExtractor", text=memory_extractor_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating memory extractor response: {e}")
     return text_response

@@ -6,9 +6,11 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Iterable, Optional
 
 from config import (
+	CRON_JOB_HOUR,
+	CRON_JOB_MINUTE,
 	DISCORD_BOT_CHANNELS,
 	DISCORD_BOT_TOKEN,
 )
@@ -23,6 +25,45 @@ CRON_JOBS_DIR = Path(__file__).parent / "agent_instructions/cron_jobs"
 HEARTBEAT_JOBS_DIR = Path(__file__).parent / "agent_instructions/heartbeat_jobs"
 DISCORD_MESSAGE_LIMIT = 2000
 HEARTBEAT_INTERVAL_SECONDS = 30 * 60
+MESSAGE_WORKER_CONCURRENCY = 3
+CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
+
+def _sanitize_history_filename_component(value: str | None) -> str:
+	value = (value or "").strip()
+	if not value:
+		return "unnamed"
+	safe = "".join(
+		ch if ch.isalnum() or ch in ("-", "_") else "_"
+		for ch in value
+	).strip("_")
+	return safe or "unnamed"
+
+def _get_channel_history_file(channel: discord.TextChannel) -> Path:
+	channel_name = _sanitize_history_filename_component(channel.name)
+	filename = f"{channel_name}.md"
+	return CHANNEL_HISTORY_DIR / filename
+
+def _get_history_file_key_for_channel(channel: object) -> str:
+	channel_name = _sanitize_history_filename_component(getattr(channel, "name", None))
+	return channel_name or "default"
+
+def ensure_history_files_for_text_channels(channels: Iterable[discord.TextChannel]) -> int:
+	channel_list = list(channels)
+	if not channel_list:
+		return 0
+
+	CHANNEL_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+	for channel in channel_list:
+		try:
+			_get_channel_history_file(channel).touch(exist_ok=True)
+		except OSError as exc:
+			logging.exception(
+				"Failed to create history file for channel '%s' (%s): %s",
+				channel.name,
+				channel.id,
+				exc,
+			)
+	return len(channel_list)
 
 
 class DiscordBotWrapper:
@@ -40,13 +81,13 @@ class DiscordBotWrapper:
 		}
 		self.whisper_model = None
 		self._message_queue: asyncio.Queue[discord.Message] = asyncio.Queue()
-		self._worker_task: asyncio.Task[None] | None = None
+		self._worker_tasks: set[asyncio.Task[None]] = set()
+		self._worker_start_lock = asyncio.Lock()
 		self._cron_task: asyncio.Task[None] | None = None
 		self._cron_stop_event: asyncio.Event | None = None
 		self._heartbeat_task: asyncio.Task[None] | None = None
 		self._heartbeat_stop_event: asyncio.Event | None = None
 		self._restart_requested = False
-		self._queue_lock = asyncio.Lock()
 
 		intents = discord.Intents.default()
 		intents.message_content = True
@@ -55,8 +96,9 @@ class DiscordBotWrapper:
 		self.responder = responder or self._default_responder
 		self._register_events()
 
-	async def _default_responder(self, text: str, _: discord.Message) -> str:
-		return await asyncio.to_thread(llm.generate_response, text, False)
+	async def _default_responder(self, text: str, message: discord.Message) -> str:
+		history_file = _get_history_file_key_for_channel(message.channel)
+		return await asyncio.to_thread(llm.generate_response, text, False, history_file)
 
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
 		for start in range(0, len(text), DISCORD_MESSAGE_LIMIT):
@@ -74,9 +116,10 @@ class DiscordBotWrapper:
 		await self._send_long_message(channel, reply)
 
 	async def _shutdown_background_tasks(self) -> None:
+		worker_tasks = [task for task in self._worker_tasks if not task.done()]
 		tasks = [
 			task
-			for task in (self._cron_task, self._heartbeat_task, self._worker_task)
+			for task in (self._cron_task, self._heartbeat_task, *worker_tasks)
 			if task is not None and not task.done()
 		]
 		for task in tasks:
@@ -87,7 +130,7 @@ class DiscordBotWrapper:
 
 		self._cron_task = None
 		self._heartbeat_task = None
-		self._worker_task = None
+		self._worker_tasks.clear()
 
 	async def _request_reload(self) -> None:
 		if self._restart_requested:
@@ -126,7 +169,7 @@ class DiscordBotWrapper:
 			return data.decode("utf-8", errors="replace").strip()
 
 	@staticmethod
-	def _seconds_until_next_daily_run(target_hour: int = 9, target_minute: int = 0) -> float:
+	def _seconds_until_next_daily_run(target_hour: int, target_minute: int) -> float:
 		now = datetime.datetime.now()
 		next_run = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
 		if now >= next_run:
@@ -245,7 +288,7 @@ class DiscordBotWrapper:
 
 				try:
 					async with channel.typing():
-						reply = await asyncio.to_thread(llm.generate_response, task_prompt, job=True)
+						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
 					logging.exception("Error running cron job task '%s': %s", task_name, exc)
@@ -255,7 +298,7 @@ class DiscordBotWrapper:
 
 		while True:
 			try:
-				seconds_until_next_run = self._seconds_until_next_daily_run(9, 0)
+				seconds_until_next_run = self._seconds_until_next_daily_run(CRON_JOB_HOUR, CRON_JOB_MINUTE)
 				if self._cron_stop_event is not None:
 					await asyncio.wait_for(
 						self._cron_stop_event.wait(),
@@ -289,7 +332,7 @@ class DiscordBotWrapper:
 
 				try:
 					async with channel.typing():
-						reply = await asyncio.to_thread(llm.generate_response, task_prompt, job=True)
+						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
 					logging.exception("Error running heartbeat task '%s': %s", task_name, exc)
@@ -313,12 +356,18 @@ class DiscordBotWrapper:
 
 			await send_heartbeat_jobs()
 
-	async def _enqueue_message(self, message: discord.Message) -> None:
-		async with self._queue_lock:
-			if self._worker_task is None or self._worker_task.done():
-				self._worker_task = asyncio.create_task(self._queue_worker())
+	async def _ensure_worker_pool(self) -> None:
+		async with self._worker_start_lock:
+			self._worker_tasks = {task for task in self._worker_tasks if not task.done()}
 
-			await self._message_queue.put(message)
+			workers_to_start = MESSAGE_WORKER_CONCURRENCY - len(self._worker_tasks)
+			for _ in range(max(0, workers_to_start)):
+				worker = asyncio.create_task(self._queue_worker())
+				self._worker_tasks.add(worker)
+
+	async def _enqueue_message(self, message: discord.Message) -> None:
+		await self._ensure_worker_pool()
+		await self._message_queue.put(message)
 
 	async def _queue_worker(self) -> None:
 		while True:
@@ -339,6 +388,7 @@ class DiscordBotWrapper:
 
 	async def _try_handle_command(self, message: discord.Message) -> bool:
 		content = (message.content or "").strip()
+		history_file = _get_history_file_key_for_channel(message.channel)
 
 		if content == f"{self.command_prefix}commands":
 			await message.channel.send(
@@ -349,16 +399,18 @@ class DiscordBotWrapper:
 				f"- {self.command_prefix}clear memory\n"
 				f"- {self.command_prefix}list cron jobs\n"
 				f"- {self.command_prefix}list heartbeat jobs\n"
+				f"- {self.command_prefix}start heartbeat\n"
+				f"- {self.command_prefix}stop heartbeat\n"
 				f"- {self.command_prefix}reload"
 			)
 			return True
 
 		if content == f"{self.command_prefix}history length":
-			history_text = history.get_conversation_history()
+			history_text = history.get_conversation_history(history_file=history_file)
 			await message.channel.send(f"Conversation history length: {len(history_text)}")
 			return True
 		if content == f"{self.command_prefix}clear history":
-			history.clear_history()
+			history.clear_history(history_file=history_file)
 			await message.channel.send("Conversation history cleared.")
 			return True
 		if content in {f"{self.command_prefix}clear memory", f"{self.command_prefix}clear_memory"}:
@@ -383,6 +435,20 @@ class DiscordBotWrapper:
 
 			formatted_tasks = "\n".join(f"- {name}" for name in task_names)
 			await message.channel.send("Heartbeat tasks (run in this order):\n" + formatted_tasks)
+			return True
+		if content == f"{self.command_prefix}start heartbeat":
+			started = self._start_heartbeat_task_if_needed(run_immediately=True)
+			if started:
+				await message.channel.send("Heartbeat scheduler started and ran immediately.")
+			else:
+				await message.channel.send("Heartbeat scheduler is already running.")
+			return True
+		if content == f"{self.command_prefix}stop heartbeat":
+			stopped = await self._stop_heartbeat_task_if_running()
+			if stopped:
+				await message.channel.send("Heartbeat scheduler stopped.")
+			else:
+				await message.channel.send("Heartbeat scheduler is not running.")
 			return True
 		if content == f"{self.command_prefix}reload":
 			await message.channel.send("Reloading bot...")
@@ -440,14 +506,33 @@ class DiscordBotWrapper:
 
 		await self._respond_and_send(message.channel, content, message)
 
+	def _ensure_channel_history_files(self) -> None:
+		channels = [
+			channel
+			for guild in self.client.guilds
+			for channel in guild.text_channels
+		]
+		if not channels:
+			return
+
+		created = ensure_history_files_for_text_channels(channels)
+		if created:
+			logging.info(
+				"Ensured history files for %d Discord channel%s in %s.",
+				created,
+				"" if created == 1 else "s",
+				CHANNEL_HISTORY_DIR,
+			)
+
 	def _register_events(self) -> None:
 		@self.client.event
 		async def on_ready() -> None:
 			logging.info("Discord bot logged in as %s", self.client.user)
 			if shutil.which("ffmpeg") is None:
 				logging.warning("ffmpeg not found: voice transcription will be unavailable until installed.")
+			self._ensure_channel_history_files()
 			self._start_cron_task_if_needed()
-			self._start_heartbeat_task_if_needed(run_immediately=True)
+			logging.info("Heartbeat scheduler is idle. Use '%sstart heartbeat' to start it.", self.command_prefix)
 
 		@self.client.event
 		async def on_message(message: discord.Message) -> None:

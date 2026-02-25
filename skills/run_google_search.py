@@ -7,7 +7,10 @@ from google.genai import types
 
 
 def run_google_search(query: str) -> str:
-    """Run a Google Search using the Gemini API's Google Search tool."""
+    """
+    Run a Google Search using the Gemini API's Google Search tool.
+    Only returns summarized search results, not urls or article titles.
+    """
     os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
 
     client = genai.Client()
