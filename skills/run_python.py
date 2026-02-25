@@ -16,7 +16,7 @@ def run_python(code: str) -> str:
         ast.parse(code, mode="exec")
     except SyntaxError as e:
         output_text = f"SyntaxError: {e}"
-        return f"Code run:\n{code}\n\nOutput:\n{output_text}"
+        return f"Code run:\n```python{code}```\n\nOutput:\n{output_text}"
 
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as f:
         f.write(code.encode())
@@ -38,4 +38,4 @@ def run_python(code: str) -> str:
         except OSError:
             pass
 
-    return f"Code run:\n{code}\n\nOutput:\n{output_text}"
+    return f"Code run:\n```python{code}```\n\nOutput:\n{output_text}"
