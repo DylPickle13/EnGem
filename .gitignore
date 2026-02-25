@@ -6,4 +6,5 @@ config.py
 /sub-agents
 /.vscode
 /agent_instructions/cron_jobs
+/agent_instructions/heartbeat_jobs
 /sandbox

@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import os
 import shutil
@@ -10,9 +11,6 @@ from typing import Awaitable, Callable, Optional
 from config import (
 	DISCORD_BOT_CHANNELS,
 	DISCORD_BOT_TOKEN,
-	DISCORD_UPDATES_CHANNEL,
-	DISCORD_UPDATES_ENABLED,
-	DISCORD_UPDATES_INTERVAL_SECONDS,
 )
 
 import discord
@@ -22,8 +20,9 @@ import whisper
 import memory as memory
 
 CRON_JOBS_DIR = Path(__file__).parent / "agent_instructions/cron_jobs"
+HEARTBEAT_JOBS_DIR = Path(__file__).parent / "agent_instructions/heartbeat_jobs"
 DISCORD_MESSAGE_LIMIT = 2000
-DEFAULT_UPDATES_INTERVAL_SECONDS = 86400.0
+HEARTBEAT_INTERVAL_SECONDS = 30 * 60
 
 
 class DiscordBotWrapper:
@@ -39,14 +38,13 @@ class DiscordBotWrapper:
 			for channel in str(DISCORD_BOT_CHANNELS).split(",")
 			if channel.strip()
 		}
-		self.updates_channel = DISCORD_UPDATES_CHANNEL
-		self.updates_enabled = DISCORD_UPDATES_ENABLED
-		self.updates_interval_seconds = DISCORD_UPDATES_INTERVAL_SECONDS
 		self.whisper_model = None
 		self._message_queue: asyncio.Queue[discord.Message] = asyncio.Queue()
 		self._worker_task: asyncio.Task[None] | None = None
-		self._updates_task: asyncio.Task[None] | None = None
-		self._updates_stop_event: asyncio.Event | None = None
+		self._cron_task: asyncio.Task[None] | None = None
+		self._cron_stop_event: asyncio.Event | None = None
+		self._heartbeat_task: asyncio.Task[None] | None = None
+		self._heartbeat_stop_event: asyncio.Event | None = None
 		self._restart_requested = False
 		self._queue_lock = asyncio.Lock()
 
@@ -65,10 +63,6 @@ class DiscordBotWrapper:
 			await channel.send(text[start : start + DISCORD_MESSAGE_LIMIT])
 
 	@staticmethod
-	def _to_bool(value: object) -> bool:
-		return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-	@staticmethod
 	def _build_prompt(content: str, attachment_text: str) -> str:
 		if not content:
 			return attachment_text
@@ -80,14 +74,19 @@ class DiscordBotWrapper:
 		await self._send_long_message(channel, reply)
 
 	async def _shutdown_background_tasks(self) -> None:
-		tasks = [task for task in (self._updates_task, self._worker_task) if task is not None and not task.done()]
+		tasks = [
+			task
+			for task in (self._cron_task, self._heartbeat_task, self._worker_task)
+			if task is not None and not task.done()
+		]
 		for task in tasks:
 			task.cancel()
 
 		if tasks:
 			await asyncio.gather(*tasks, return_exceptions=True)
 
-		self._updates_task = None
+		self._cron_task = None
+		self._heartbeat_task = None
 		self._worker_task = None
 
 	async def _request_reload(self) -> None:
@@ -126,28 +125,13 @@ class DiscordBotWrapper:
 		except UnicodeDecodeError:
 			return data.decode("utf-8", errors="replace").strip()
 
-	def _get_updates_interval_seconds(self) -> float:
-		try:
-			interval_seconds = float(self.updates_interval_seconds)
-		except (ValueError, TypeError):
-			logging.warning(
-				"Invalid DISCORD_UPDATES_INTERVAL_SECONDS '%s'; defaulting to %s",
-				self.updates_interval_seconds,
-				int(DEFAULT_UPDATES_INTERVAL_SECONDS),
-			)
-			interval_seconds = DEFAULT_UPDATES_INTERVAL_SECONDS
-
-		if interval_seconds <= 0:
-			logging.warning(
-				"DISCORD_UPDATES_INTERVAL_SECONDS must be > 0; defaulting to %s",
-				int(DEFAULT_UPDATES_INTERVAL_SECONDS),
-			)
-			interval_seconds = DEFAULT_UPDATES_INTERVAL_SECONDS
-
-		return interval_seconds
-
-	def _updates_are_enabled(self) -> bool:
-		return self._to_bool(self.updates_enabled)
+	@staticmethod
+	def _seconds_until_next_daily_run(target_hour: int = 9, target_minute: int = 0) -> float:
+		now = datetime.datetime.now()
+		next_run = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+		if now >= next_run:
+			next_run += datetime.timedelta(days=1)
+		return (next_run - now).total_seconds()
 
 	def _find_channel_by_name(self, channel_name: str) -> Optional[discord.abc.Messageable]:
 		for guild in self.client.guilds:
@@ -160,7 +144,7 @@ class DiscordBotWrapper:
 	def _get_task_channel_name(task_file: Path) -> str:
 		return task_file.stem.replace("_", "-")
 
-	def _load_update_tasks(self) -> list[tuple[str, str, str]]:
+	def _load_cron_tasks(self) -> list[tuple[str, str, str]]:
 		tasks: list[tuple[str, str, str]] = []
 
 		for task_file in sorted(CRON_JOBS_DIR.glob("*.md")):
@@ -175,37 +159,78 @@ class DiscordBotWrapper:
 
 		return tasks
 
-	def _list_update_task_names(self) -> list[str]:
-		return [f"{task_name} -> #{channel_name}" for task_name, channel_name, _ in self._load_update_tasks()]
+	def _load_heartbeat_tasks(self) -> list[tuple[str, str, str]]:
+		tasks: list[tuple[str, str, str]] = []
 
-	def _start_updates_task_if_needed(self, *, run_immediately: bool = False) -> bool:
-		if self._updates_task is not None and not self._updates_task.done():
+		for task_file in sorted(HEARTBEAT_JOBS_DIR.glob("*.md")):
+			try:
+				task_prompt = task_file.read_text(encoding="utf-8").strip()
+			except Exception as exc:
+				logging.exception("Error reading heartbeat task file '%s': %s", task_file, exc)
+				continue
+
+			if task_prompt:
+				tasks.append((task_file.name, self._get_task_channel_name(task_file), task_prompt))
+
+		return tasks
+
+	def _list_cron_task_names(self) -> list[str]:
+		return [f"{task_name} -> #{channel_name}" for task_name, channel_name, _ in self._load_cron_tasks()]
+
+	def _list_heartbeat_task_names(self) -> list[str]:
+		return [f"{task_name} -> #{channel_name}" for task_name, channel_name, _ in self._load_heartbeat_tasks()]
+
+	def _start_cron_task_if_needed(self, *, run_immediately: bool = False) -> bool:
+		if self._cron_task is not None and not self._cron_task.done():
 			return False
 
-		self._updates_stop_event = asyncio.Event()
-		self._updates_task = asyncio.create_task(self._run_updates_scheduler(run_immediately=run_immediately))
+		self._cron_stop_event = asyncio.Event()
+		self._cron_task = asyncio.create_task(self._run_cron_scheduler(run_immediately=run_immediately))
 		return True
 
-	async def _stop_updates_task_if_running(self) -> bool:
-		if self._updates_task is None or self._updates_task.done():
-			self._updates_task = None
-			self._updates_stop_event = None
+	def _start_heartbeat_task_if_needed(self, *, run_immediately: bool = False) -> bool:
+		if self._heartbeat_task is not None and not self._heartbeat_task.done():
 			return False
 
-		if self._updates_stop_event is not None:
-			self._updates_stop_event.set()
-
-		self._updates_task.cancel()
-		await asyncio.gather(self._updates_task, return_exceptions=True)
-		self._updates_task = None
-		self._updates_stop_event = None
+		self._heartbeat_stop_event = asyncio.Event()
+		self._heartbeat_task = asyncio.create_task(self._run_heartbeat_scheduler(run_immediately=run_immediately))
 		return True
 
-	async def _run_updates_scheduler(self, run_immediately: bool = False) -> None:
-		async def send_scheduled_update() -> None:
-			tasks = self._load_update_tasks()
+	async def _stop_cron_task_if_running(self) -> bool:
+		if self._cron_task is None or self._cron_task.done():
+			self._cron_task = None
+			self._cron_stop_event = None
+			return False
+
+		if self._cron_stop_event is not None:
+			self._cron_stop_event.set()
+
+		self._cron_task.cancel()
+		await asyncio.gather(self._cron_task, return_exceptions=True)
+		self._cron_task = None
+		self._cron_stop_event = None
+		return True
+
+	async def _stop_heartbeat_task_if_running(self) -> bool:
+		if self._heartbeat_task is None or self._heartbeat_task.done():
+			self._heartbeat_task = None
+			self._heartbeat_stop_event = None
+			return False
+
+		if self._heartbeat_stop_event is not None:
+			self._heartbeat_stop_event.set()
+
+		self._heartbeat_task.cancel()
+		await asyncio.gather(self._heartbeat_task, return_exceptions=True)
+		self._heartbeat_task = None
+		self._heartbeat_stop_event = None
+		return True
+
+	async def _run_cron_scheduler(self, run_immediately: bool = False) -> None:
+		async def send_cron_jobs() -> None:
+			tasks = self._load_cron_tasks()
 			if not tasks:
-				logging.warning("No scheduled update tasks found in '%s'.", CRON_JOBS_DIR)
+				logging.warning("No cron job tasks found in '%s'.", CRON_JOBS_DIR)
 				return
 
 			for task_name, channel_name, task_prompt in tasks:
@@ -223,26 +248,70 @@ class DiscordBotWrapper:
 						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
-					logging.exception("Error running scheduled updates task '%s': %s", task_name, exc)
+					logging.exception("Error running cron job task '%s': %s", task_name, exc)
 
 		if run_immediately:
-			await send_scheduled_update()
+			await send_cron_jobs()
 
 		while True:
 			try:
-				if self._updates_stop_event is not None:
+				seconds_until_next_run = self._seconds_until_next_daily_run(9, 0)
+				if self._cron_stop_event is not None:
 					await asyncio.wait_for(
-						self._updates_stop_event.wait(),
-						timeout=self._get_updates_interval_seconds(),
+						self._cron_stop_event.wait(),
+						timeout=seconds_until_next_run,
 					)
 					break
-				await asyncio.sleep(self._get_updates_interval_seconds())
+				await asyncio.sleep(seconds_until_next_run)
 			except asyncio.TimeoutError:
 				pass
 			except asyncio.CancelledError:
 				break
 
-			await send_scheduled_update()
+			await send_cron_jobs()
+
+	async def _run_heartbeat_scheduler(self, run_immediately: bool = False) -> None:
+		async def send_heartbeat_jobs() -> None:
+			tasks = self._load_heartbeat_tasks()
+			if not tasks:
+				logging.warning("No heartbeat tasks found in '%s'.", HEARTBEAT_JOBS_DIR)
+				return
+
+			for task_name, channel_name, task_prompt in tasks:
+				channel = self._find_channel_by_name(channel_name)
+				if channel is None:
+					logging.warning(
+						"Channel '%s' not found for heartbeat task '%s'; skipping.",
+						channel_name,
+						task_name,
+					)
+					continue
+
+				try:
+					async with channel.typing():
+						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True)
+					await self._send_long_message(channel, reply)
+				except Exception as exc:
+					logging.exception("Error running heartbeat task '%s': %s", task_name, exc)
+
+		if run_immediately:
+			await send_heartbeat_jobs()
+
+		while True:
+			try:
+				if self._heartbeat_stop_event is not None:
+					await asyncio.wait_for(
+						self._heartbeat_stop_event.wait(),
+						timeout=HEARTBEAT_INTERVAL_SECONDS,
+					)
+					break
+				await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+			except asyncio.TimeoutError:
+				pass
+			except asyncio.CancelledError:
+				break
+
+			await send_heartbeat_jobs()
 
 	async def _enqueue_message(self, message: discord.Message) -> None:
 		async with self._queue_lock:
@@ -278,9 +347,8 @@ class DiscordBotWrapper:
 				f"- {self.command_prefix}history length\n"
 				f"- {self.command_prefix}clear history\n"
 				f"- {self.command_prefix}clear memory\n"
-				f"- {self.command_prefix}list updates tasks\n"
-				f"- {self.command_prefix}start updates\n"
-				f"- {self.command_prefix}stop updates\n"
+				f"- {self.command_prefix}list cron jobs\n"
+				f"- {self.command_prefix}list heartbeat jobs\n"
 				f"- {self.command_prefix}reload"
 			)
 			return True
@@ -298,34 +366,28 @@ class DiscordBotWrapper:
 			cleared_count = store.clear_memories()
 			await message.channel.send(f"Memory cleared. Removed {cleared_count} entr{'y' if cleared_count == 1 else 'ies'}.")
 			return True
-		if content == f"{self.command_prefix}list updates tasks":
-			task_names = self._list_update_task_names()
+		if content == f"{self.command_prefix}list cron jobs":
+			task_names = self._list_cron_task_names()
 			if not task_names:
-				await message.channel.send(f"No .md update tasks found in {CRON_JOBS_DIR}.")
+				await message.channel.send(f"No .md cron job tasks found in {CRON_JOBS_DIR}.")
 				return True
 
 			formatted_tasks = "\n".join(f"- {name}" for name in task_names)
-			await message.channel.send("Scheduled update tasks (run in this order):\n" + formatted_tasks)
+			await message.channel.send("Cron job tasks (run in this order):\n" + formatted_tasks)
+			return True
+		if content == f"{self.command_prefix}list heartbeat jobs":
+			task_names = self._list_heartbeat_task_names()
+			if not task_names:
+				await message.channel.send(f"No .md heartbeat tasks found in {HEARTBEAT_JOBS_DIR}.")
+				return True
+
+			formatted_tasks = "\n".join(f"- {name}" for name in task_names)
+			await message.channel.send("Heartbeat tasks (run in this order):\n" + formatted_tasks)
 			return True
 		if content == f"{self.command_prefix}reload":
 			await message.channel.send("Reloading bot...")
 			await self._request_reload()
 			return True
-		if content == f"{self.command_prefix}start updates":
-			started = self._start_updates_task_if_needed(run_immediately=True)
-			if started:
-				await message.channel.send("Updates scheduler started and ran immediately.")
-			else:
-				await message.channel.send("Updates scheduler is already running.")
-			return True
-		if content == f"{self.command_prefix}stop updates":
-			stopped = await self._stop_updates_task_if_running()
-			if stopped:
-				await message.channel.send("Updates scheduler stopped.")
-			else:
-				await message.channel.send("Updates scheduler is not running.")
-			return True
-
 		return False
 
 	async def _process_message(self, message: discord.Message) -> None:
@@ -384,18 +446,13 @@ class DiscordBotWrapper:
 			logging.info("Discord bot logged in as %s", self.client.user)
 			if shutil.which("ffmpeg") is None:
 				logging.warning("ffmpeg not found: voice transcription will be unavailable until installed.")
-			if self._updates_are_enabled():
-				self._start_updates_task_if_needed()
-			else:
-				logging.info("Automatic updates are disabled by DISCORD_UPDATES_ENABLED")
+			self._start_cron_task_if_needed()
+			self._start_heartbeat_task_if_needed(run_immediately=True)
 
 		@self.client.event
 		async def on_message(message: discord.Message) -> None:
 			# Ignore messages from bots (including itself) and messages not in the allowed channel
 			if message.author.bot:
-				return
-
-			if getattr(message.channel, "name", None) == self.updates_channel:
 				return
 
 			# If allowed_channels are set, ignore messages not in those channels
