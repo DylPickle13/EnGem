@@ -18,6 +18,9 @@ INTENT_FILE = Path(__file__).parent / "agent_instructions/intent.md"
 # Manager file located alongside this module
 MANAGER_FILE = Path(__file__).parent / "agent_instructions/manager.md"
 
+# Followup file located alongside this module
+FOLLOWUP_FILE = Path(__file__).parent / "agent_instructions/followup.md"
+
 # Sub-agent file located alongside this module
 SUB_AGENT_FILE = Path(__file__).parent / "agent_instructions/sub_agent.md"
 
@@ -219,5 +222,5 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
         output = response.text or ""
     else:
         output = response.text or ""
-        output += "\n\n" + function_output
+        output += "\n\nTool output:\n\n" + function_output
     return output

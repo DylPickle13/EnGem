@@ -156,12 +156,8 @@ class DiscordBotWrapper:
 					return channel
 		return None
 
-	@staticmethod
-	def _get_task_channel_name(task_file: Path) -> str:
-		return task_file.stem.replace("_", "-")
-
-	def _load_update_tasks(self) -> list[tuple[str, str, str]]:
-		tasks: list[tuple[str, str, str]] = []
+	def _load_update_tasks(self) -> list[tuple[str, str]]:
+		tasks: list[tuple[str, str]] = []
 
 		for task_file in sorted(CRON_JOBS_DIR.glob("*.md")):
 			try:
@@ -171,12 +167,12 @@ class DiscordBotWrapper:
 				continue
 
 			if task_prompt:
-				tasks.append((task_file.name, self._get_task_channel_name(task_file), task_prompt))
+				tasks.append((task_file.name, task_prompt))
 
 		return tasks
 
 	def _list_update_task_names(self) -> list[str]:
-		return [f"{task_name} -> #{channel_name}" for task_name, channel_name, _ in self._load_update_tasks()]
+		return [task_name for task_name, _ in self._load_update_tasks()]
 
 	def _start_updates_task_if_needed(self, *, run_immediately: bool = False) -> bool:
 		if self._updates_task is not None and not self._updates_task.done():
@@ -203,21 +199,17 @@ class DiscordBotWrapper:
 
 	async def _run_updates_scheduler(self, run_immediately: bool = False) -> None:
 		async def send_scheduled_update() -> None:
+			channel = self._find_channel_by_name(self.updates_channel)
+			if channel is None:
+				logging.warning("Updates channel '%s' not found; skipping scheduled message.", self.updates_channel)
+				return
+
 			tasks = self._load_update_tasks()
 			if not tasks:
 				logging.warning("No scheduled update tasks found in '%s'.", CRON_JOBS_DIR)
 				return
 
-			for task_name, channel_name, task_prompt in tasks:
-				channel = self._find_channel_by_name(channel_name)
-				if channel is None:
-					logging.warning(
-						"Channel '%s' not found for scheduled task '%s'; skipping.",
-						channel_name,
-						task_name,
-					)
-					continue
-
+			for task_name, task_prompt in tasks:
 				try:
 					async with channel.typing():
 						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True)
