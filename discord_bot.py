@@ -90,6 +90,14 @@ class DiscordBotWrapper:
 
 		intents = discord.Intents.default()
 		intents.message_content = True
+		intents.voice_states = True
+
+		# Detect whether voice support (PyNaCl) is available and record it.
+		try:
+			import nacl  # type: ignore
+			self.voice_available = True
+		except Exception:
+			self.voice_available = False
 
 		self.client = discord.Client(intents=intents)
 		self.responder = responder or self._default_responder
@@ -559,6 +567,8 @@ class DiscordBotWrapper:
 			logging.info("Discord bot logged in as %s", self.client.user)
 			if shutil.which("ffmpeg") is None:
 				logging.warning("ffmpeg not found: voice transcription will be unavailable until installed.")
+			if not getattr(self, "voice_available", False):
+				logging.warning("PyNaCl not found: voice features will be unavailable. Install with: pip install pynacl")
 			self._ensure_channel_history_files()
 			self._start_cron_task_if_needed()
 			logging.info("Heartbeat scheduler is idle. Use '%sstart heartbeat' to start it.", self.command_prefix)
@@ -577,6 +587,68 @@ class DiscordBotWrapper:
 				return
 
 			await self._enqueue_message(message)
+
+		@self.client.event
+		async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+			# Skip voice handling if PyNaCl (voice support) is not installed.
+			if not getattr(self, "voice_available", False):
+				logging.warning("Skipping voice state handling: PyNaCl not installed.")
+				return
+			# Handle joins, moves, and leaves so the bot follows users and leaves empty channels.
+			try:
+				if member.bot:
+					return
+
+				# If nothing changed about channel membership, ignore (e.g., mute/unmute)
+				if before.channel == after.channel:
+					return
+
+				guild = getattr(member, "guild", None)
+				if guild is None:
+					return
+
+				voice_client = getattr(guild, "voice_client", None)
+
+				# If the member joined or moved to a channel, connect or move the bot there.
+				if after.channel is not None:
+					if voice_client is None:
+						await after.channel.connect()
+						logging.info(
+							"Connected to voice channel %s in guild %s",
+							getattr(after.channel, "name", None),
+							getattr(guild, "name", None),
+						)
+					else:
+						if voice_client.channel != after.channel:
+							await voice_client.move_to(after.channel)
+							logging.info(
+								"Moved voice client to %s in guild %s",
+								getattr(after.channel, "name", None),
+								getattr(guild, "name", None),
+							)
+
+				# If the member left a channel (after.channel is None) or moved away, check if the previous channel is empty.
+				if before.channel is not None:
+					try:
+						non_bot_members = [m for m in before.channel.members if not m.bot]
+						if not non_bot_members:
+							# If the bot is connected to that channel, disconnect.
+							vc = getattr(guild, "voice_client", None)
+							if vc is not None and vc.channel == before.channel:
+								await vc.disconnect()
+								logging.info(
+									"Disconnected from empty voice channel %s in guild %s",
+									getattr(before.channel, "name", None),
+									getattr(guild, "name", None),
+								)
+					except Exception:
+						# If reading members fails for any reason, just log and continue.
+						logging.exception(
+							"Failed checking members for channel %s",
+							getattr(before.channel, "name", None),
+						)
+			except Exception as exc:
+				logging.exception("Error handling voice state update: %s", exc)
 
 	def run(self) -> None:
 		if not self.token:
