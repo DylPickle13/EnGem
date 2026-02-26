@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 from pathlib import Path
 from google import genai
 from google.genai import types
@@ -11,14 +12,14 @@ from config import GEMINI_API_KEY
 BROWSER_FILE = Path(__file__).parent / "agent_instructions/browser.md"
 SCREEN_WIDTH = 1440
 SCREEN_HEIGHT = 900
-TURN_LIMIT = 25
+TURN_LIMIT = 50
 MODEL_NAME = "gemini-2.5-computer-use-preview-10-2025"
 DEBUG_SCROLL = False
 DEFAULT_SCROLL_DELTA = 600
 DEFAULT_DOCUMENT_SCROLL_AMOUNT = 800
 
-_PLAYWRIGHT_INSTANCE: Playwright | None = None
-_BROWSER_INSTANCE: Browser | None = None
+_PLAYWRIGHT_INSTANCES: dict[int, Playwright] = {}
+_BROWSER_INSTANCES: dict[int, Browser] = {}
 
 
 def denormalize_x(x: int, screen_width: int) -> int:
@@ -479,22 +480,32 @@ def _get_existing_open_page(browser: Browser) -> Page | None:
 
 
 def setup_browser(reuse_existing: bool = True) -> tuple[Playwright, Browser, Page]:
-    global _PLAYWRIGHT_INSTANCE, _BROWSER_INSTANCE
+    """
+    Ensure a Playwright and Browser instance exist for the current OS thread.
+    This keeps Playwright's sync greenlet usage isolated to a single thread so
+    calls from separate threads create separate browser instances.
+    """
+    tid = threading.get_ident()
 
-    if reuse_existing and _PLAYWRIGHT_INSTANCE and _BROWSER_INSTANCE and _BROWSER_INSTANCE.is_connected():
-        existing_page = _get_existing_open_page(_BROWSER_INSTANCE)
+    pw = _PLAYWRIGHT_INSTANCES.get(tid)
+    br = _BROWSER_INSTANCES.get(tid)
+
+    if reuse_existing and pw and br and br.is_connected():
+        existing_page = _get_existing_open_page(br)
         if existing_page:
-            return _PLAYWRIGHT_INSTANCE, _BROWSER_INSTANCE, existing_page
+            return pw, br, existing_page
 
-    if _PLAYWRIGHT_INSTANCE is None:
-        _PLAYWRIGHT_INSTANCE = sync_playwright().start()
+    if pw is None:
+        pw = sync_playwright().start()
+        _PLAYWRIGHT_INSTANCES[tid] = pw
 
-    if _BROWSER_INSTANCE is None or not _BROWSER_INSTANCE.is_connected():
-        _BROWSER_INSTANCE = _PLAYWRIGHT_INSTANCE.chromium.launch(headless=False)
+    if br is None or not br.is_connected():
+        br = pw.chromium.launch(headless=False)
+        _BROWSER_INSTANCES[tid] = br
 
-    context = _BROWSER_INSTANCE.new_context(viewport={"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT})
+    context = br.new_context(viewport={"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT})
     page = context.new_page()
-    return _PLAYWRIGHT_INSTANCE, _BROWSER_INSTANCE, page
+    return pw, br, page
 
 
 def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
@@ -511,7 +522,7 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
 
     responses = ""
     for i in range(TURN_LIMIT):
-        # print(f"\n--- Turn {i+1} ---")
+        print(f"\n--- Turn {i+1} ---")
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=contents,
@@ -523,7 +534,7 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
 
         has_function_calls = any(part.function_call for part in candidate.content.parts)
         if not has_function_calls:
-            # print("No function calls detected, ending agent loop.")
+            print("No function calls detected, ending agent loop.")
             responses += "".join(part.text for part in candidate.content.parts if part.text)
             break
 

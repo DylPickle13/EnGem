@@ -87,7 +87,7 @@ class DiscordBotWrapper:
 		self._cron_stop_event: asyncio.Event | None = None
 		self._heartbeat_task: asyncio.Task[None] | None = None
 		self._heartbeat_stop_event: asyncio.Event | None = None
-		self._restart_requested = False
+
 
 		intents = discord.Intents.default()
 		intents.message_content = True
@@ -132,13 +132,6 @@ class DiscordBotWrapper:
 		self._heartbeat_task = None
 		self._worker_tasks.clear()
 
-	async def _request_reload(self) -> None:
-		if self._restart_requested:
-			return
-
-		self._restart_requested = True
-		await self._shutdown_background_tasks()
-		await self.client.close()
 
 	async def _get_whisper_model(self):
 		if self.whisper_model is None:
@@ -401,7 +394,7 @@ class DiscordBotWrapper:
 				f"- {self.command_prefix}list heartbeat jobs\n"
 				f"- {self.command_prefix}start heartbeat\n"
 				f"- {self.command_prefix}stop heartbeat\n"
-				f"- {self.command_prefix}reload"
+				# reload command removed
 			)
 			return True
 
@@ -450,10 +443,7 @@ class DiscordBotWrapper:
 			else:
 				await message.channel.send("Heartbeat scheduler is not running.")
 			return True
-		if content == f"{self.command_prefix}reload":
-			await message.channel.send("Reloading bot...")
-			await self._request_reload()
-			return True
+		# Reload command removed
 		return False
 
 	async def _process_message(self, message: discord.Message) -> None:
@@ -558,8 +548,7 @@ class DiscordBotWrapper:
 			level=logging.WARNING,
 		)
 		self.client.run(self.token, log_level=logging.WARNING)
-		if self._restart_requested:
-			os.execv(sys.executable, [sys.executable, *sys.argv])
+		# Restart-on-reload removed; bot will exit normally when stopped.
 
 
 if __name__ == "__main__":
