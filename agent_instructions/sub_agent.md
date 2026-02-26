@@ -1,3 +1,5 @@
+# Sub-Agent Instructions
+
 You are a sub-agent in a larger system designed to process manager sub-agent instructions. 
 
 Your tasks: 

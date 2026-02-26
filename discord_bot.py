@@ -83,6 +83,7 @@ class DiscordBotWrapper:
 		self._message_queue: asyncio.Queue[discord.Message] = asyncio.Queue()
 		self._worker_tasks: set[asyncio.Task[None]] = set()
 		self._worker_start_lock = asyncio.Lock()
+		self._channel_processing_locks: dict[int, asyncio.Lock] = {}
 		self._cron_task: asyncio.Task[None] | None = None
 		self._cron_stop_event: asyncio.Event | None = None
 		self._heartbeat_task: asyncio.Task[None] | None = None
@@ -280,8 +281,10 @@ class DiscordBotWrapper:
 					continue
 
 				try:
-					async with channel.typing():
-						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name)
+					channel_lock = self._get_channel_processing_lock(channel)
+					async with channel_lock:
+						async with channel.typing():
+							reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
 					logging.exception("Error running cron job task '%s': %s", task_name, exc)
@@ -324,8 +327,10 @@ class DiscordBotWrapper:
 					continue
 
 				try:
-					async with channel.typing():
-						reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name)
+					channel_lock = self._get_channel_processing_lock(channel)
+					async with channel_lock:
+						async with channel.typing():
+							reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
 					logging.exception("Error running heartbeat task '%s': %s", task_name, exc)
@@ -362,6 +367,16 @@ class DiscordBotWrapper:
 		await self._ensure_worker_pool()
 		await self._message_queue.put(message)
 
+	def _get_channel_processing_lock(self, channel: object) -> asyncio.Lock:
+		channel_id = getattr(channel, "id", None)
+		if not isinstance(channel_id, int):
+			channel_id = id(channel)
+		lock = self._channel_processing_locks.get(channel_id)
+		if lock is None:
+			lock = asyncio.Lock()
+			self._channel_processing_locks[channel_id] = lock
+		return lock
+
 	async def _queue_worker(self) -> None:
 		while True:
 			try:
@@ -369,8 +384,10 @@ class DiscordBotWrapper:
 			except asyncio.CancelledError:
 				break
 
+			channel_lock = self._get_channel_processing_lock(message.channel)
 			try:
-				await self._process_message(message)
+				async with channel_lock:
+					await self._process_message(message)
 			except asyncio.CancelledError:
 				raise
 			except Exception as exc:
@@ -390,11 +407,11 @@ class DiscordBotWrapper:
 				f"- {self.command_prefix}history length\n"
 				f"- {self.command_prefix}clear history\n"
 				f"- {self.command_prefix}clear memory\n"
+				f"- {self.command_prefix}list memories [limit]\n"
 				f"- {self.command_prefix}list cron jobs\n"
 				f"- {self.command_prefix}list heartbeat jobs\n"
 				f"- {self.command_prefix}start heartbeat\n"
 				f"- {self.command_prefix}stop heartbeat\n"
-				# reload command removed
 			)
 			return True
 
@@ -410,6 +427,30 @@ class DiscordBotWrapper:
 			store = memory.get_default_store()
 			cleared_count = store.clear_memories()
 			await message.channel.send(f"Memory cleared. Removed {cleared_count} entr{'y' if cleared_count == 1 else 'ies'}.")
+			return True
+		if content.startswith(f"{self.command_prefix}list memories"):
+			parts = content.split()
+			limit = None
+			if len(parts) >= 3:
+				try:
+					limit = int(parts[2])
+				except Exception:
+					await message.channel.send(
+						f"Usage: {self.command_prefix}list memories [limit] — limit must be an integer."
+					)
+					return True
+			store = memory.get_default_store()
+			memories = store.read_all_memories(limit=limit)
+			if not memories:
+				await message.channel.send("No memories stored.")
+				return True
+			formatted = []
+			for m in memories:
+				text = (m.text or "").strip().replace("\n", " ")
+				if len(text) > 300:
+					text = text[:297] + "..."
+				formatted.append(f"- {text}")
+			await self._send_long_message(message.channel, "Memories:\n" + "\n".join(formatted))
 			return True
 		if content == f"{self.command_prefix}list cron jobs":
 			task_names = self._list_cron_task_names()
@@ -548,7 +589,6 @@ class DiscordBotWrapper:
 			level=logging.WARNING,
 		)
 		self.client.run(self.token, log_level=logging.WARNING)
-		# Restart-on-reload removed; bot will exit normally when stopped.
 
 
 if __name__ == "__main__":

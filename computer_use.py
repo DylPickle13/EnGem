@@ -509,7 +509,7 @@ def setup_browser(reuse_existing: bool = True) -> tuple[Playwright, Browser, Pag
 
 
 def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
-    # print("Prompt:", prompt)
+    print("Prompt:", prompt)
     config = create_model_config()
     initial_screenshot = page.screenshot(type="png")
 
