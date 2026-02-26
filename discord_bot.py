@@ -1,9 +1,7 @@
 import asyncio
 import datetime
 import logging
-import os
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Optional
@@ -592,11 +590,8 @@ class DiscordBotWrapper:
 
 
 if __name__ == "__main__":
-	# if vector_db is not there, create it
 	if not Path(memory.DEFAULT_DB_PATH).exists():
-		logging.info("Creating vector database...")
 		memory.get_default_store()
 
 	print("Starting PICKLEBOT...")
 	DiscordBotWrapper().run()
-	print("PICKLEBOT stopped.")
