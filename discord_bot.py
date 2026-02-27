@@ -30,7 +30,7 @@ import history
 import llm
 import whisper
 import memory as memory
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY as GEMINI_API_KEY, VOICE_TOOL_TARGET_CHANNEL_NAME as VOICE_TOOL_TARGET_CHANNEL_NAME
 
 VOICE_INSTRUCTIONS = Path(__file__).parent / "agent_instructions" / "voice_instructions.md"
 
@@ -48,9 +48,29 @@ HEARTBEAT_INTERVAL_SECONDS = 30 * 60
 MESSAGE_WORKER_CONCURRENCY = 3
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
 GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+SEND_DISCORD_TEXT_MESSAGE_TOOL = {
+	"name": "send_discord_text_message",
+	"description": "Send a text message to a Discord text channel.",
+	"parameters": {
+		"type": "object",
+		"properties": {
+			"message": {
+				"type": "string",
+				"description": "The message content to send.",
+			},
+		},
+		"required": ["message"],
+	},
+}
 GEMINI_LIVE_CONFIG = {
 	"response_modalities": ["AUDIO"],
+	"enable_affective_dialog": True,
+	"proactivity": {'proactive_audio': True},
 	"system_instruction": VOICE_INSTRUCTIONS.read_text(encoding="utf-8"),
+	"tools": [
+		{"google_search": {}},
+		{"function_declarations": [SEND_DISCORD_TEXT_MESSAGE_TOOL]},
+	],
 	"speech_config": types.SpeechConfig(
         voice_config=types.VoiceConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -174,7 +194,7 @@ class _QueueAudioSource(discord.AudioSource):
 class _GeminiVoiceConversation:
 	def __init__(self, client: discord.Client) -> None:
 		self._discord_client = client
-		self._genai_client = genai.Client(api_key=GEMINI_API_KEY)
+		self._genai_client = genai.Client(api_key=GEMINI_API_KEY, http_options={"api_version": "v1alpha"})
 		self._task: asyncio.Task[None] | None = None
 		self._stop_event = asyncio.Event()
 		self._voice_client: object | None = None
@@ -315,12 +335,84 @@ class _GeminiVoiceConversation:
 			return
 		loop.call_soon_threadsafe(lambda: asyncio.create_task(self._send_audio_stream_end()))
 
+	async def _resolve_vc_text_channel(self) -> discord.TextChannel | None:
+		for guild in self._discord_client.guilds:
+			for channel in guild.text_channels:
+				if channel.name == VOICE_TOOL_TARGET_CHANNEL_NAME:
+					return channel
+		return None
+
+	async def _tool_send_discord_text_message(self, args: object) -> dict[str, object]:
+		if not isinstance(args, dict):
+			return {"ok": False, "error": "Invalid arguments payload."}
+
+		message_text = str(args.get("message") or "").strip()
+		if not message_text:
+			return {"ok": False, "error": "message is required."}
+
+		channel = await self._resolve_vc_text_channel()
+		if channel is None:
+			return {
+				"ok": False,
+				"error": f"Text channel not found for channel_name='{VOICE_TOOL_TARGET_CHANNEL_NAME}'"
+			}
+
+		sent_parts = 0
+		for start in range(0, len(message_text), DISCORD_MESSAGE_LIMIT):
+			part = message_text[start : start + DISCORD_MESSAGE_LIMIT]
+			if not part:
+				continue
+			await channel.send(part)
+			sent_parts += 1
+
+		return {
+			"ok": True,
+			"channel_id": channel.id,
+			"channel_name": channel.name,
+			"sent_parts": sent_parts,
+		}
+
+	async def _handle_tool_calls(self, live_session: object, response: object) -> None:
+		tool_call = getattr(response, "tool_call", None)
+		if tool_call is None:
+			return
+
+		function_calls = getattr(tool_call, "function_calls", None) or []
+		function_responses: list[types.FunctionResponse] = []
+		for function_call in function_calls:
+			call_id = getattr(function_call, "id", None)
+			name = getattr(function_call, "name", "")
+			args = getattr(function_call, "args", {})
+
+			if name == "send_discord_text_message":
+				try:
+					result = await self._tool_send_discord_text_message(args)
+				except Exception as exc:
+					logging.exception("send_discord_text_message tool failed: %s", exc)
+					result = {"ok": False, "error": f"Failed to send message: {exc}"}
+			else:
+				result = {"ok": False, "error": f"Unknown tool: {name}"}
+
+			if call_id and name:
+				function_responses.append(
+					types.FunctionResponse(
+						id=call_id,
+						name=name,
+						response=result,
+					)
+				)
+
+		if function_responses:
+			await live_session.send_tool_response(function_responses=function_responses)
+
 	async def _receive_audio_loop(self, live_session: object) -> None:
 		while not self._stop_event.is_set():
 			turn = live_session.receive()
 			async for response in turn:
 				if self._stop_event.is_set():
 					return
+
+				await self._handle_tool_calls(live_session, response)
 
 				server_content = getattr(response, "server_content", None)
 				model_turn = getattr(server_content, "model_turn", None) if server_content else None
