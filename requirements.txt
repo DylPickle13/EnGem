@@ -1,6 +1,7 @@
 google-genai==1.63.0
 openai-whisper==20250625
 discord.py==2.6.3
+discord-ext-voice-recv
 torch==2.10.0
 chromadb==0.5.23
 sentence-transformers

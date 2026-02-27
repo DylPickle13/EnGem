@@ -26,6 +26,18 @@ pip install -r requirements.txt
 python discord_bot.py
 ```
 
+Discord voice conversation (Gemini Live)
+
+- Install voice dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+- Ensure `GEMINI_API_KEY` is set.
+- The bot now joins/moves with users in voice channels, listens to non-bot users, streams PCM audio to Gemini Live, and plays Gemini audio responses back into the same voice channel.
+- Incoming voice capture requires `discord-ext-voice-recv` and PyNaCl.
+
 Project layout (key files and folders)
 
 - `discord_bot.py`: Discord bot entrypoint and command/event handlers.
