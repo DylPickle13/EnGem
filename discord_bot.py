@@ -9,8 +9,6 @@ import array
 import datetime
 import logging
 import queue
-import shutil
-import tempfile
 import time
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Optional
@@ -28,9 +26,9 @@ from google import genai
 from google.genai import types
 import history
 import llm
-import whisper
 import memory as memory
-from config import GEMINI_API_KEY as GEMINI_API_KEY, VOICE_TOOL_TARGET_CHANNEL_NAME as VOICE_TOOL_TARGET_CHANNEL_NAME
+from config import GEMINI_API_KEY as GEMINI_API_KEY
+from config import VOICE_TOOL_TARGET_CHANNEL_NAME as VOICE_TOOL_TARGET_CHANNEL_NAME
 
 VOICE_INSTRUCTIONS = Path(__file__).parent / "agent_instructions" / "voice_instructions.md"
 
@@ -47,10 +45,11 @@ DISCORD_MESSAGE_LIMIT = 2000
 HEARTBEAT_INTERVAL_SECONDS = 30 * 60
 MESSAGE_WORKER_CONCURRENCY = 3
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
+RELAY_PREFIX = ">"
 GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 SEND_DISCORD_TEXT_MESSAGE_TOOL = {
 	"name": "send_discord_text_message",
-	"description": "Send a text message to a Discord text channel.",
+	"description": "Send a text message to the Discord channel associated with the current voice conversation. ",
 	"parameters": {
 		"type": "object",
 		"properties": {
@@ -64,8 +63,6 @@ SEND_DISCORD_TEXT_MESSAGE_TOOL = {
 }
 GEMINI_LIVE_CONFIG = {
 	"response_modalities": ["AUDIO"],
-	"enable_affective_dialog": True,
-	"proactivity": {'proactive_audio': True},
 	"system_instruction": VOICE_INSTRUCTIONS.read_text(encoding="utf-8"),
 	"tools": [
 		{"google_search": {}},
@@ -74,7 +71,7 @@ GEMINI_LIVE_CONFIG = {
 	"speech_config": types.SpeechConfig(
         voice_config=types.VoiceConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(
-               voice_name='Leda',
+               voice_name='Zephyr',
             )
         ),
     ),
@@ -87,7 +84,7 @@ GEMINI_INPUT_SAMPLE_RATE = 16000
 GEMINI_OUTPUT_SAMPLE_RATE = 24000
 DISCORD_FRAME_SIZE_BYTES = 3840
 VOICE_OUTPUT_QUEUE_MAX_FRAMES = 1200
-VOICE_PLAYBACK_PREBUFFER_FRAMES = 22
+VOICE_PLAYBACK_PREBUFFER_FRAMES = 12
 VOICE_PLAYBACK_GET_TIMEOUT_SECONDS = 0.03
 VOICE_PLAYBACK_MAX_CONCEALMENT_FRAMES = 8
 VOICE_RECV_START_DELAY_SECONDS = 0.45
@@ -192,8 +189,9 @@ class _QueueAudioSource(discord.AudioSource):
 
 
 class _GeminiVoiceConversation:
-	def __init__(self, client: discord.Client) -> None:
+	def __init__(self, client: discord.Client, command_prefix: str = ">") -> None:
 		self._discord_client = client
+		self.command_prefix = command_prefix
 		self._genai_client = genai.Client(api_key=GEMINI_API_KEY, http_options={"api_version": "v1alpha"})
 		self._task: asyncio.Task[None] | None = None
 		self._stop_event = asyncio.Event()
@@ -206,6 +204,9 @@ class _GeminiVoiceConversation:
 		self._out_rate_state: tuple[float, ...] | None = None
 		self._last_activity_end_sent_at = 0.0
 		self._bytes_since_activity_end = 0
+		self._processed_tool_call_ids: set[str] = set()
+		self._last_tool_message_key: tuple[int, str] | None = None
+		self._last_tool_message_sent_at = 0.0
 
 	def _queue_discord_frame(self, frame: bytes) -> None:
 		if not frame:
@@ -336,9 +337,19 @@ class _GeminiVoiceConversation:
 		loop.call_soon_threadsafe(lambda: asyncio.create_task(self._send_audio_stream_end()))
 
 	async def _resolve_vc_text_channel(self) -> discord.TextChannel | None:
+		target_name = str(VOICE_TOOL_TARGET_CHANNEL_NAME or "").strip()
+		if not target_name:
+			return None
+
 		for guild in self._discord_client.guilds:
 			for channel in guild.text_channels:
-				if channel.name == VOICE_TOOL_TARGET_CHANNEL_NAME:
+				if channel.name == target_name:
+					return channel
+
+		target_name_folded = target_name.casefold()
+		for guild in self._discord_client.guilds:
+			for channel in guild.text_channels:
+				if channel.name.casefold() == target_name_folded:
 					return channel
 		return None
 
@@ -349,12 +360,26 @@ class _GeminiVoiceConversation:
 		message_text = str(args.get("message") or "").strip()
 		if not message_text:
 			return {"ok": False, "error": "message is required."}
+		if not message_text.startswith(RELAY_PREFIX):
+			message_text = f"{RELAY_PREFIX}{message_text}"
 
 		channel = await self._resolve_vc_text_channel()
 		if channel is None:
 			return {
 				"ok": False,
 				"error": f"Text channel not found for channel_name='{VOICE_TOOL_TARGET_CHANNEL_NAME}'"
+			}
+
+		now = time.monotonic()
+		message_key = (channel.id, message_text)
+		if self._last_tool_message_key == message_key and (now - self._last_tool_message_sent_at) < 1.5:
+			logging.warning("Suppressed duplicate send_discord_text_message for channel %s", channel.name)
+			return {
+				"ok": True,
+				"channel_id": channel.id,
+				"channel_name": channel.name,
+				"sent_parts": 0,
+				"duplicate_ignored": True,
 			}
 
 		sent_parts = 0
@@ -364,6 +389,9 @@ class _GeminiVoiceConversation:
 				continue
 			await channel.send(part)
 			sent_parts += 1
+
+		self._last_tool_message_key = message_key
+		self._last_tool_message_sent_at = now
 
 		return {
 			"ok": True,
@@ -384,14 +412,31 @@ class _GeminiVoiceConversation:
 			name = getattr(function_call, "name", "")
 			args = getattr(function_call, "args", {})
 
+			if call_id and call_id in self._processed_tool_call_ids:
+				result = {"ok": True, "duplicate_ignored": True, "call_id": call_id}
+				if call_id and name:
+					function_responses.append(
+						types.FunctionResponse(
+							id=call_id,
+							name=name,
+							response=result,
+						)
+					)
+				continue
+
 			if name == "send_discord_text_message":
 				try:
 					result = await self._tool_send_discord_text_message(args)
+					if isinstance(result, dict) and not result.get("ok", False):
+						logging.warning("send_discord_text_message returned non-ok result: %s", result)
 				except Exception as exc:
 					logging.exception("send_discord_text_message tool failed: %s", exc)
 					result = {"ok": False, "error": f"Failed to send message: {exc}"}
 			else:
 				result = {"ok": False, "error": f"Unknown tool: {name}"}
+
+			if call_id:
+				self._processed_tool_call_ids.add(call_id)
 
 			if call_id and name:
 				function_responses.append(
@@ -456,6 +501,9 @@ class _GeminiVoiceConversation:
 		self._out_rate_state = None
 		self._last_activity_end_sent_at = 0.0
 		self._bytes_since_activity_end = 0
+		self._processed_tool_call_ids.clear()
+		self._last_tool_message_key = None
+		self._last_tool_message_sent_at = 0.0
 
 		audio_source = _QueueAudioSource(self._output_frames)
 		if hasattr(voice_client, "is_playing") and not voice_client.is_playing():
@@ -592,7 +640,6 @@ class DiscordBotWrapper:
 			for channel in str(DISCORD_BOT_CHANNELS).split(",")
 			if channel.strip()
 		}
-		self.whisper_model = None
 		self._message_queue: asyncio.Queue[discord.Message] = asyncio.Queue()
 		self._worker_tasks: set[asyncio.Task[None]] = set()
 		self._worker_start_lock = asyncio.Lock()
@@ -618,7 +665,7 @@ class DiscordBotWrapper:
 
 		self.client = discord.Client(intents=intents)
 		if self.voice_available and VOICE_RECV_AVAILABLE and GEMINI_API_KEY:
-			self._voice_conversation = _GeminiVoiceConversation(self.client)
+			self._voice_conversation = _GeminiVoiceConversation(self.client, self.command_prefix)
 		else:
 			self._voice_conversation = None
 		self.responder = responder or self._default_responder
@@ -663,28 +710,6 @@ class DiscordBotWrapper:
 		self._heartbeat_task = None
 		self._worker_tasks.clear()
 		self._voice_input_sink = None
-
-
-	async def _get_whisper_model(self):
-		if self.whisper_model is None:
-			self.whisper_model = await asyncio.to_thread(whisper.load_model, "base")
-		return self.whisper_model
-
-	async def _transcribe_attachment(self, attachment: discord.Attachment) -> str:
-		if shutil.which("ffmpeg") is None:
-			raise RuntimeError("ffmpeg is not installed. Install it with: brew install ffmpeg")
-
-		suffix = Path(attachment.filename or "audio.ogg").suffix or ".ogg"
-		with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-			tmp_path = tmp.name
-
-		try:
-			await attachment.save(tmp_path)
-			model = await self._get_whisper_model()
-			result = await asyncio.to_thread(model.transcribe, tmp_path, fp16=False)
-			return (result.get("text") or "").strip()
-		finally:
-			Path(tmp_path).unlink(missing_ok=True)
 
 	async def _read_text_attachment(self, attachment: discord.Attachment) -> str:
 		data = await attachment.read()
@@ -938,6 +963,7 @@ class DiscordBotWrapper:
 				f"- {self.command_prefix}history length\n"
 				f"- {self.command_prefix}clear history\n"
 				f"- {self.command_prefix}clear memory\n"
+				f"- {self.command_prefix}forget memories {{topic}}\n"
 				f"- {self.command_prefix}list memories [limit]\n"
 				f"- {self.command_prefix}list cron jobs\n"
 				f"- {self.command_prefix}list heartbeat jobs\n"
@@ -958,6 +984,15 @@ class DiscordBotWrapper:
 			store = memory.get_default_store()
 			cleared_count = store.clear_memories()
 			await message.channel.send(f"Memory cleared. Removed {cleared_count} entr{'y' if cleared_count == 1 else 'ies'}.")
+			return True
+		if content.startswith(f"{self.command_prefix}forget memories"):
+			topic = content[len(f"{self.command_prefix}forget memories"):].strip()
+			if not topic:
+				await message.channel.send(f"Usage: {self.command_prefix}forget memories {{topic}}")
+				return True
+
+			result = await asyncio.to_thread(memory.forget_memories, topic)
+			await self._send_long_message(message.channel, result)
 			return True
 		if content.startswith(f"{self.command_prefix}list memories"):
 			parts = content.split()
@@ -1020,17 +1055,19 @@ class DiscordBotWrapper:
 
 	async def _process_message(self, message: discord.Message) -> None:
 		content = (message.content or "").strip()
-		if await self._try_handle_command(message):
+		is_self_relay_message = (
+			message.author.bot
+			and self.client.user is not None
+			and message.author.id == self.client.user.id
+			and content.startswith(RELAY_PREFIX)
+		)
+
+		if is_self_relay_message:
+			content = content[len(RELAY_PREFIX):].strip()
+
+		if not is_self_relay_message and await self._try_handle_command(message):
 			return
 
-		audio_attachment = next(
-			(
-				attachment
-				for attachment in message.attachments
-				if (attachment.content_type or "").startswith("audio/")
-			),
-			None,
-		)
 		text_attachment = next(
 			(
 				attachment
@@ -1040,7 +1077,7 @@ class DiscordBotWrapper:
 			None,
 		)
 
-		if not content and audio_attachment is None and text_attachment is None:
+		if not content and text_attachment is None:
 			return
 
 		if text_attachment is not None:
@@ -1053,17 +1090,6 @@ class DiscordBotWrapper:
 
 			prompt = self._build_prompt(content, attachment_text)
 			await self._respond_and_send(message.channel, prompt, message)
-			return
-
-		if audio_attachment is not None and not content:
-			async with message.channel.typing():
-				transcription = await self._transcribe_attachment(audio_attachment)
-
-			if not transcription:
-				await message.channel.send("Could not transcribe audio (empty result).")
-				return
-
-			await self._respond_and_send(message.channel, transcription, message)
 			return
 
 		await self._respond_and_send(message.channel, content, message)
@@ -1135,8 +1161,6 @@ class DiscordBotWrapper:
 		@self.client.event
 		async def on_ready() -> None:
 			logging.info("Discord bot logged in as %s", self.client.user)
-			if shutil.which("ffmpeg") is None:
-				logging.warning("ffmpeg not found: voice transcription will be unavailable until installed.")
 			if not getattr(self, "voice_available", False):
 				logging.warning("PyNaCl not found: voice features will be unavailable. Install with: pip install pynacl")
 			if getattr(self, "voice_available", False) and not VOICE_RECV_AVAILABLE:
@@ -1151,15 +1175,23 @@ class DiscordBotWrapper:
 
 		@self.client.event
 		async def on_message(message: discord.Message) -> None:
-			# Ignore messages from bots (including itself) and messages not in the allowed channel
-			if message.author.bot:
+			content = (message.content or "").strip()
+			is_self_relay_message = (
+				message.author.bot
+				and self.client.user is not None
+				and message.author.id == self.client.user.id
+				and content.startswith(RELAY_PREFIX)
+			)
+
+			# Ignore bot messages, except self-authored relay messages prefixed with the command prefix.
+			if message.author.bot and not is_self_relay_message:
 				return
 
 			# If allowed_channels are set, ignore messages not in those channels
 			if self.allowed_channels and getattr(message.channel, "name", None) not in self.allowed_channels:
 				return
 
-			if await self._try_handle_command(message):
+			if not is_self_relay_message and await self._try_handle_command(message):
 				return
 
 			await self._enqueue_message(message)

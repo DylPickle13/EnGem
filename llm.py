@@ -30,11 +30,8 @@ TEXTER_FILE = Path(__file__).parent / "agent_instructions/texter.md"
 # Memory Extractor file located alongside this module
 MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extractor.md"
 
-# Execution order file path
-EXECUTION_ORDER_FILE = Path(__file__).parent / "sub-agents/execution_order.json"
 
-
-def generate_response(user_message: str, job: bool, history_file: str = "picklebot-test") -> str:
+def generate_response(user_message: str, job: bool, history_file: str) -> str:
 
     exit_string = ""
     default_temperature = 1.0
@@ -67,17 +64,13 @@ def generate_response(user_message: str, job: bool, history_file: str = "pickleb
             return intent_response
 
     while True:
-        # clear the 'sub-agents/execution_order.json' file at the start of each loop iteration
-        if EXECUTION_ORDER_FILE.exists():
-            try:
-                EXECUTION_ORDER_FILE.unlink()
-            except Exception as e:
-                print(f"Error clearing execution order file: {e}")
+        # Execution order file path
+        EXECUTION_ORDER_FILE = Path(__file__).parent / f"sub-agents/execution_order_{history_file}.json"
 
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=True, temperature=temperature)
+            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8") + history_file, tool_use_allowed=True, force_tool=True, temperature=temperature)
             history.append_history(role="Manager", text=manager_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating manager response: {e}")
@@ -113,6 +106,12 @@ def generate_response(user_message: str, job: bool, history_file: str = "pickleb
         except Exception as e:
             print(f"Error generating reviewer response: {e}")
         if exit_string == "<yes>":
+            # clear the 'sub-agents/execution_order_{history_file}.json' file at the start of each loop iteration
+            if EXECUTION_ORDER_FILE.exists():
+                try:
+                    EXECUTION_ORDER_FILE.unlink()
+                except Exception as e:
+                    print(f"Error clearing execution order file: {e}")
             break
         else:
             if temperature < 2.0:

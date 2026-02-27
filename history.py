@@ -3,7 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
-HISTORY_MAX_CHARS = 200_000
+HISTORY_MAX_CHARS = 100_000
 TORONTO_TZ = ZoneInfo("America/Toronto")
 
 
