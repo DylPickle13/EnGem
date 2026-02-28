@@ -3,6 +3,7 @@ from google.genai import types
 import os
 import json
 import inspect
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from config import GEMINI_API_KEY as GEMINI_API_KEY
@@ -42,26 +43,18 @@ def generate_response(user_message: str, job: bool, history_file: str) -> str:
     if not job:
         relevant_memories = memory.get_default_store().search_memories(history.get_conversation_history(history_file=history_file), limit=5)
         relevant_memories_text = "\n\n".join([f"Memory: {memory.text}\nMetadata: {json.dumps(memory.metadata)}" for memory in relevant_memories])
-        try:
-            memory_retriever_response = _run_model_api(history.get_conversation_history(history_file=history_file) + relevant_memories_text, MEMORY_RETRIEVER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
-            if memory_retriever_response != "<NO_RELEVANT_MEMORIES>":
-                history.append_history(role="MemoryRetriever", text=memory_retriever_response, history_file=history_file)
-        except Exception as e:
-            print(f"Error generating memory retriever response: {e}")
 
         intent_response = ""
         try:
-            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=default_temperature)
+            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, tool_use_allowed=True, force_tool=False, temperature=default_temperature)
         except Exception as e:
             print(f"Error generating intent response: {e}")
 
         if intent_response != "<complex>":
             history.append_history(role="IntentClassifier", text=intent_response, history_file=history_file)
             if not job:
-                memory_extractor_response = _run_model_api(history.get_conversation_history(history_file=history_file), MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
-                if memory_extractor_response.strip() != "<NO_MEMORY>" and memory_extractor_response.strip() != "":
-                    memory.get_default_store().write_memory(memory_extractor_response)
-                    history.append_history(role="MemoryExtractor", text=memory_extractor_response, history_file=history_file)
+                extraction_input = history.get_conversation_history(history_file=history_file)
+                _run_memory_extraction_async(extraction_input, history_file, default_temperature)
             return intent_response
 
     while True:
@@ -186,14 +179,29 @@ def generate_response(user_message: str, job: bool, history_file: str) -> str:
 
     if not job:
         relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in memory.get_default_store().search_memories(history.get_conversation_history(history_file=history_file), limit=10)])
+        extraction_input = "History: " + history.get_conversation_history(history_file=history_file) + "\n\nRelevant memories: \n\n" + relevant_memories_history
+        _run_memory_extraction_async(extraction_input, history_file, default_temperature)
+    return text_response
+
+
+def _run_memory_extraction_async(extraction_input: str, history_file: str, temperature: float) -> None:
+    def _worker() -> None:
         try:
-            memory_extractor_response = _run_model_api("History: " + history.get_conversation_history(history_file=history_file) + "\n\nRelevant memories: \n\n" + relevant_memories_history, MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
-            if memory_extractor_response.strip() != "<NO_MEMORY>":
-                memory.get_default_store().write_memory(memory_extractor_response)
-                history.append_history(role="MemoryExtractor", text=memory_extractor_response, history_file=history_file)
+            memory_extractor_response = _run_model_api(
+                extraction_input,
+                MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
+                tool_use_allowed=False,
+                force_tool=False,
+                temperature=temperature,
+            )
+            cleaned_response = memory_extractor_response.strip()
+            if cleaned_response and cleaned_response != "<NO_MEMORY>":
+                memory.get_default_store().write_memory(cleaned_response)
+                history.append_history(role="MemoryExtractor", text=cleaned_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating memory extractor response: {e}")
-    return text_response
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _get_function_declarations(client: genai.Client = None) -> list[types.FunctionDeclaration]:

@@ -63,7 +63,8 @@ SEND_DISCORD_TEXT_MESSAGE_TOOL = {
 }
 GEMINI_LIVE_CONFIG = {
 	"response_modalities": ["AUDIO"],
-	"system_instruction": VOICE_INSTRUCTIONS.read_text(encoding="utf-8"),
+	"enable_affective_dialog": True,
+	"system_instruction": VOICE_INSTRUCTIONS.read_text(encoding="utf-8") + str(memory.get_default_store().read_all_memories()),
 	"tools": [
 		{"google_search": {}},
 		{"function_declarations": [SEND_DISCORD_TEXT_MESSAGE_TOOL]},
@@ -71,7 +72,7 @@ GEMINI_LIVE_CONFIG = {
 	"speech_config": types.SpeechConfig(
         voice_config=types.VoiceConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(
-               voice_name='Sulafat',
+               voice_name='Leda',
             )
         ),
     ),

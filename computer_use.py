@@ -21,7 +21,6 @@ DEFAULT_DOCUMENT_SCROLL_AMOUNT = 800
 
 _PLAYWRIGHT_INSTANCES: dict[int, Playwright] = {}
 _BROWSER_INSTANCES: dict[int, Browser] = {}
-_THREAD_LOCAL = threading.local()
 
 
 def _select_model_for_loop(prompt: str) -> str:
@@ -492,29 +491,34 @@ def _get_existing_open_page(browser: Browser) -> Page | None:
     return None
 
 
-def setup_browser(reuse_existing: bool = True) -> tuple[Playwright, Browser, Page]:
+def setup_browser(reuse_existing: bool = False) -> tuple[Playwright, Browser, Page]:
     """
-    Ensure a Playwright and Browser instance exist for the current OS thread.
-    This keeps Playwright's sync greenlet usage isolated to a single thread so
-    calls from separate threads create separate browser instances.
+    Always start a fresh Playwright and Browser for the current thread.
+    This avoids reusing existing browser instances while keeping the pattern
+    that each browser is created on the calling thread.
     """
-    local = _THREAD_LOCAL
-    pw = getattr(local, "pw", None)
-    br = getattr(local, "br", None)
+    tid = threading.get_ident()
 
-    if reuse_existing and pw and br and br.is_connected():
-        existing_page = _get_existing_open_page(br)
-        if existing_page:
-            return pw, br, existing_page
+    # If there are any leftover instances for this thread, close them first
+    # to ensure we don't reuse or leak resources.
+    old_br = _BROWSER_INSTANCES.pop(tid, None)
+    old_pw = _PLAYWRIGHT_INSTANCES.pop(tid, None)
+    if old_br:
+        try:
+            old_br.close()
+        except Exception:
+            pass
+    if old_pw:
+        try:
+            old_pw.stop()
+        except Exception:
+            pass
 
-    if pw is None:
-        pw = sync_playwright().start()
-        setattr(local, "pw", pw)
+    pw = sync_playwright().start()
+    br = pw.chromium.launch(headless=False)
 
-    if br is None or not br.is_connected():
-        br = pw.chromium.launch(headless=False)
-        setattr(local, "br", br)
-
+    # Do not store the new instances for reuse — callers should close them
+    # when finished. Returning fresh instances ensures no reuse occurs.
     context = br.new_context(viewport={"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT})
     page = context.new_page()
     return pw, br, page

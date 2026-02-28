@@ -12,7 +12,7 @@ def use_browser(prompt: str) -> str:
     """
     output = ""
     client = computer_use.create_client()
-    _playwright, _browser, page = computer_use.setup_browser(reuse_existing=True)
+    _playwright, _browser, page = computer_use.setup_browser(reuse_existing=False)
 
     try:
         output = computer_use.run_agent_loop(client, page, prompt=prompt)
@@ -20,4 +20,13 @@ def use_browser(prompt: str) -> str:
         output = llm._run_model_api(output, system_instructions=BROWSER_SUMMARIZER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=1.0)
     except Exception as e:
         output = f"An error occurred: {str(e)}"
+    finally:
+        try:
+            _browser.close()
+        except Exception:
+            pass
+        try:
+            _playwright.stop()
+        except Exception:
+            pass
     return output

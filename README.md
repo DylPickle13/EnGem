@@ -44,7 +44,9 @@ Project layout (key files and folders)
 - `llm.py`: LLM provider and response orchestration.
 - `memory.py`, `history.py`: Helpers for storing/retrieving conversational memory.
 - `memory/`: Persistent data (channel histories and `vector_db/`). See `memory/vector_db/chroma.sqlite3` for embeddings.
+- `computer_use.py`: Opens the browser. 
 - `skills/`: Modular scripts and tools the bot can invoke.
 - `agent_instructions/`: Markdown instructions and job templates for sub-agents and scheduled jobs.
-- `sub-agents/`: Execution order and small orchestration artifacts (e.g., `execution_order.json`).
-- `DylPickle13.github.io/`: A small static site included in the repo.
+- `config.py`: Centralized configuration management via environment variables.
+- `requirements.txt`: Python dependencies for the project.
+- `README.md`: This documentation file.
