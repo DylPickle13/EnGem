@@ -33,11 +33,17 @@ TEXTER_FILE = Path(__file__).parent / "agent_instructions/texter.md"
 MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extractor.md"
 
 
-def generate_response(user_message: str, job: bool, history_file: str) -> str:
+def generate_response(user_message: str, job: bool, history_file: str, image: dict[str, bytes | str] | None = None) -> str:
 
     exit_string = ""
     default_temperature = 1.0
     temperature = default_temperature
+    image_text = _convert_image_to_text(image)
+    if image_text:
+        if user_message:
+            user_message = f"{user_message}\n\nImage text:\n{image_text}"
+        else:
+            user_message = f"Image text:\n{image_text}"
     history.append_history(role="user", text=user_message, history_file=history_file)
 
     if not job:
@@ -182,6 +188,54 @@ def generate_response(user_message: str, job: bool, history_file: str) -> str:
         extraction_input = "History: " + history.get_conversation_history(history_file=history_file) + "\n\nRelevant memories: \n\n" + relevant_memories_history
         _run_memory_extraction_async(extraction_input, history_file, default_temperature)
     return text_response
+
+
+def _convert_image_to_text(image: dict[str, bytes | str] | None) -> str:
+    if not image:
+        return ""
+
+    image_bytes = image.get("data")
+    mime_type = image.get("mime_type")
+    filename = image.get("filename")
+
+    if not isinstance(image_bytes, bytes) or not image_bytes:
+        return ""
+
+    if not isinstance(mime_type, str) or not mime_type:
+        mime_type = "application/octet-stream"
+
+    if not isinstance(filename, str) or not filename:
+        filename = "image"
+
+    prompt = (
+        "Extract all useful text and salient visual details from this image. "
+        "Return plain text only, concise but complete."
+    )
+
+    os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
+    client = genai.Client()
+
+    while True:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part(text=f"Image filename: {filename}\n{prompt}"),
+                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        ],
+                    )
+                ],
+                config=types.GenerateContentConfig(temperature=0.2),
+            )
+            return (getattr(response, "text", "") or "").strip()
+        except Exception as e:
+            print(f"Error converting image to text: {e}")
+            break
+
+    return ""
 
 
 def _run_memory_extraction_async(extraction_input: str, history_file: str, temperature: float) -> None:

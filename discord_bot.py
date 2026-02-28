@@ -690,7 +690,8 @@ class DiscordBotWrapper:
 
 	async def _default_responder(self, text: str, message: discord.Message) -> str:
 		history_file = _get_history_file_key_for_channel(message.channel)
-		return await asyncio.to_thread(llm.generate_response, text, False, history_file)
+		image_payload = await self._read_image_attachment(message)
+		return await asyncio.to_thread(llm.generate_response, text, False, history_file, image_payload)
 
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
 		for start in range(0, len(text), DISCORD_MESSAGE_LIMIT):
@@ -734,6 +735,30 @@ class DiscordBotWrapper:
 			return data.decode("utf-8").strip()
 		except UnicodeDecodeError:
 			return data.decode("utf-8", errors="replace").strip()
+
+	@staticmethod
+	def _is_image_attachment(attachment: discord.Attachment) -> bool:
+		content_type = (attachment.content_type or "").lower()
+		filename = (attachment.filename or "").lower()
+		return content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"))
+
+	async def _read_image_attachment(self, message: discord.Message) -> dict[str, bytes | str] | None:
+		image_attachment = next(
+			(attachment for attachment in message.attachments if self._is_image_attachment(attachment)),
+			None,
+		)
+		if image_attachment is None:
+			return None
+
+		image_bytes = await image_attachment.read()
+		if not image_bytes:
+			return None
+
+		return {
+			"data": image_bytes,
+			"mime_type": image_attachment.content_type or "application/octet-stream",
+			"filename": image_attachment.filename or "image",
+		}
 
 	@staticmethod
 	def _seconds_until_next_daily_run(target_hour: int, target_minute: int) -> float:
@@ -857,7 +882,7 @@ class DiscordBotWrapper:
 					channel_lock = self._get_channel_processing_lock(channel)
 					async with channel_lock:
 						async with channel.typing():
-							reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name)
+							reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name, None)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
 					logging.exception("Error running cron job task '%s': %s", task_name, exc)
@@ -903,7 +928,7 @@ class DiscordBotWrapper:
 					channel_lock = self._get_channel_processing_lock(channel)
 					async with channel_lock:
 						async with channel.typing():
-							reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name)
+							reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name, None)
 					await self._send_long_message(channel, reply)
 				except Exception as exc:
 					logging.exception("Error running heartbeat task '%s': %s", task_name, exc)
@@ -1093,8 +1118,12 @@ class DiscordBotWrapper:
 			),
 			None,
 		)
+		has_image_attachment = any(
+			self._is_image_attachment(attachment)
+			for attachment in message.attachments
+		)
 
-		if not content and text_attachment is None:
+		if not content and text_attachment is None and not has_image_attachment:
 			return
 
 		if text_attachment is not None:
