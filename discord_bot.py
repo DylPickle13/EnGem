@@ -1327,9 +1327,22 @@ class DiscordBotWrapper:
 		self.client.run(self.token, log_level=logging.WARNING)
 
 
+def _clear_sub_agents_directory() -> None:
+	sub_agents_dir = Path("sub-agents")
+	if sub_agents_dir.exists() and sub_agents_dir.is_dir():
+		for file in sub_agents_dir.iterdir():
+			try:
+				if file.is_file():
+					file.unlink()
+			except Exception:
+				logging.warning("Could not unlink sub-agent file '%s'; it may be in use. Skipping.", file)
+
+
 if __name__ == "__main__":
 	if not Path(memory.DEFAULT_DB_PATH).exists():
 		memory.get_default_store()
+
+	_clear_sub_agents_directory()
 
 	print("Starting PICKLEBOT...")
 	DiscordBotWrapper().run()

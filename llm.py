@@ -32,8 +32,15 @@ TEXTER_FILE = Path(__file__).parent / "agent_instructions/texter.md"
 # Memory Extractor file located alongside this module
 MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extractor.md"
 
+# Image Extractor file located alongside this module
+IMAGE_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/image_extractor.md"
+
 
 def generate_response(user_message: str, job: bool, history_file: str, image: dict[str, bytes | str] | None = None) -> str:
+    """
+    Main function to generate a response from the model based on the user's message, conversation history, and optionally an image. 
+    This function handles the entire flow of generating a response, including intent classification, sub-agent execution, and final response generation.
+    """
 
     exit_string = ""
     default_temperature = 1.0
@@ -160,7 +167,7 @@ def generate_response(user_message: str, job: bool, history_file: str, image: di
             continue
 
         try:
-            exit_string = _run_model_api(history.get_conversation_history(history_file=history_file) + "\n\nThe user's original message was: " + user_message, REVIEWER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+            exit_string = _run_model_api(history.get_conversation_history(history_file=history_file), REVIEWER_FILE.read_text(encoding="utf-8") + user_message, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
             history.append_history(role="Reviewer", text=exit_string, history_file=history_file)
         except Exception as e:
             print(f"Error generating reviewer response: {e}")
@@ -207,10 +214,7 @@ def _convert_image_to_text(image: dict[str, bytes | str] | None) -> str:
     if not isinstance(filename, str) or not filename:
         filename = "image"
 
-    prompt = (
-        "Extract all useful text and salient visual details from this image. "
-        "Return plain text only, concise but complete."
-    )
+    prompt = IMAGE_EXTRACTOR_FILE.read_text(encoding="utf-8")
 
     os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
     client = genai.Client()

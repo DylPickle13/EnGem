@@ -1,0 +1,1 @@
+Extract all useful text and salient visual details from this image. Return plain text only, concise but complete.
