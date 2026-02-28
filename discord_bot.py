@@ -304,13 +304,21 @@ class _GeminiVoiceConversation:
 			pass
 
 	async def _send_audio_loop(self, live_session: object) -> None:
-		while not self._stop_event.is_set():
-			try:
-				audio = await asyncio.wait_for(self._input_queue.get(), timeout=1.0)
-			except asyncio.TimeoutError:
-				continue
+			while not self._stop_event.is_set():
+				try:
+					audio = await asyncio.wait_for(self._input_queue.get(), timeout=1.0)
+				except asyncio.TimeoutError:
+					continue
 
-			await live_session.send_realtime_input(audio=audio)
+				try:
+					await live_session.send_realtime_input(audio=audio)
+				except asyncio.CancelledError:
+					raise
+				except Exception as exc:
+					logging.exception("Gemini Live send loop error: %s", exc)
+					# Stop the session to avoid an unhandled exception propagating out of TaskGroup
+					self._stop_event.set()
+					return
 
 	async def _send_audio_stream_end(self) -> None:
 		live_session = self._live_session
@@ -451,24 +459,32 @@ class _GeminiVoiceConversation:
 			await live_session.send_tool_response(function_responses=function_responses)
 
 	async def _receive_audio_loop(self, live_session: object) -> None:
-		while not self._stop_event.is_set():
-			turn = live_session.receive()
-			async for response in turn:
-				if self._stop_event.is_set():
+			while not self._stop_event.is_set():
+				try:
+					turn = live_session.receive()
+					async for response in turn:
+						if self._stop_event.is_set():
+							return
+
+						await self._handle_tool_calls(live_session, response)
+
+						server_content = getattr(response, "server_content", None)
+						model_turn = getattr(server_content, "model_turn", None) if server_content else None
+						if not model_turn:
+							continue
+
+						for part in model_turn.parts:
+							inline_data = getattr(part, "inline_data", None)
+							if inline_data and isinstance(inline_data.data, bytes):
+								self._push_gemini_audio(inline_data.data)
+					self._flush_output_tail()
+				except asyncio.CancelledError:
+					raise
+				except Exception as exc:
+					logging.exception("Gemini Live receive loop error: %s", exc)
+					# Stop the session gracefully to avoid bubbling the exception out of the TaskGroup
+					self._stop_event.set()
 					return
-
-				await self._handle_tool_calls(live_session, response)
-
-				server_content = getattr(response, "server_content", None)
-				model_turn = getattr(server_content, "model_turn", None) if server_content else None
-				if not model_turn:
-					continue
-
-				for part in model_turn.parts:
-					inline_data = getattr(part, "inline_data", None)
-					if inline_data and isinstance(inline_data.data, bytes):
-						self._push_gemini_audio(inline_data.data)
-			self._flush_output_tail()
 
 	async def _run(self) -> None:
 		try:

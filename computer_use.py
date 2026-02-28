@@ -13,13 +13,26 @@ BROWSER_FILE = Path(__file__).parent / "agent_instructions/browser.md"
 SCREEN_WIDTH = 1440
 SCREEN_HEIGHT = 900
 TURN_LIMIT = 50
-MODEL_NAME = "gemini-2.5-computer-use-preview-10-2025"
+MODEL_NAME = "gemini-3-flash-preview"
+ALT_MODEL_NAME = "gemini-2.5-computer-use-preview-10-2025"
 DEBUG_SCROLL = False
 DEFAULT_SCROLL_DELTA = 600
 DEFAULT_DOCUMENT_SCROLL_AMOUNT = 800
 
 _PLAYWRIGHT_INSTANCES: dict[int, Playwright] = {}
 _BROWSER_INSTANCES: dict[int, Browser] = {}
+_THREAD_LOCAL = threading.local()
+
+
+def _select_model_for_loop(prompt: str) -> str:
+    """Pick a single model for the whole loop to preserve tool-call turn consistency."""
+    model_pool = [MODEL_NAME]
+    if ALT_MODEL_NAME:
+        model_pool.append(ALT_MODEL_NAME)
+    if len(model_pool) == 1:
+        return model_pool[0]
+    key = f"{threading.get_ident()}::{prompt}"
+    return model_pool[abs(hash(key)) % len(model_pool)]
 
 
 def denormalize_x(x: int, screen_width: int) -> int:
@@ -485,10 +498,9 @@ def setup_browser(reuse_existing: bool = True) -> tuple[Playwright, Browser, Pag
     This keeps Playwright's sync greenlet usage isolated to a single thread so
     calls from separate threads create separate browser instances.
     """
-    tid = threading.get_ident()
-
-    pw = _PLAYWRIGHT_INSTANCES.get(tid)
-    br = _BROWSER_INSTANCES.get(tid)
+    local = _THREAD_LOCAL
+    pw = getattr(local, "pw", None)
+    br = getattr(local, "br", None)
 
     if reuse_existing and pw and br and br.is_connected():
         existing_page = _get_existing_open_page(br)
@@ -497,11 +509,11 @@ def setup_browser(reuse_existing: bool = True) -> tuple[Playwright, Browser, Pag
 
     if pw is None:
         pw = sync_playwright().start()
-        _PLAYWRIGHT_INSTANCES[tid] = pw
+        setattr(local, "pw", pw)
 
     if br is None or not br.is_connected():
         br = pw.chromium.launch(headless=False)
-        _BROWSER_INSTANCES[tid] = br
+        setattr(local, "br", br)
 
     context = br.new_context(viewport={"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT})
     page = context.new_page()
@@ -512,6 +524,8 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
     print("Prompt:", prompt)
     config = create_model_config()
     initial_screenshot = page.screenshot(type="png")
+    model_to_use = _select_model_for_loop(prompt)
+    print(f"Using model for this loop: {model_to_use}")
 
     contents = [
         Content(role="user", parts=[
@@ -523,11 +537,17 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
     responses = ""
     for i in range(TURN_LIMIT):
         print(f"\n--- Turn {i+1} ---")
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=contents,
-            config=config,
-        )
+        while True:
+            try:
+                response = client.models.generate_content(
+                    model=model_to_use,
+                    contents=contents,
+                    config=config,
+                )
+                break
+            except Exception as e:
+                print(f"Error during content generation: {e}\nRetrying...")
+                time.sleep(1)
 
         candidate = response.candidates[0]
         contents.append(candidate.content)

@@ -3,6 +3,7 @@ from google.genai import types
 import os
 import json
 import inspect
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from config import GEMINI_API_KEY as GEMINI_API_KEY
 from config import model as model
@@ -87,17 +88,76 @@ def generate_response(user_message: str, job: bool, history_file: str) -> str:
                 print(f"Error reading execution order file: {e}")
                 continue
 
-        for agent in execution_order_dict['sub_agents']:
-            sub_agent_response = ""
-            try:
-                sub_agent_response = _run_model_api(history.get_conversation_history(history_file=history_file) + "\n\n" + agent['instruction'], system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"), tool_use_allowed=True, force_tool=False, temperature=temperature)
-                history.append_history(role=agent['task_name'], text=sub_agent_response, history_file=history_file)
-                if sub_agent_response.strip() == "<CANNOT_PROCEED>":
-                    break
-            except Exception as e:
-                print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
+        execution_plan = _normalize_execution_plan(execution_order_dict)
+        if not execution_plan:
+            print("No valid execution plan found in execution order file.")
+            continue
 
-        if sub_agent_response.strip() == "<CANNOT_PROCEED>":
+        cannot_proceed = False
+        for stage in execution_plan:
+            mode = stage["mode"]
+            agents = stage["sub_agents"]
+
+            if mode == "parallel" and len(agents) > 1:
+                base_history = history.get_conversation_history(history_file=history_file)
+                stage_results = ["" for _ in agents]
+
+                def _run_parallel_agent(agent: dict, stage_history: str) -> str:
+                    return _run_model_api(
+                        stage_history + "\n\n" + agent["instruction"],
+                        system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"),
+                        tool_use_allowed=True,
+                        force_tool=False,
+                        temperature=temperature,
+                    )
+
+                with ThreadPoolExecutor(max_workers=min(len(agents), 8)) as executor:
+                    future_to_index = {
+                        executor.submit(_run_parallel_agent, agent, base_history): idx
+                        for idx, agent in enumerate(agents)
+                    }
+
+                    for future in as_completed(future_to_index):
+                        idx = future_to_index[future]
+                        agent = agents[idx]
+                        try:
+                            stage_results[idx] = future.result()
+                        except Exception as e:
+                            print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
+                            stage_results[idx] = ""
+
+                for idx, agent in enumerate(agents):
+                    sub_agent_response = stage_results[idx]
+                    history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
+                    if sub_agent_response.strip() == "<CANNOT_PROCEED>":
+                        cannot_proceed = True
+                        break
+
+                if cannot_proceed:
+                    break
+
+            else:
+                for agent in agents:
+                    sub_agent_response = ""
+                    try:
+                        sub_agent_response = _run_model_api(
+                            history.get_conversation_history(history_file=history_file) + "\n\n" + agent["instruction"],
+                            system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"),
+                            tool_use_allowed=True,
+                            force_tool=False,
+                            temperature=temperature,
+                        )
+                        history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
+                        if sub_agent_response.strip() == "<CANNOT_PROCEED>":
+                            cannot_proceed = True
+                            break
+                    except Exception as e:
+                        print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
+
+                if cannot_proceed:
+                    break
+
+        if cannot_proceed:
             continue
 
         try:
@@ -153,6 +213,45 @@ def _get_function_declarations(client: genai.Client = None) -> list[types.Functi
         except Exception as e:
             print(f"Error importing skill module '{module_name}': {e}")
     return function_declarations
+
+
+def _normalize_execution_plan(execution_order_dict: dict) -> list[dict]:
+    """Normalize execution order payload into staged execution format.
+
+    Required format:
+    - {"execution_plan": [{"mode": "parallel|serial", "sub_agents": [...]}, ...]}
+    - Each stage must explicitly include "mode" as "parallel" or "serial".
+    """
+    normalized_plan: list[dict] = []
+
+    if isinstance(execution_order_dict, dict) and isinstance(execution_order_dict.get("execution_plan"), list):
+        for stage in execution_order_dict["execution_plan"]:
+            if not isinstance(stage, dict):
+                continue
+
+            mode = stage.get("mode")
+            if mode not in ("parallel", "serial"):
+                continue
+            sub_agents = stage.get("sub_agents", [])
+            if not isinstance(sub_agents, list):
+                continue
+
+            cleaned_agents = []
+            for agent in sub_agents:
+                if not isinstance(agent, dict):
+                    continue
+                task_name = agent.get("task_name")
+                instruction = agent.get("instruction")
+                if not isinstance(task_name, str) or not isinstance(instruction, str):
+                    continue
+                cleaned_agents.append({"task_name": task_name, "instruction": instruction})
+
+            if cleaned_agents:
+                normalized_plan.append({"mode": mode, "sub_agents": cleaned_agents})
+
+        return normalized_plan
+
+    return []
 
 
 def _get_skill(function_name: str, function_args: dict) -> str:
