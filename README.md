@@ -1,6 +1,6 @@
-# PICKLEBOT
+# EnGem
 
-PICKLEBOT is a developer-focused local assistant framework that connects a streaming LLM to host-side tooling and exposes a Discord bot interface. It's designed for experimentation with vector memory (Chroma), lightweight sub-agents, and automation scripts.
+EnGem is a developer-focused local assistant framework that connects a streaming LLM to host-side tooling and exposes a Discord bot interface. It's designed for experimentation with vector memory (Chroma), lightweight sub-agents, and automation scripts.
 
 **Current project state (2026-02-25)**
 

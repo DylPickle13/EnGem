@@ -23,7 +23,7 @@ logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 
 DEFAULT_DB_PATH = Path(__file__).parent / "memory" / "vector_db"
-DEFAULT_COLLECTION_NAME = "picklebot_memory"
+DEFAULT_COLLECTION_NAME = "engem_memory"
 MEMORY_RELATED = Path(__file__).parent / "agent_instructions" / "memory_related.md"
 
 

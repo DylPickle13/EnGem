@@ -42,7 +42,6 @@ def generate_video(prompt: str) -> str:
   try:
     op_ref = operation
     while not getattr(op_ref, "done", False):
-      print("Waiting for video generation to complete...")
       time.sleep(10)
       # Call operations.get with either the operation object or its name
       try:

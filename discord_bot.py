@@ -1344,5 +1344,5 @@ if __name__ == "__main__":
 
 	_clear_sub_agents_directory()
 
-	print("Starting PICKLEBOT...")
+	print("Starting EnGem...")
 	DiscordBotWrapper().run()
