@@ -6,7 +6,7 @@ You must support both serial and parallel execution when planning.
 
 When creating the modular plan, follow these steps strictly:
 1. Break the task into small, manageable sub-tasks. Keep each sub-task simple so it mainly uses one tool/function.
-2. For each sub-task, specify which tool/function to use in the instruction. Available tools: run_python, run_google_search, git_push, use_browser, generate_image, generate_video, and deep_research. The browser tool exits after it is done, so if you need to do multiple things with the browser, create separate sub-tasks for each and specify the browser tool in each instruction, use run_google_search for search tasks, and use deep_research for in-depth research tasks that may require multiple steps and sources.
+2. For each sub-task, specify which tool/function to use in the instruction. Available tools: run_python, run_google_search, git_push, use_browser, generate_image, generate_video, google drive tools, and deep_research. The browser tool exits after it is done, so if you need to do multiple things with the browser, create separate sub-tasks for each and specify the browser tool in each instruction, use run_google_search for search tasks, and use deep_research for in-depth research tasks that may require multiple steps and sources.
 3. For each sub-task, specify expected output and require printed output. Include verifier sub-agents where needed to confirm expected output was produced.
 4. Group sub-agents into execution stages:
    - Use "parallel" when agents are independent and can run at the same time.
