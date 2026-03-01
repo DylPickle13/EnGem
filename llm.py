@@ -4,6 +4,7 @@ import os
 import json
 import inspect
 import threading
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from config import GEMINI_API_KEY as GEMINI_API_KEY
@@ -29,14 +30,30 @@ REVIEWER_FILE = Path(__file__).parent / "agent_instructions/reviewer.md"
 # Summarize file located alongside this module
 TEXTER_FILE = Path(__file__).parent / "agent_instructions/texter.md"
 
+# Media selector file located alongside this module
+MEDIA_SELECTOR_FILE = Path(__file__).parent / "agent_instructions/media_selector.md"
+
 # Memory Extractor file located alongside this module
 MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extractor.md"
 
 # Image Extractor file located alongside this module
 IMAGE_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/image_extractor.md"
 
+GENERATED_IMAGES_DIR = (Path(__file__).parent / "generated_images").resolve()
+GENERATED_VIDEOS_DIR = (Path(__file__).parent / "generated_videos").resolve()
+SUPPORTED_MEDIA_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
+    ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v",
+}
 
-def generate_response(user_message: str, job: bool, history_file: str, image: dict[str, bytes | str] | None = None) -> str:
+
+@dataclass
+class LLMResponse:
+    text: str = ""
+    media_paths: list[str] = field(default_factory=list)
+
+
+def generate_response(user_message: str, job: bool, history_file: str, image: dict[str, bytes | str] | None = None) -> LLMResponse:
     """
     Main function to generate a response from the model based on the user's message, conversation history, and optionally an image. 
     This function handles the entire flow of generating a response, including intent classification, sub-agent execution, and final response generation.
@@ -68,7 +85,7 @@ def generate_response(user_message: str, job: bool, history_file: str, image: di
             if not job:
                 extraction_input = history.get_conversation_history(history_file=history_file)
                 _run_memory_extraction_async(extraction_input, history_file, default_temperature)
-            return intent_response
+            return LLMResponse(text=intent_response, media_paths=[])
 
     while True:
         # Execution order file path
@@ -184,17 +201,148 @@ def generate_response(user_message: str, job: bool, history_file: str, image: di
                 temperature += 0.1
 
     text_response = ""
-    try:
-        text_response = _run_model_api(history.get_conversation_history(history_file=history_file), TEXTER_FILE.read_text(encoding="utf-8"), tool_use_allowed=False, force_tool=False, temperature=default_temperature)
-        history.append_history(role="Texter", text=text_response, history_file=history_file)
-    except Exception as e:
-        print(f"Error generating texter response: {e}")
+    media_paths: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        text_future = executor.submit(
+            _run_model_api,
+            history.get_conversation_history(history_file=history_file),
+            TEXTER_FILE.read_text(encoding="utf-8"),
+            False,
+            False,
+            default_temperature,
+        )
+        media_future = executor.submit(
+            _select_media_paths,
+            history_file,
+            user_message,
+            default_temperature,
+        )
+
+        try:
+            text_response = text_future.result()
+            history.append_history(role="Texter", text=text_response, history_file=history_file)
+        except Exception as e:
+            print(f"Error generating texter response: {e}")
+
+        try:
+            media_paths = media_future.result()
+            history.append_history(
+                role="MediaSelector",
+                text=json.dumps({"media_paths": media_paths}, ensure_ascii=False),
+                history_file=history_file,
+            )
+        except Exception as e:
+            print(f"Error selecting media paths: {e}")
+            media_paths = []
 
     if not job:
         relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in memory.get_default_store().search_memories(history.get_conversation_history(history_file=history_file), limit=10)])
         extraction_input = "History: " + history.get_conversation_history(history_file=history_file) + "\n\nRelevant memories: \n\n" + relevant_memories_history
         _run_memory_extraction_async(extraction_input, history_file, default_temperature)
-    return text_response
+    return LLMResponse(text=text_response, media_paths=media_paths)
+
+
+def _select_media_paths(history_file: str, user_message: str, temperature: float) -> list[str]:
+    try:
+        from skills.select_generated_media import collect_generated_media
+    except Exception as e:
+        print(f"Error importing media selection skill: {e}")
+        return []
+
+    catalog_json = collect_generated_media("120")
+    selector_input = (
+        "Latest user request:\n"
+        f"{user_message}\n\n"
+        "Conversation history:\n"
+        f"{history.get_conversation_history(history_file=history_file)}\n\n"
+        "Generated media catalog JSON:\n"
+        f"{catalog_json}"
+    )
+
+    selector_response = _run_model_api(
+        selector_input,
+        MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
+        tool_use_allowed=False,
+        force_tool=False,
+        temperature=temperature,
+    )
+    return _parse_selected_media_paths(selector_response)
+
+
+def _parse_selected_media_paths(selector_response: str) -> list[str]:
+    text = (selector_response or "").strip()
+    if not text:
+        return []
+
+    payload = _extract_json_payload(text)
+    if not isinstance(payload, dict):
+        return []
+
+    raw_paths = payload.get("media_paths", [])
+    if not isinstance(raw_paths, list):
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for item in raw_paths:
+        if not isinstance(item, str):
+            continue
+        safe_path = _normalize_media_path(item)
+        if not safe_path or safe_path in seen:
+            continue
+        seen.add(safe_path)
+        normalized.append(safe_path)
+        if len(normalized) >= 10:
+            break
+
+    return normalized
+
+
+def _extract_json_payload(text: str) -> dict | None:
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        parsed = json.loads(text[start : end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _normalize_media_path(raw_path: str) -> str | None:
+    try:
+        path = Path(raw_path).expanduser().resolve()
+    except Exception:
+        return None
+
+    if not path.exists() or not path.is_file():
+        return None
+    if path.suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS:
+        return None
+    if not _is_under_directory(path, GENERATED_IMAGES_DIR) and not _is_under_directory(path, GENERATED_VIDEOS_DIR):
+        return None
+    return str(path)
+
+
+def _is_under_directory(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+        return True
+    except Exception:
+        return False
 
 
 def _convert_image_to_text(image: dict[str, bytes | str] | None) -> str:

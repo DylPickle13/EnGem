@@ -42,6 +42,9 @@ except Exception:
 CRON_JOBS_DIR = Path(__file__).parent / "agent_instructions/cron_jobs"
 HEARTBEAT_JOBS_DIR = Path(__file__).parent / "agent_instructions/heartbeat_jobs"
 DISCORD_MESSAGE_LIMIT = 2000
+DISCORD_MAX_ATTACHMENTS_PER_MESSAGE = 10
+DISCORD_ATTACHMENT_BATCH_MAX_BYTES = 24 * 1024 * 1024
+DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
 HEARTBEAT_INTERVAL_SECONDS = 30 * 60
 MESSAGE_WORKER_CONCURRENCY = 3
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
@@ -647,7 +650,7 @@ def ensure_history_files_for_text_channels(channels: Iterable[discord.TextChanne
 class DiscordBotWrapper:
 	def __init__(
 		self,
-		responder: Optional[Callable[[str, discord.Message], Awaitable[str]]] = None,
+		responder: Optional[Callable[[str, discord.Message], Awaitable[llm.LLMResponse | str]]] = None,
 		command_prefix: str = ">",
 	) -> None:
 		self.token = DISCORD_BOT_TOKEN
@@ -688,14 +691,187 @@ class DiscordBotWrapper:
 		self.responder = responder or self._default_responder
 		self._register_events()
 
-	async def _default_responder(self, text: str, message: discord.Message) -> str:
+	async def _default_responder(self, text: str, message: discord.Message) -> llm.LLMResponse:
 		history_file = _get_history_file_key_for_channel(message.channel)
 		image_payload = await self._read_image_attachment(message)
 		return await asyncio.to_thread(llm.generate_response, text, False, history_file, image_payload)
 
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
+		if not text:
+			return
 		for start in range(0, len(text), DISCORD_MESSAGE_LIMIT):
 			await channel.send(text[start : start + DISCORD_MESSAGE_LIMIT])
+
+	@staticmethod
+	def _normalize_response_payload(response: llm.LLMResponse | str) -> llm.LLMResponse:
+		if isinstance(response, llm.LLMResponse):
+			return response
+
+		if isinstance(response, str):
+			return llm.LLMResponse(text=response, media_paths=[])
+
+		return llm.LLMResponse(text=str(response), media_paths=[])
+
+	async def _send_media_attachments(self, channel: discord.abc.Messageable, media_paths: list[str]) -> None:
+		if not media_paths:
+			return
+
+		upload_limit_bytes = self._get_channel_upload_limit_bytes(channel)
+
+		valid_paths: list[Path] = []
+		skipped_paths: list[str] = []
+		oversized_paths: dict[str, int] = {}
+		for media_path in media_paths:
+			path = Path(media_path)
+			if not path.exists() or not path.is_file():
+				skipped_paths.append(str(path))
+				continue
+			try:
+				file_size = int(path.stat().st_size)
+				if file_size > upload_limit_bytes:
+					logging.warning(
+						"Skipping media '%s': file size %d exceeds upload limit %d bytes.",
+						path,
+						file_size,
+						upload_limit_bytes,
+					)
+					oversized_paths[str(path)] = file_size
+					skipped_paths.append(str(path))
+					continue
+				valid_paths.append(path)
+			except Exception as exc:
+				logging.warning("Failed to attach media '%s': %s", path, exc)
+				skipped_paths.append(str(path))
+
+		if not valid_paths:
+			if oversized_paths:
+				await self._send_oversized_media_warning(channel, oversized_paths, upload_limit_bytes)
+			non_oversized_skips = [p for p in skipped_paths if p not in oversized_paths]
+			if non_oversized_skips:
+				await self._send_long_message(
+					channel,
+					"Could not attach media files (missing/unreadable files).",
+				)
+			return
+
+		batches: list[list[Path]] = []
+		current_batch: list[Path] = []
+		current_batch_bytes = 0
+
+		for path in valid_paths:
+			try:
+				file_size = int(path.stat().st_size)
+			except Exception:
+				skipped_paths.append(str(path))
+				continue
+
+			would_exceed_count = len(current_batch) >= DISCORD_MAX_ATTACHMENTS_PER_MESSAGE
+			would_exceed_bytes = current_batch and (current_batch_bytes + file_size > DISCORD_ATTACHMENT_BATCH_MAX_BYTES)
+
+			if would_exceed_count or would_exceed_bytes:
+				batches.append(current_batch)
+				current_batch = []
+				current_batch_bytes = 0
+
+			current_batch.append(path)
+			current_batch_bytes += file_size
+
+		if current_batch:
+			batches.append(current_batch)
+
+		for batch in batches:
+			try:
+				batch_skipped = await self._send_media_batch(channel, batch)
+				for skipped in batch_skipped:
+					if skipped not in oversized_paths:
+						try:
+							oversized_paths[skipped] = int(Path(skipped).stat().st_size)
+						except Exception:
+							oversized_paths[skipped] = 0
+				skipped_paths.extend(batch_skipped)
+			except Exception as exc:
+				logging.exception("Failed sending media batch: %s", exc)
+				skipped_paths.extend(str(path) for path in batch)
+
+		if oversized_paths:
+			await self._send_oversized_media_warning(channel, oversized_paths, upload_limit_bytes)
+
+		if skipped_paths:
+			unique_skipped = list(dict.fromkeys(skipped_paths))
+			non_oversized_skips = [path for path in unique_skipped if path not in oversized_paths]
+			skipped_count = len(non_oversized_skips)
+			if skipped_count == 0:
+				return
+			if skipped_count == 1:
+				await self._send_long_message(channel, f"Skipped 1 media file that Discord would not accept: {non_oversized_skips[0]}")
+			else:
+				await self._send_long_message(channel, f"Skipped {skipped_count} media files that Discord would not accept.")
+
+	async def _send_oversized_media_warning(
+		self,
+		channel: discord.abc.Messageable,
+		oversized_paths: dict[str, int],
+		upload_limit_bytes: int,
+	) -> None:
+		if not oversized_paths:
+			return
+
+		entries = list(dict.fromkeys(oversized_paths.keys()))
+		display_entries = entries[:5]
+		lines: list[str] = []
+		for media_path in display_entries:
+			size_bytes = oversized_paths.get(media_path, 0)
+			if size_bytes > 0:
+				size_text = f"{size_bytes / (1024 * 1024):.1f}MB"
+			else:
+				size_text = "unknown size"
+			lines.append(f"- {Path(media_path).name} ({size_text})")
+
+		remaining = len(entries) - len(display_entries)
+		limit_text = f"{upload_limit_bytes / (1024 * 1024):.1f}MB"
+		message = "⚠️ Some media files are too large for this Discord channel upload limit "
+		message += f"({limit_text}):\n" + "\n".join(lines)
+		if remaining > 0:
+			message += f"\n...and {remaining} more file(s)."
+
+		await self._send_long_message(channel, message)
+
+	@staticmethod
+	def _get_channel_upload_limit_bytes(channel: discord.abc.Messageable) -> int:
+		guild = getattr(channel, "guild", None)
+		limit = getattr(guild, "filesize_limit", None)
+		if isinstance(limit, int) and limit > 0:
+			return limit
+		return DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES
+
+	async def _send_media_batch(self, channel: discord.abc.Messageable, batch_paths: list[Path]) -> list[str]:
+		if not batch_paths:
+			return []
+
+		files: list[discord.File] = []
+		try:
+			for path in batch_paths:
+				files.append(discord.File(str(path), filename=path.name))
+			await channel.send(files=files)
+			return []
+		except discord.HTTPException as exc:
+			if getattr(exc, "code", None) == 40005:
+				if len(batch_paths) > 1:
+					skipped: list[str] = []
+					for path in batch_paths:
+						skipped.extend(await self._send_media_batch(channel, [path]))
+					return skipped
+
+				single_path = batch_paths[0]
+				logging.warning("Skipping media '%s': Discord rejected the file as too large.", single_path)
+				return [str(single_path)]
+			raise
+		finally:
+			for file_obj in files:
+				try:
+					file_obj.close()
+				except Exception:
+					pass
 
 	@staticmethod
 	def _build_prompt(content: str, attachment_text: str) -> str:
@@ -705,8 +881,11 @@ class DiscordBotWrapper:
 
 	async def _respond_and_send(self, channel: discord.abc.Messageable, prompt: str, message: discord.Message) -> None:
 		async with channel.typing():
-			reply = await self.responder(prompt, message)
-		await self._send_long_message(channel, reply)
+			response = await self.responder(prompt, message)
+
+		payload = self._normalize_response_payload(response)
+		await self._send_long_message(channel, payload.text)
+		await self._send_media_attachments(channel, payload.media_paths)
 
 	async def _shutdown_background_tasks(self) -> None:
 		worker_tasks = [task for task in self._worker_tasks if not task.done()]
@@ -882,8 +1061,10 @@ class DiscordBotWrapper:
 					channel_lock = self._get_channel_processing_lock(channel)
 					async with channel_lock:
 						async with channel.typing():
-							reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name, None)
-					await self._send_long_message(channel, reply)
+							response = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name, None)
+					payload = self._normalize_response_payload(response)
+					await self._send_long_message(channel, payload.text)
+					await self._send_media_attachments(channel, payload.media_paths)
 				except Exception as exc:
 					logging.exception("Error running cron job task '%s': %s", task_name, exc)
 
@@ -928,8 +1109,10 @@ class DiscordBotWrapper:
 					channel_lock = self._get_channel_processing_lock(channel)
 					async with channel_lock:
 						async with channel.typing():
-							reply = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name, None)
-					await self._send_long_message(channel, reply)
+							response = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name, None)
+					payload = self._normalize_response_payload(response)
+					await self._send_long_message(channel, payload.text)
+					await self._send_media_attachments(channel, payload.media_paths)
 				except Exception as exc:
 					logging.exception("Error running heartbeat task '%s': %s", task_name, exc)
 
