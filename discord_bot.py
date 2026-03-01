@@ -39,6 +39,41 @@ except Exception:
 	voice_recv = None
 	VOICE_RECV_AVAILABLE = False
 
+
+def _apply_voice_recv_compat_patch() -> None:
+	if not VOICE_RECV_AVAILABLE or voice_recv is None:
+		return
+
+	voice_client_cls = getattr(voice_recv, "VoiceRecvClient", None)
+	if voice_client_cls is None:
+		return
+
+	original_remove_ssrc = getattr(voice_client_cls, "_remove_ssrc", None)
+	if original_remove_ssrc is None:
+		return
+
+	if getattr(original_remove_ssrc, "_engem_guarded", False):
+		return
+
+	def _safe_remove_ssrc(self, *, user_id):
+		try:
+			return original_remove_ssrc(self, user_id=user_id)
+		except AttributeError as exc:
+			reader = getattr(self, "_reader", None)
+			if reader is None or not hasattr(reader, "speaking_timer"):
+				logging.warning(
+					"voice_recv race detected while dropping SSRC for user_id=%s; skipping unsafe _remove_ssrc call.",
+					user_id,
+				)
+				return None
+			raise exc
+
+	setattr(_safe_remove_ssrc, "_engem_guarded", True)
+	setattr(voice_client_cls, "_remove_ssrc", _safe_remove_ssrc)
+
+
+_apply_voice_recv_compat_patch()
+
 CRON_JOBS_DIR = Path(__file__).parent / "agent_instructions/cron_jobs"
 HEARTBEAT_JOBS_DIR = Path(__file__).parent / "agent_instructions/heartbeat_jobs"
 DISCORD_MESSAGE_LIMIT = 2000
