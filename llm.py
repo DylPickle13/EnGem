@@ -45,6 +45,7 @@ SUPPORTED_MEDIA_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
     ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v",
 }
+MAX_INPUT_ATTACHMENTS = 10
 
 
 @dataclass
@@ -53,21 +54,27 @@ class LLMResponse:
     media_paths: list[str] = field(default_factory=list)
 
 
-def generate_response(user_message: str, job: bool, history_file: str, image: dict[str, bytes | str] | None = None) -> LLMResponse:
+def generate_response(
+    user_message: str,
+    job: bool,
+    history_file: str,
+    image: dict[str, bytes | str] | list[dict[str, bytes | str]] | None = None,
+) -> LLMResponse:
     """
-    Main function to generate a response from the model based on the user's message, conversation history, and optionally an image. 
+    Main function to generate a response from the model based on the user's message,
+    conversation history, and optionally image/video attachments.
     This function handles the entire flow of generating a response, including intent classification, sub-agent execution, and final response generation.
     """
 
     exit_string = ""
     default_temperature = 1.0
     temperature = default_temperature
-    image_text = _convert_image_to_text(image)
-    if image_text:
+    attachment_text = _convert_attachments_to_text(image)
+    if attachment_text:
         if user_message:
-            user_message = f"{user_message}\n\nImage text:\n{image_text}"
+            user_message = f"{user_message}\n\nAttachment text:\n{attachment_text}"
         else:
-            user_message = f"Image text:\n{image_text}"
+            user_message = f"Attachment text:\n{attachment_text}"
     history.append_history(role="user", text=user_message, history_file=history_file)
 
     if not job:
@@ -345,15 +352,42 @@ def _is_under_directory(path: Path, directory: Path) -> bool:
         return False
 
 
-def _convert_image_to_text(image: dict[str, bytes | str] | None) -> str:
-    if not image:
+def _convert_attachments_to_text(attachments: dict[str, bytes | str] | list[dict[str, bytes | str]] | None) -> str:
+    if not attachments:
         return ""
 
-    image_bytes = image.get("data")
-    mime_type = image.get("mime_type")
-    filename = image.get("filename")
+    normalized_attachments: list[dict[str, bytes | str]] = []
+    if isinstance(attachments, dict):
+        normalized_attachments = [attachments]
+    elif isinstance(attachments, list):
+        normalized_attachments = [item for item in attachments if isinstance(item, dict)]
+    else:
+        return ""
 
-    if not isinstance(image_bytes, bytes) or not image_bytes:
+    extracted_segments: list[str] = []
+    for index, attachment in enumerate(normalized_attachments[:MAX_INPUT_ATTACHMENTS], start=1):
+        extracted_text = _convert_single_attachment_to_text(attachment)
+        if not extracted_text:
+            continue
+
+        filename = attachment.get("filename")
+        if isinstance(filename, str) and filename:
+            extracted_segments.append(f"[Attachment {index}: {filename}]\n{extracted_text}")
+        else:
+            extracted_segments.append(f"[Attachment {index}]\n{extracted_text}")
+
+    return "\n\n".join(extracted_segments)
+
+
+def _convert_single_attachment_to_text(attachment: dict[str, bytes | str]) -> str:
+    if not attachment:
+        return ""
+
+    attachment_bytes = attachment.get("data")
+    mime_type = attachment.get("mime_type")
+    filename = attachment.get("filename")
+
+    if not isinstance(attachment_bytes, bytes) or not attachment_bytes:
         return ""
 
     if not isinstance(mime_type, str) or not mime_type:
@@ -375,8 +409,8 @@ def _convert_image_to_text(image: dict[str, bytes | str] | None) -> str:
                     types.Content(
                         role="user",
                         parts=[
-                            types.Part(text=f"Image filename: {filename}\n{prompt}"),
-                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                            types.Part(text=f"Attachment filename: {filename}\nAttachment MIME type: {mime_type}\n{prompt}"),
+                            types.Part.from_bytes(data=attachment_bytes, mime_type=mime_type),
                         ],
                     )
                 ],

@@ -728,8 +728,8 @@ class DiscordBotWrapper:
 
 	async def _default_responder(self, text: str, message: discord.Message) -> llm.LLMResponse:
 		history_file = _get_history_file_key_for_channel(message.channel)
-		image_payload = await self._read_image_attachment(message)
-		return await asyncio.to_thread(llm.generate_response, text, False, history_file, image_payload)
+		media_payloads = await self._read_media_attachments(message)
+		return await asyncio.to_thread(llm.generate_response, text, False, history_file, media_payloads)
 
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
 		if not text:
@@ -956,23 +956,47 @@ class DiscordBotWrapper:
 		filename = (attachment.filename or "").lower()
 		return content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"))
 
-	async def _read_image_attachment(self, message: discord.Message) -> dict[str, bytes | str] | None:
-		image_attachment = next(
-			(attachment for attachment in message.attachments if self._is_image_attachment(attachment)),
-			None,
-		)
-		if image_attachment is None:
-			return None
+	@staticmethod
+	def _is_video_attachment(attachment: discord.Attachment) -> bool:
+		content_type = (attachment.content_type or "").lower()
+		filename = (attachment.filename or "").lower()
+		return content_type.startswith("video/") or filename.endswith((".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"))
 
-		image_bytes = await image_attachment.read()
-		if not image_bytes:
-			return None
+	def _is_media_attachment(self, attachment: discord.Attachment) -> bool:
+		return self._is_image_attachment(attachment) or self._is_video_attachment(attachment)
 
-		return {
-			"data": image_bytes,
-			"mime_type": image_attachment.content_type or "application/octet-stream",
-			"filename": image_attachment.filename or "image",
-		}
+	async def _read_media_attachments(self, message: discord.Message) -> list[dict[str, bytes | str]]:
+		media_payloads: list[dict[str, bytes | str]] = []
+		for attachment in message.attachments:
+			if len(media_payloads) >= DISCORD_MAX_ATTACHMENTS_PER_MESSAGE:
+				break
+			if not self._is_media_attachment(attachment):
+				continue
+
+			try:
+				attachment_bytes = await attachment.read()
+			except Exception as exc:
+				logging.warning("Failed reading attachment '%s': %s", attachment.filename, exc)
+				continue
+
+			if not attachment_bytes:
+				continue
+
+			default_name = "attachment"
+			if self._is_video_attachment(attachment):
+				default_name = "video"
+			elif self._is_image_attachment(attachment):
+				default_name = "image"
+
+			media_payloads.append(
+				{
+					"data": attachment_bytes,
+					"mime_type": attachment.content_type or "application/octet-stream",
+					"filename": attachment.filename or default_name,
+				}
+			)
+
+		return media_payloads
 
 	@staticmethod
 	def _seconds_until_next_daily_run(target_hour: int, target_minute: int) -> float:
@@ -1336,12 +1360,12 @@ class DiscordBotWrapper:
 			),
 			None,
 		)
-		has_image_attachment = any(
-			self._is_image_attachment(attachment)
+		has_media_attachment = any(
+			self._is_media_attachment(attachment)
 			for attachment in message.attachments
 		)
 
-		if not content and text_attachment is None and not has_image_attachment:
+		if not content and text_attachment is None and not has_media_attachment:
 			return
 
 		if text_attachment is not None:
