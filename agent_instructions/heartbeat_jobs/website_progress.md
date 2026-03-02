@@ -1,7 +1,8 @@
-# Website Builder Instructions — EnGem Revamp Prompt (v9.1)
+# Website Builder Instructions — EnGem Revamp Prompt (v9.2)
 
 ## Prompt Changelog
-- 2026-03-02 — agent: v9.1 UI enhancements; added CSS animations, refined hover states, and expanded section content for Features, Use Cases, Docs, and Blog.
+- 2026-03-02 — agent: v9.2; Dynamic Skills integration from root skills/ directory.
+- 2026-03-02 — agent: v9.2 UI enhancements; added CSS animations, refined hover states, and expanded section content for Features, Use Cases, Docs, and Blog.
 - 2026-03-02 — agent: Deployed V9.0 Omni-EnGem; full reconstruction with 6 mandatory sections (Home, Features, Use Cases, Docs, Blog, Contact).
 - 2026-03-02 — agent: Fixed submodule deployment and synchronized skills snippet.
 - 2026-03-01 — agent: Rebranding EnGem to a "Gemini Blue" aesthetic.
