@@ -1,6 +1,8 @@
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import re
+from typing import List, Dict, Optional
 
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
 HISTORY_MAX_CHARS = 100_000
@@ -80,3 +82,70 @@ def _prune_history(history_file: str = "default", max_chars: int = HISTORY_MAX_C
         target_file.write_text(trimmed.lstrip(), encoding="utf-8")
     except Exception:
         return "Failed to prune history file."
+
+
+def parse_history(history_text: str) -> List[Dict[str, Optional[str]]]:
+    """Parse a conversation history string into a list of message parts.
+
+    Tries two common formats:
+    - Markdown blocks written by `append_history`:
+        ## 2026-03-01T12:00:00 - role\n\nmessage text\n\n---\n\n
+    - Simple prefixed lines like `User: ...` and `Assistant: ...` where blocks
+      start with `Name:` at the start of a line and may span multiple lines.
+
+    Returns a list of dicts with keys: `speaker`, `text`, and optional
+    `timestamp` (only for the markdown format).
+    """
+    messages: List[Dict[str, Optional[str]]] = []
+
+    if not history_text:
+        return messages
+
+    # Try the markdown timestamped blocks first (append_history format)
+    # ISO-8601 timestamp (basic validation) to avoid matching truncated headers
+    iso_ts = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)?"
+    md_pattern = re.compile(
+        rf"(?m)^##\s*(?P<timestamp>{iso_ts})\s+-\s+(?P<speaker>[^\n]+)\n\n(?P<text>.*?)(?=(?:\n\n---\n\n)|(?:^##\\s*{iso_ts}\s+-\s+[^\n]+)|\Z)",
+        re.DOTALL | re.MULTILINE,
+    )
+
+    md_matches = list(md_pattern.finditer(history_text))
+    if md_matches:
+        for m in md_matches:
+            messages.append(
+                {
+                    "speaker": m.group("speaker").strip(),
+                    "text": m.group("text").strip(),
+                    "timestamp": m.group("timestamp").strip(),
+                }
+            )
+        return messages
+
+    # Fallback: simple "Name: text" blocks (colon at line-start)
+    colon_pattern = re.compile(
+        r"(?ms)^(?P<speaker>[A-Za-z0-9 _\-\[\]\(\)]+):\s*(?P<text>.*?)(?=^[A-Za-z0-9 _\-\[\]\(\)]+:\s|\Z)",
+        re.MULTILINE,
+    )
+
+    for m in colon_pattern.finditer(history_text):
+        messages.append(
+            {"speaker": m.group("speaker").strip(), "text": m.group("text").strip(), "timestamp": None}
+        )
+
+    return messages
+
+
+def parse_history_file(history_file: str = "default") -> List[Dict[str, Optional[str]]]:
+    """Read the history file and parse it into parts using `parse_history`."""
+    raw = get_conversation_history(history_file)
+    if not raw or raw == "No history available.":
+        return []
+    return parse_history(raw)
+
+
+if __name__ == "__main__":    # Example usage
+    history_file = "engem-chat3"
+
+    history = parse_history_file(history_file)
+    for msg in history:
+        print(f"{msg['speaker']}:")
