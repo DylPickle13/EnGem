@@ -2,11 +2,12 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import re
+import threading
 from typing import List, Dict, Optional
 
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
-HISTORY_MAX_CHARS = 100_000
 TORONTO_TZ = ZoneInfo("America/Toronto")
+_HISTORY_FILE_LOCK = threading.RLock()
 
 
 def _resolve_history_file(history_file: str = "default") -> Path:
@@ -24,7 +25,8 @@ def get_conversation_history(history_file: str = "default") -> str:
     """Get the conversation history as raw text."""
     target_file = _resolve_history_file(history_file)
     try:
-        return target_file.read_text(encoding="utf-8")
+        with _HISTORY_FILE_LOCK:
+            return target_file.read_text(encoding="utf-8")
     except Exception:
         return "No history available."
     
@@ -33,7 +35,8 @@ def clear_history(history_file: str = "default") -> None:
     """Clear the conversation history by clearing the contents of the history file."""
     target_file = _resolve_history_file(history_file)
     try:
-        target_file.write_text("", encoding="utf-8")
+        with _HISTORY_FILE_LOCK:
+            target_file.write_text("", encoding="utf-8")
     except Exception:
         return "Failed to clear history file."
 
@@ -46,42 +49,77 @@ def append_history(role: str, text: str, history_file: str = "default") -> None:
     target_file = _resolve_history_file(history_file)
     try:
         ts = datetime.now(TORONTO_TZ).isoformat()
-        with target_file.open("a", encoding="utf-8") as f:
-            f.write(f"## {ts} - {role}\n\n")
-            f.write(text.rstrip() + "\n\n---\n\n")
-        _prune_history(history_file=history_file)
+        with _HISTORY_FILE_LOCK:
+            with target_file.open("a", encoding="utf-8") as f:
+                f.write(f"## {ts} - {role}\n\n")
+                f.write(text.rstrip() + "\n\n---\n\n")
     except Exception:
         return "Failed to append to history file."
 
 
-def _prune_history(history_file: str = "default", max_chars: int = HISTORY_MAX_CHARS) -> None:
-    """Trim history.md from the top when it exceeds max_chars.
+def _format_message_block(message: Dict[str, Optional[str]]) -> str:
+    timestamp = (message.get("timestamp") or datetime.now(TORONTO_TZ).isoformat()).strip()
+    speaker = (message.get("speaker") or "unknown").strip() or "unknown"
+    text = (message.get("text") or "").rstrip()
+    return f"## {timestamp} - {speaker}\n\n{text}\n\n---\n\n"
 
-    Keeps the most recent history content and attempts to align to the next
-    message boundary ("\n\n---\n\n") so entries are not cut mid-block.
-    """
+
+def get_history_before_latest_user(history_file: str = "default") -> str:
+    """Return history text that occurred before the latest user message."""
+    messages = parse_history_file(history_file)
+    if not messages:
+        return ""
+
+    latest_user_index = -1
+    for idx in range(len(messages) - 1, -1, -1):
+        if (messages[idx].get("speaker") or "").strip().lower() == "user":
+            latest_user_index = idx
+            break
+
+    if latest_user_index <= 0:
+        return ""
+
+    return "".join(_format_message_block(msg) for msg in messages[:latest_user_index]).strip()
+
+
+def rewrite_history_with_summary_before_latest_user(
+    summary_text: str,
+    history_file: str = "default",
+    summary_role: str = "ConversationSummary",
+) -> None:
+    """Rewrite history so first message is summary, then latest user request and following messages."""
+    cleaned_summary = (summary_text or "").strip()
+    if not cleaned_summary:
+        return
+
     target_file = _resolve_history_file(history_file)
-    try:
-        if max_chars <= 0:
+    with _HISTORY_FILE_LOCK:
+        try:
+            raw_history = target_file.read_text(encoding="utf-8")
+        except Exception:
             return
 
-        if not target_file.exists():
+        messages = parse_history(raw_history)
+        if not messages:
             return
 
-        history_text = target_file.read_text(encoding="utf-8")
-        if len(history_text) <= max_chars:
+        latest_user_index = -1
+        for idx in range(len(messages) - 1, -1, -1):
+            if (messages[idx].get("speaker") or "").strip().lower() == "user":
+                latest_user_index = idx
+                break
+
+        if latest_user_index <= 0:
             return
 
-        trimmed = history_text[-max_chars:]
-        boundary = "\n\n---\n\n"
-        boundary_index = trimmed.find(boundary)
-
-        if boundary_index != -1:
-            trimmed = trimmed[boundary_index + len(boundary) :]
-
-        target_file.write_text(trimmed.lstrip(), encoding="utf-8")
-    except Exception:
-        return "Failed to prune history file."
+        summary_message: Dict[str, Optional[str]] = {
+            "speaker": summary_role,
+            "text": cleaned_summary,
+            "timestamp": datetime.now(TORONTO_TZ).isoformat(),
+        }
+        rewritten = [summary_message] + messages[latest_user_index:]
+        payload = "".join(_format_message_block(msg) for msg in rewritten)
+        target_file.write_text(payload, encoding="utf-8")
 
 
 def parse_history(history_text: str) -> List[Dict[str, Optional[str]]]:
@@ -141,11 +179,3 @@ def parse_history_file(history_file: str = "default") -> List[Dict[str, Optional
     if not raw or raw == "No history available.":
         return []
     return parse_history(raw)
-
-
-if __name__ == "__main__":    # Example usage
-    history_file = "engem-chat3"
-
-    history = parse_history_file(history_file)
-    for msg in history:
-        print(f"{msg['speaker']}:")

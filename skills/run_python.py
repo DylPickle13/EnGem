@@ -5,6 +5,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Maximum number of characters to keep from tool stdout
+MAX_OUTPUT_CHARS = 100_000
+
 
 def run_python(code: str) -> str:
     """
@@ -29,7 +32,24 @@ def run_python(code: str) -> str:
             text=True,
             timeout=300,
         )
-        output_text = result.stderr if result.stderr else result.stdout
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+
+        def _truncate_stdout(s: str) -> str:
+            if len(s) <= MAX_OUTPUT_CHARS:
+                return s
+            return s[:MAX_OUTPUT_CHARS] + f"\n\n...[truncated stdout; original length={len(s)} chars]"
+
+        truncated_stdout = _truncate_stdout(stdout)
+
+        if stderr and stderr.strip():
+            # include stderr and the (possibly truncated) stdout
+            if truncated_stdout and truncated_stdout.strip():
+                output_text = f"STDERR:\n{stderr}\n\nSTDOUT:\n{truncated_stdout}"
+            else:
+                output_text = f"STDERR:\n{stderr}"
+        else:
+            output_text = truncated_stdout
     except subprocess.TimeoutExpired as e:
         output_text = f"TimeoutExpired: {e}"
     finally:

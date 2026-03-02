@@ -36,6 +36,9 @@ MEDIA_SELECTOR_FILE = Path(__file__).parent / "agent_instructions/media_selector
 # Memory Extractor file located alongside this module
 MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extractor.md"
 
+# History summarizer system instructions located alongside this module
+HISTORY_SUMMARIZER_SYSTEM = Path(__file__).parent / "agent_instructions/history_summarizer.md"
+
 # Image Extractor file located alongside this module
 IMAGE_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/image_extractor.md"
 
@@ -90,6 +93,7 @@ def generate_response(
         if intent_response != "<complex>":
             history.append_history(role="IntentClassifier", text=intent_response, history_file=history_file)
             if not job:
+                _run_history_summarization_async(history_file=history_file, temperature=default_temperature)
                 extraction_input = history.get_conversation_history(history_file=history_file)
                 _run_memory_extraction_async(extraction_input, history_file, default_temperature)
             return LLMResponse(text=intent_response, media_paths=[])
@@ -209,6 +213,8 @@ def generate_response(
 
     text_response = ""
     media_paths: list[str] = []
+
+    _run_history_summarization_async(history_file=history_file, temperature=default_temperature)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         text_future = executor.submit(
@@ -440,6 +446,34 @@ def _run_memory_extraction_async(extraction_input: str, history_file: str, tempe
                 history.append_history(role="MemoryExtractor", text=cleaned_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating memory extractor response: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _run_history_summarization_async(history_file: str, temperature: float) -> None:
+    def _worker() -> None:
+        try:
+            prior_history = history.get_history_before_latest_user(history_file=history_file)
+            if not prior_history:
+                return
+
+            summary = _run_model_api(
+                prior_history,
+                HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
+                tool_use_allowed=False,
+                force_tool=False,
+                temperature=temperature,
+            )
+            cleaned_summary = (summary or "").strip()
+            if not cleaned_summary:
+                return
+
+            history.rewrite_history_with_summary_before_latest_user(
+                summary_text=cleaned_summary,
+                history_file=history_file,
+            )
+        except Exception as e:
+            print(f"Error running history summarization: {e}")
 
     threading.Thread(target=_worker, daemon=True).start()
 
