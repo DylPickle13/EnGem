@@ -24,6 +24,10 @@ pip install -r requirements.txt
 
 # run the Discord bot
 python discord_bot.py
+
+# run GUI (prereq: install node.js / npm from https://nodejs.org/en/blog/release/v24.14.0)
+npm install # installs dependencies
+npm run dev
 ```
 
 Discord voice conversation (Gemini Live)

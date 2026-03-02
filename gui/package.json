@@ -1,0 +1,32 @@
+{
+  "name": "engem",
+  "version": "1.0.0",
+  "description": "EnGem is a developer-focused local assistant framework that connects a streaming LLM to host-side tooling and exposes a Discord bot interface. It's designed for experimentation with vector memory (Chroma), lightweight sub-agents, and automation scripts.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DylPickle13/EnGem.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/DylPickle13/EnGem/issues"
+  },
+  "homepage": "https://github.com/DylPickle13/EnGem#readme",
+  "dependencies": {
+    "@xyflow/react": "^12.10.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.4",
+    "vite": "^7.3.1"
+  }
+}
