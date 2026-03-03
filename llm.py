@@ -7,6 +7,7 @@ import threading
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Callable
 from config import GEMINI_API_KEY as GEMINI_API_KEY
 from config import model as model
 import history
@@ -49,6 +50,7 @@ SUPPORTED_MEDIA_EXTENSIONS = {
     ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v",
 }
 MAX_INPUT_ATTACHMENTS = 10
+SUB_AGENT_INSTRUCTION_PREVIEW_CHARS = 200
 
 
 @dataclass
@@ -62,16 +64,20 @@ def generate_response(
     job: bool,
     history_file: str,
     image: dict[str, bytes | str] | list[dict[str, bytes | str]] | None = None,
+    execution_plan_notifier: Callable[[str, list[dict]], None] | None = None,
 ) -> LLMResponse:
     """
     Main function to generate a response from the model based on the user's message,
     conversation history, and optionally image/video attachments.
     This function handles the entire flow of generating a response, including intent classification, sub-agent execution, and final response generation.
+    If execution_plan_notifier is provided, it is called asynchronously with an
+    ASCII diagram of the active execution plan whenever a new plan is detected.
     """
 
     exit_string = ""
     default_temperature = 1.0
     temperature = default_temperature
+    last_notified_execution_plan = ""
     attachment_text = _convert_attachments_to_text(image)
     if attachment_text:
         if user_message:
@@ -86,7 +92,7 @@ def generate_response(
 
         intent_response = ""
         try:
-            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, tool_use_allowed=True, force_tool=False, temperature=default_temperature)
+            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         except Exception as e:
             print(f"Error generating intent response: {e}")
 
@@ -126,6 +132,19 @@ def generate_response(
         if not execution_plan:
             print("No valid execution plan found in execution order file.")
             continue
+
+        try:
+            serialized_execution_plan = json.dumps(execution_plan, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            serialized_execution_plan = ""
+
+        if serialized_execution_plan and serialized_execution_plan != last_notified_execution_plan:
+            _dispatch_execution_plan_preview_async(
+                execution_plan,
+                history_file,
+                execution_plan_notifier,
+            )
+            last_notified_execution_plan = serialized_execution_plan
 
         cannot_proceed = False
         for stage in execution_plan:
@@ -254,6 +273,54 @@ def generate_response(
         extraction_input = "History: " + history.get_conversation_history(history_file=history_file) + "\n\nRelevant memories: \n\n" + relevant_memories_history
         _run_memory_extraction_async(extraction_input, history_file, default_temperature)
     return LLMResponse(text=text_response, media_paths=media_paths)
+
+
+def _dispatch_execution_plan_preview_async(
+    execution_plan: list[dict],
+    history_file: str,
+    execution_plan_notifier: Callable[[str, list[dict]], None] | None,
+) -> None:
+    if execution_plan_notifier is None or not execution_plan:
+        return
+
+    def _worker() -> None:
+        try:
+            diagram = _build_execution_plan_ascii_diagram(execution_plan, history_file)
+            if diagram:
+                execution_plan_notifier(diagram, execution_plan)
+        except Exception as e:
+            print(f"Error dispatching execution plan preview: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _build_execution_plan_ascii_diagram(execution_plan: list[dict], history_file: str) -> str:
+    lines: list[str] = []
+    lines.append(f"+-- Execution Plan ({history_file})")
+
+    for stage_index, stage in enumerate(execution_plan, start=1):
+        mode = str(stage.get("mode", "serial"))
+        sub_agents = stage.get("sub_agents", []) if isinstance(stage.get("sub_agents"), list) else []
+        lines.append(f"|-- Stage {stage_index} [{mode}]")
+
+        for agent_index, agent in enumerate(sub_agents, start=1):
+            if not isinstance(agent, dict):
+                continue
+
+            task_name = str(agent.get("task_name", "unnamed_task"))
+            instruction = str(agent.get("instruction", ""))
+            preview = _truncate_instruction_preview(instruction, SUB_AGENT_INSTRUCTION_PREVIEW_CHARS)
+            lines.append(f"|   |-- Agent {agent_index}: {task_name}")
+            lines.append(f"|   |   instruction: {preview}")
+
+    return "\n".join(lines)
+
+
+def _truncate_instruction_preview(instruction: str, limit: int) -> str:
+    compact = " ".join((instruction or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "..."
 
 
 def _select_media_paths(history_file: str, user_message: str, temperature: float) -> list[str]:

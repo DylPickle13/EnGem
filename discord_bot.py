@@ -11,7 +11,7 @@ import logging
 import queue
 import time
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from config import (
 	CRON_JOB_HOUR,
@@ -81,6 +81,11 @@ DISCORD_MAX_ATTACHMENTS_PER_MESSAGE = 10
 DISCORD_ATTACHMENT_BATCH_MAX_BYTES = 24 * 1024 * 1024
 DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
 HEARTBEAT_INTERVAL_SECONDS = 30 * 60
+EXECUTION_PLAN_PROGRESS_UPDATE_INTERVAL_SECONDS = 1
+EXECUTION_PLAN_WAITING_EMOJI = "⏳"
+EXECUTION_PLAN_IN_PROGRESS_EMOJI = "🔄"
+EXECUTION_PLAN_COMPLETED_EMOJI = "✅"
+EXECUTION_PLAN_MESSAGE_HEADER = "Sub-agent execution plan progress"
 MESSAGE_WORKER_CONCURRENCY = 3
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
 RELAY_PREFIX = ">"
@@ -703,6 +708,8 @@ class DiscordBotWrapper:
 		self._cron_stop_event: asyncio.Event | None = None
 		self._heartbeat_task: asyncio.Task[None] | None = None
 		self._heartbeat_stop_event: asyncio.Event | None = None
+		self._execution_plan_progress_tasks: dict[str, asyncio.Task[None]] = {}
+		self._execution_plan_progress_messages: dict[str, discord.Message] = {}
 		self._voice_conversation: _GeminiVoiceConversation | None = None
 		self._voice_input_sink: object | None = None
 
@@ -729,7 +736,278 @@ class DiscordBotWrapper:
 	async def _default_responder(self, text: str, message: discord.Message) -> llm.LLMResponse:
 		history_file = _get_history_file_key_for_channel(message.channel)
 		media_payloads = await self._read_media_attachments(message)
-		return await asyncio.to_thread(llm.generate_response, text, False, history_file, media_payloads)
+		execution_plan_notifier = self._build_execution_plan_notifier(message.channel, history_file)
+		return await asyncio.to_thread(
+			llm.generate_response,
+			text,
+			False,
+			history_file,
+			media_payloads,
+			execution_plan_notifier,
+		)
+
+	def _build_execution_plan_notifier(
+		self,
+		channel: discord.abc.Messageable,
+		history_file: str,
+	) -> Callable[[str, list[dict[str, Any]]], None]:
+		loop = self.client.loop
+
+		def _notifier(diagram_text: str, execution_plan: list[dict[str, Any]]) -> None:
+			if not diagram_text:
+				return
+			if loop.is_closed():
+				return
+			if not execution_plan:
+				return
+
+			try:
+				future = asyncio.run_coroutine_threadsafe(
+					self._start_execution_plan_progress_tracker(
+						channel=channel,
+						history_file=history_file,
+						execution_plan=execution_plan,
+					),
+					loop,
+				)
+
+				def _log_send_result(done_future: object) -> None:
+					try:
+						exception = done_future.exception()  # type: ignore[attr-defined]
+						if exception is not None:
+							logging.exception(
+								"Failed sending execution plan preview for history '%s': %s",
+								history_file,
+								exception,
+							)
+					except Exception:
+						pass
+
+				future.add_done_callback(_log_send_result)
+			except Exception as exc:
+				logging.exception(
+					"Failed scheduling execution plan preview for history '%s': %s",
+					history_file,
+					exc,
+				)
+
+		return _notifier
+
+	async def _start_execution_plan_progress_tracker(
+		self,
+		channel: discord.abc.Messageable,
+		history_file: str,
+		execution_plan: list[dict[str, Any]],
+	) -> None:
+		tracker_key = f"{id(channel)}::{history_file}"
+		existing_task = self._execution_plan_progress_tasks.get(tracker_key)
+		if existing_task is not None and not existing_task.done():
+			existing_task.cancel()
+			await asyncio.gather(existing_task, return_exceptions=True)
+
+		task = asyncio.create_task(
+			self._run_execution_plan_progress_tracker(
+				channel=channel,
+				history_file=history_file,
+				execution_plan=execution_plan,
+			)
+		)
+		self._execution_plan_progress_tasks[tracker_key] = task
+
+		def _cleanup_tracker(done_task: asyncio.Task[None]) -> None:
+			current_task = self._execution_plan_progress_tasks.get(tracker_key)
+			if current_task is done_task:
+				self._execution_plan_progress_tasks.pop(tracker_key, None)
+
+		task.add_done_callback(_cleanup_tracker)
+
+	async def _run_execution_plan_progress_tracker(
+		self,
+		channel: discord.abc.Messageable,
+		history_file: str,
+		execution_plan: list[dict[str, Any]],
+	) -> None:
+		progress_message: discord.Message | None = None
+		tracker_key = f"{id(channel)}::{history_file}"
+
+		while True:
+			message_content, all_completed = await self._build_execution_plan_progress_message(
+				history_file=history_file,
+				execution_plan=execution_plan,
+			)
+
+			try:
+				if progress_message is None:
+					progress_message = await channel.send(message_content)
+					self._execution_plan_progress_messages[tracker_key] = progress_message
+				else:
+					await progress_message.edit(content=message_content)
+			except Exception as exc:
+				logging.exception(
+					"Failed to send/edit execution progress message for history '%s': %s",
+					history_file,
+					exc,
+				)
+				return
+
+			if all_completed:
+				return
+
+			await asyncio.sleep(EXECUTION_PLAN_PROGRESS_UPDATE_INTERVAL_SECONDS)
+
+	async def _clear_execution_plan_progress_message(
+		self,
+		channel: discord.abc.Messageable,
+		history_file: str,
+	) -> None:
+		tracker_key = f"{id(channel)}::{history_file}"
+
+		task = self._execution_plan_progress_tasks.get(tracker_key)
+		if task is not None and not task.done():
+			task.cancel()
+			await asyncio.gather(task, return_exceptions=True)
+
+		self._execution_plan_progress_tasks.pop(tracker_key, None)
+
+		progress_message = self._execution_plan_progress_messages.pop(tracker_key, None)
+		if progress_message is not None:
+			try:
+				await progress_message.delete()
+			except Exception:
+				pass
+
+	async def _build_execution_plan_progress_message(
+		self,
+		history_file: str,
+		execution_plan: list[dict[str, Any]],
+	) -> tuple[str, bool]:
+		history_entries = await asyncio.to_thread(history.parse_history_file, history_file)
+
+		latest_manager_index = -1
+		for index in range(len(history_entries) - 1, -1, -1):
+			role = str(history_entries[index].get("speaker") or "").strip()
+			if role.casefold() == "manager":
+				latest_manager_index = index
+				break
+
+		if latest_manager_index >= 0:
+			relevant_entries = history_entries[latest_manager_index + 1 :]
+		else:
+			relevant_entries = history_entries
+
+		role_counts: dict[str, int] = {}
+		for entry in relevant_entries:
+			role = str(entry.get("speaker") or "").strip()
+			if not role:
+				continue
+			role_counts[role] = role_counts.get(role, 0) + 1
+
+		flattened_agents: list[dict[str, Any]] = []
+		for stage_index, stage in enumerate(execution_plan):
+			mode = str(stage.get("mode", "serial"))
+			sub_agents = stage.get("sub_agents", []) if isinstance(stage.get("sub_agents"), list) else []
+			for agent_index, agent in enumerate(sub_agents):
+				if not isinstance(agent, dict):
+					continue
+				flattened_agents.append(
+					{
+						"stage_index": stage_index,
+						"agent_index": agent_index,
+						"mode": mode,
+						"task_name": str(agent.get("task_name", "unnamed_task")),
+						"instruction": str(agent.get("instruction", "")),
+					}
+				)
+
+		consumed_counts: dict[str, int] = {}
+		completed_keys: set[tuple[int, int]] = set()
+		for item in flattened_agents:
+			task_name = item["task_name"]
+			seen = consumed_counts.get(task_name, 0)
+			if seen < role_counts.get(task_name, 0):
+				completed_keys.add((item["stage_index"], item["agent_index"]))
+				consumed_counts[task_name] = seen + 1
+
+		stage_completion: list[bool] = []
+		for stage_index, stage in enumerate(execution_plan):
+			sub_agents = stage.get("sub_agents", []) if isinstance(stage.get("sub_agents"), list) else []
+			stage_keys = {
+				(stage_index, agent_index)
+				for agent_index, agent in enumerate(sub_agents)
+				if isinstance(agent, dict)
+			}
+			if not stage_keys:
+				stage_completion.append(True)
+				continue
+			stage_completion.append(stage_keys.issubset(completed_keys))
+
+		active_stage_index: int | None = None
+		for idx, done in enumerate(stage_completion):
+			if not done:
+				active_stage_index = idx
+				break
+
+		in_progress_keys: set[tuple[int, int]] = set()
+		if active_stage_index is not None:
+			active_stage = execution_plan[active_stage_index]
+			active_mode = str(active_stage.get("mode", "serial"))
+			active_sub_agents = active_stage.get("sub_agents", []) if isinstance(active_stage.get("sub_agents"), list) else []
+			incomplete_keys = [
+				(active_stage_index, agent_index)
+				for agent_index, agent in enumerate(active_sub_agents)
+				if isinstance(agent, dict) and (active_stage_index, agent_index) not in completed_keys
+			]
+			if active_mode == "parallel":
+				in_progress_keys.update(incomplete_keys)
+			elif incomplete_keys:
+				in_progress_keys.add(incomplete_keys[0])
+
+		lines: list[str] = []
+		title_line = f"{EXECUTION_PLAN_MESSAGE_HEADER} ({history_file})"
+		lines.append(title_line)
+		lines.append("=" * len(title_line))
+		lines.append("")
+
+		for stage_index, stage in enumerate(execution_plan, start=1):
+			mode = str(stage.get("mode", "serial"))
+			sub_agents = stage.get("sub_agents", []) if isinstance(stage.get("sub_agents"), list) else []
+			lines.append(f"Stage {stage_index} [{mode}]")
+
+			for agent_index, agent in enumerate(sub_agents, start=1):
+				if not isinstance(agent, dict):
+					continue
+
+				key = (stage_index - 1, agent_index - 1)
+				if key in completed_keys:
+					emoji = EXECUTION_PLAN_COMPLETED_EMOJI
+				elif key in in_progress_keys:
+					emoji = EXECUTION_PLAN_IN_PROGRESS_EMOJI
+				else:
+					emoji = EXECUTION_PLAN_WAITING_EMOJI
+
+				task_name = str(agent.get("task_name", "unnamed_task"))
+				instruction = " ".join(str(agent.get("instruction", "")).split())
+				if len(instruction) > 200:
+					instruction = instruction[:200] + "..."
+
+				lines.append(f"  {emoji} Agent {agent_index}: {task_name}")
+				if key in in_progress_keys:
+					lines.append(f"      instruction: {instruction}")
+
+			lines.append("")
+
+		text_body = "\n".join(lines).strip()
+		wrapped_content = f"```\n{text_body}\n```"
+		if len(wrapped_content) > DISCORD_MESSAGE_LIMIT:
+			max_body_length = DISCORD_MESSAGE_LIMIT - len("```\n\n```") - 3
+			truncated_body = text_body[:max_body_length] + "..."
+			wrapped_content = f"```\n{truncated_body}\n```"
+
+		all_completed = bool(stage_completion) and all(stage_completion)
+		if not execution_plan:
+			all_completed = True
+
+		return wrapped_content, all_completed
 
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
 		if not text:
@@ -920,13 +1198,16 @@ class DiscordBotWrapper:
 
 		payload = self._normalize_response_payload(response)
 		await self._send_long_message(channel, payload.text)
+		history_file = _get_history_file_key_for_channel(message.channel)
+		await self._clear_execution_plan_progress_message(channel, history_file)
 		await self._send_media_attachments(channel, payload.media_paths)
 
 	async def _shutdown_background_tasks(self) -> None:
 		worker_tasks = [task for task in self._worker_tasks if not task.done()]
+		execution_plan_tasks = [task for task in self._execution_plan_progress_tasks.values() if not task.done()]
 		tasks = [
 			task
-			for task in (self._cron_task, self._heartbeat_task, *worker_tasks)
+			for task in (self._cron_task, self._heartbeat_task, *worker_tasks, *execution_plan_tasks)
 			if task is not None and not task.done()
 		]
 		for task in tasks:
@@ -941,6 +1222,8 @@ class DiscordBotWrapper:
 		self._cron_task = None
 		self._heartbeat_task = None
 		self._worker_tasks.clear()
+		self._execution_plan_progress_tasks.clear()
+		self._execution_plan_progress_messages.clear()
 		self._voice_input_sink = None
 
 	async def _read_text_attachment(self, attachment: discord.Attachment) -> str:
@@ -1120,9 +1403,18 @@ class DiscordBotWrapper:
 					channel_lock = self._get_channel_processing_lock(channel)
 					async with channel_lock:
 						async with channel.typing():
-							response = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name, None)
+							execution_plan_notifier = self._build_execution_plan_notifier(channel, channel_name)
+							response = await asyncio.to_thread(
+								llm.generate_response,
+								task_prompt,
+								True,
+								channel_name,
+								None,
+								execution_plan_notifier,
+							)
 					payload = self._normalize_response_payload(response)
 					await self._send_long_message(channel, payload.text)
+					await self._clear_execution_plan_progress_message(channel, channel_name)
 					await self._send_media_attachments(channel, payload.media_paths)
 				except Exception as exc:
 					logging.exception("Error running cron job task '%s': %s", task_name, exc)
@@ -1168,9 +1460,18 @@ class DiscordBotWrapper:
 					channel_lock = self._get_channel_processing_lock(channel)
 					async with channel_lock:
 						async with channel.typing():
-							response = await asyncio.to_thread(llm.generate_response, task_prompt, True, channel_name, None)
+							execution_plan_notifier = self._build_execution_plan_notifier(channel, channel_name)
+							response = await asyncio.to_thread(
+								llm.generate_response,
+								task_prompt,
+								True,
+								channel_name,
+								None,
+								execution_plan_notifier,
+							)
 					payload = self._normalize_response_payload(response)
 					await self._send_long_message(channel, payload.text)
+					await self._clear_execution_plan_progress_message(channel, channel_name)
 					await self._send_media_attachments(channel, payload.media_paths)
 				except Exception as exc:
 					logging.exception("Error running heartbeat task '%s': %s", task_name, exc)
