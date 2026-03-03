@@ -750,10 +750,15 @@ class DiscordBotWrapper:
 		self,
 		channel: discord.abc.Messageable,
 		history_file: str,
-	) -> Callable[[str, list[dict[str, Any]]], None]:
+	) -> Callable[[str, list[dict[str, Any]], int, bool], None]:
 		loop = self.client.loop
 
-		def _notifier(diagram_text: str, execution_plan: list[dict[str, Any]]) -> None:
+		def _notifier(
+			diagram_text: str,
+			execution_plan: list[dict[str, Any]],
+			attempt_number: int = 1,
+			reset_previous_preview: bool = False,
+		) -> None:
 			if not diagram_text:
 				return
 			if loop.is_closed():
@@ -767,6 +772,8 @@ class DiscordBotWrapper:
 						channel=channel,
 						history_file=history_file,
 						execution_plan=execution_plan,
+						attempt_number=attempt_number,
+						reset_previous_preview=reset_previous_preview,
 					),
 					loop,
 				)
@@ -798,6 +805,8 @@ class DiscordBotWrapper:
 		channel: discord.abc.Messageable,
 		history_file: str,
 		execution_plan: list[dict[str, Any]],
+		attempt_number: int,
+		reset_previous_preview: bool,
 	) -> None:
 		tracker_key = f"{id(channel)}::{history_file}"
 		existing_task = self._execution_plan_progress_tasks.get(tracker_key)
@@ -805,11 +814,20 @@ class DiscordBotWrapper:
 			existing_task.cancel()
 			await asyncio.gather(existing_task, return_exceptions=True)
 
+		if reset_previous_preview:
+			previous_message = self._execution_plan_progress_messages.pop(tracker_key, None)
+			if previous_message is not None:
+				try:
+					await previous_message.delete()
+				except Exception:
+					pass
+
 		task = asyncio.create_task(
 			self._run_execution_plan_progress_tracker(
 				channel=channel,
 				history_file=history_file,
 				execution_plan=execution_plan,
+				attempt_number=attempt_number,
 			)
 		)
 		self._execution_plan_progress_tasks[tracker_key] = task
@@ -826,6 +844,7 @@ class DiscordBotWrapper:
 		channel: discord.abc.Messageable,
 		history_file: str,
 		execution_plan: list[dict[str, Any]],
+		attempt_number: int,
 	) -> None:
 		progress_message: discord.Message | None = None
 		tracker_key = f"{id(channel)}::{history_file}"
@@ -834,6 +853,7 @@ class DiscordBotWrapper:
 			message_content, all_completed = await self._build_execution_plan_progress_message(
 				history_file=history_file,
 				execution_plan=execution_plan,
+				attempt_number=attempt_number,
 			)
 
 			try:
@@ -880,6 +900,7 @@ class DiscordBotWrapper:
 		self,
 		history_file: str,
 		execution_plan: list[dict[str, Any]],
+		attempt_number: int,
 	) -> tuple[str, bool]:
 		history_entries = await asyncio.to_thread(history.parse_history_file, history_file)
 
@@ -919,6 +940,16 @@ class DiscordBotWrapper:
 					}
 				)
 
+		reviewer_stage_index = len(execution_plan)
+		reviewer_agent = {
+			"stage_index": reviewer_stage_index,
+			"agent_index": 0,
+			"mode": "serial",
+			"task_name": "Reviewer",
+			"instruction": "Validates whether execution can exit with <yes>.",
+		}
+		flattened_agents.append(reviewer_agent)
+
 		consumed_counts: dict[str, int] = {}
 		completed_keys: set[tuple[int, int]] = set()
 		for item in flattened_agents:
@@ -941,6 +972,10 @@ class DiscordBotWrapper:
 				continue
 			stage_completion.append(stage_keys.issubset(completed_keys))
 
+		reviewer_key = (reviewer_stage_index, 0)
+		reviewer_completed = reviewer_key in completed_keys
+		stage_completion.append(reviewer_completed)
+
 		active_stage_index: int | None = None
 		for idx, done in enumerate(stage_completion):
 			if not done:
@@ -949,23 +984,27 @@ class DiscordBotWrapper:
 
 		in_progress_keys: set[tuple[int, int]] = set()
 		if active_stage_index is not None:
-			active_stage = execution_plan[active_stage_index]
-			active_mode = str(active_stage.get("mode", "serial"))
-			active_sub_agents = active_stage.get("sub_agents", []) if isinstance(active_stage.get("sub_agents"), list) else []
-			incomplete_keys = [
-				(active_stage_index, agent_index)
-				for agent_index, agent in enumerate(active_sub_agents)
-				if isinstance(agent, dict) and (active_stage_index, agent_index) not in completed_keys
-			]
-			if active_mode == "parallel":
-				in_progress_keys.update(incomplete_keys)
-			elif incomplete_keys:
-				in_progress_keys.add(incomplete_keys[0])
+			if active_stage_index < len(execution_plan):
+				active_stage = execution_plan[active_stage_index]
+				active_mode = str(active_stage.get("mode", "serial"))
+				active_sub_agents = active_stage.get("sub_agents", []) if isinstance(active_stage.get("sub_agents"), list) else []
+				incomplete_keys = [
+					(active_stage_index, agent_index)
+					for agent_index, agent in enumerate(active_sub_agents)
+					if isinstance(agent, dict) and (active_stage_index, agent_index) not in completed_keys
+				]
+				if active_mode == "parallel":
+					in_progress_keys.update(incomplete_keys)
+				elif incomplete_keys:
+					in_progress_keys.add(incomplete_keys[0])
+			else:
+				in_progress_keys.add(reviewer_key)
 
 		lines: list[str] = []
 		title_line = f"{EXECUTION_PLAN_MESSAGE_HEADER} ({history_file})"
+		attempt_label = max(1, int(attempt_number))
 		lines.append(title_line)
-		lines.append("=" * len(title_line))
+		lines.append(f"Attempt: {attempt_label}")
 		lines.append("")
 
 		for stage_index, stage in enumerate(execution_plan, start=1):
@@ -990,11 +1029,24 @@ class DiscordBotWrapper:
 				if len(instruction) > 200:
 					instruction = instruction[:200] + "..."
 
-				lines.append(f"  {emoji} Agent {agent_index}: {task_name}")
+				lines.append(f"  {emoji} {task_name}")
 				if key in in_progress_keys:
 					lines.append(f"      instruction: {instruction}")
 
 			lines.append("")
+
+		if reviewer_completed:
+			reviewer_emoji = EXECUTION_PLAN_COMPLETED_EMOJI
+		elif reviewer_key in in_progress_keys:
+			reviewer_emoji = EXECUTION_PLAN_IN_PROGRESS_EMOJI
+		else:
+			reviewer_emoji = EXECUTION_PLAN_WAITING_EMOJI
+
+		lines.append("Final Stage [serial]")
+		lines.append(f"  {reviewer_emoji} Reviewer")
+		if reviewer_key in in_progress_keys:
+			lines.append("      instruction: Validates whether execution can exit with <yes>.")
+		lines.append("")
 
 		text_body = "\n".join(lines).strip()
 		wrapped_content = f"```\n{text_body}\n```"

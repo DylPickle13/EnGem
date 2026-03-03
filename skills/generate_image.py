@@ -21,7 +21,8 @@ def generate_image(prompt: str) -> str:
     """
     Generate an image from `prompt`, save it under the repository root
     in a `generated_images/` folder, and return the filesystem path to
-    the saved image. Returns an empty string on failure.
+    the saved image. Returns an empty string on failure. 
+    Can only create one image at a time. 
     """
     os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
 

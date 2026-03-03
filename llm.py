@@ -64,7 +64,7 @@ def generate_response(
     job: bool,
     history_file: str,
     image: dict[str, bytes | str] | list[dict[str, bytes | str]] | None = None,
-    execution_plan_notifier: Callable[[str, list[dict]], None] | None = None,
+    execution_plan_notifier: Callable[[str, list[dict], int, bool], None] | None = None,
 ) -> LLMResponse:
     """
     Main function to generate a response from the model based on the user's message,
@@ -78,6 +78,7 @@ def generate_response(
     default_temperature = 1.0
     temperature = default_temperature
     last_notified_execution_plan = ""
+    attempt_number = 1
     attachment_text = _convert_attachments_to_text(image)
     if attachment_text:
         if user_message:
@@ -143,6 +144,8 @@ def generate_response(
                 execution_plan,
                 history_file,
                 execution_plan_notifier,
+                attempt_number,
+                attempt_number > 1,
             )
             last_notified_execution_plan = serialized_execution_plan
 
@@ -153,7 +156,6 @@ def generate_response(
 
             if mode == "parallel" and len(agents) > 1:
                 base_history = history.get_conversation_history(history_file=history_file)
-                stage_results = ["" for _ in agents]
 
                 def _run_parallel_agent(agent: dict, stage_history: str) -> str:
                     return _run_model_api(
@@ -173,18 +175,15 @@ def generate_response(
                     for future in as_completed(future_to_index):
                         idx = future_to_index[future]
                         agent = agents[idx]
+                        sub_agent_response = ""
                         try:
-                            stage_results[idx] = future.result()
+                            sub_agent_response = future.result()
                         except Exception as e:
                             print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
-                            stage_results[idx] = ""
 
-                for idx, agent in enumerate(agents):
-                    sub_agent_response = stage_results[idx]
-                    history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
-                    if sub_agent_response.strip() == "<CANNOT_PROCEED>":
-                        cannot_proceed = True
-                        break
+                        history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
+                        if sub_agent_response.strip() == "<CANNOT_PROCEED>":
+                            cannot_proceed = True
 
                 if cannot_proceed:
                     break
@@ -229,6 +228,7 @@ def generate_response(
         else:
             if temperature < 2.0:
                 temperature += 0.1
+            attempt_number += 1
 
     text_response = ""
     media_paths: list[str] = []
@@ -278,7 +278,9 @@ def generate_response(
 def _dispatch_execution_plan_preview_async(
     execution_plan: list[dict],
     history_file: str,
-    execution_plan_notifier: Callable[[str, list[dict]], None] | None,
+    execution_plan_notifier: Callable[[str, list[dict], int, bool], None] | None,
+    attempt_number: int,
+    reset_previous_preview: bool,
 ) -> None:
     if execution_plan_notifier is None or not execution_plan:
         return
@@ -287,7 +289,10 @@ def _dispatch_execution_plan_preview_async(
         try:
             diagram = _build_execution_plan_ascii_diagram(execution_plan, history_file)
             if diagram:
-                execution_plan_notifier(diagram, execution_plan)
+                try:
+                    execution_plan_notifier(diagram, execution_plan, attempt_number, reset_previous_preview)
+                except TypeError:
+                    execution_plan_notifier(diagram, execution_plan)  # type: ignore[misc, call-arg]
         except Exception as e:
             print(f"Error dispatching execution plan preview: {e}")
 
