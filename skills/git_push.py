@@ -3,6 +3,13 @@ from __future__ import annotations
 import importlib
 import sys
 from pathlib import Path
+
+# Ensure repository root is on sys.path so top-level modules (like config)
+# can be imported when this module is run directly.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+  sys.path.insert(0, str(_REPO_ROOT))
+
 from config import SSH_KEY_PATH, REPO_PATH
 
 BRANCH = "master"
@@ -32,7 +39,16 @@ def git_push(message: str) -> str:
 	Repo = git_module.Repo
 	GitCommandError = git_exc_module.GitCommandError
 
-	repo = Repo(REPO_PATH)
+	repo_path = Path(REPO_PATH).expanduser().resolve()
+	if not repo_path.exists():
+		raise RuntimeError(f"REPO_PATH does not exist: {repo_path}")
+
+	try:
+		repo = Repo(repo_path)
+	except getattr(git_exc_module, "InvalidGitRepositoryError", Exception) as e:
+		raise RuntimeError(
+			f"Invalid git repository at {repo_path}. Ensure REPO_PATH points to a git repository."
+		) from e
 
 	if repo.bare:
 		raise ValueError("Repository is bare and cannot be committed/pushed.")
@@ -65,3 +81,7 @@ def git_push(message: str) -> str:
 		raise RuntimeError(f"Push failed: {error}") from error
 
 	return f"Committed and pushed to {REMOTE_NAME}/{BRANCH}."
+
+
+if __name__ == "__main__":
+	print(git_push("Resetting"))
