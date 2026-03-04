@@ -9,7 +9,7 @@ _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
 
 
-def collect_generated_media(max_items: str = "80") -> str:
+def get_generated_media(max_items: str = "80") -> str:
     """Return a JSON list of recent generated media files.
 
     The output is a JSON object with a single key "media" that contains

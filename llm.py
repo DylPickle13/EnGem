@@ -330,12 +330,12 @@ def _truncate_instruction_preview(instruction: str, limit: int) -> str:
 
 def _select_media_paths(history_file: str, user_message: str, temperature: float) -> list[str]:
     try:
-        from skills.select_generated_media import collect_generated_media
+        from skills.collect_generated_media import get_generated_media
     except Exception as e:
         print(f"Error importing media selection skill: {e}")
         return []
 
-    catalog_json = collect_generated_media("120")
+    catalog_json = get_generated_media("120")
     selector_input = (
         "Latest user request:\n"
         f"{user_message}\n\n"
