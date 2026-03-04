@@ -847,6 +847,7 @@ class DiscordBotWrapper:
 		attempt_number: int,
 	) -> None:
 		progress_message: discord.Message | None = None
+		last_sent_content: str | None = None
 		tracker_key = f"{id(channel)}::{history_file}"
 
 		while True:
@@ -859,9 +860,11 @@ class DiscordBotWrapper:
 			try:
 				if progress_message is None:
 					progress_message = await channel.send(message_content)
+					last_sent_content = message_content
 					self._execution_plan_progress_messages[tracker_key] = progress_message
-				else:
+				elif message_content != last_sent_content:
 					await progress_message.edit(content=message_content)
+					last_sent_content = message_content
 			except Exception as exc:
 				logging.exception(
 					"Failed to send/edit execution progress message for history '%s': %s",

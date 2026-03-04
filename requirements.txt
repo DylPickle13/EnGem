@@ -13,3 +13,5 @@ nbformat
 ipykernel
 matplotlib
 numpy
+
+papermill
