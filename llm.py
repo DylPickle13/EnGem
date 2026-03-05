@@ -77,7 +77,6 @@ def generate_response(
     exit_string = ""
     default_temperature = 1.0
     temperature = default_temperature
-    last_notified_execution_plan = ""
     attempt_number = 1
     attachment_text = _convert_attachments_to_text(image)
     if attachment_text:
@@ -109,6 +108,14 @@ def generate_response(
         # Execution order file path
         EXECUTION_ORDER_FILE = Path(__file__).parent / f"sub-agents/execution_order_{history_file}.json"
 
+        # Always clear stale execution-order output so each manager run writes a fresh plan.
+        if EXECUTION_ORDER_FILE.exists():
+            try:
+                EXECUTION_ORDER_FILE.unlink()
+            except Exception as e:
+                print(f"Error clearing execution order file before manager run: {e}")
+                continue
+
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
@@ -134,20 +141,13 @@ def generate_response(
             print("No valid execution plan found in execution order file.")
             continue
 
-        try:
-            serialized_execution_plan = json.dumps(execution_plan, ensure_ascii=False, sort_keys=True)
-        except Exception:
-            serialized_execution_plan = ""
-
-        if serialized_execution_plan and serialized_execution_plan != last_notified_execution_plan:
-            _dispatch_execution_plan_preview_async(
-                execution_plan,
-                history_file,
-                execution_plan_notifier,
-                attempt_number,
-                attempt_number > 1,
-            )
-            last_notified_execution_plan = serialized_execution_plan
+        _dispatch_execution_plan_preview_async(
+            execution_plan,
+            history_file,
+            execution_plan_notifier,
+            attempt_number,
+            attempt_number > 1,
+        )
 
         cannot_proceed = False
         for stage in execution_plan:
@@ -218,14 +218,13 @@ def generate_response(
         except Exception as e:
             print(f"Error generating reviewer response: {e}")
         if exit_string == "<yes>":
-            # clear the 'sub-agents/execution_order_{history_file}.json' file at the start of each loop iteration
-            if EXECUTION_ORDER_FILE.exists():
-                try:
-                    EXECUTION_ORDER_FILE.unlink()
-                except Exception as e:
-                    print(f"Error clearing execution order file: {e}")
             break
         else:
+            _run_history_summarization_async(
+                history_file=history_file,
+                temperature=default_temperature,
+                pivot_role="manager",
+            )
             if temperature < 2.0:
                 temperature += 0.1
             attempt_number += 1
@@ -522,10 +521,10 @@ def _run_memory_extraction_async(extraction_input: str, history_file: str, tempe
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def _run_history_summarization_async(history_file: str, temperature: float) -> None:
+def _run_history_summarization_async(history_file: str, temperature: float, pivot_role: str = "user") -> None:
     def _worker() -> None:
         try:
-            prior_history = history.get_history_before_latest_user(history_file=history_file)
+            prior_history = history.get_history_before_latest_role(history_file=history_file, role=pivot_role)
             if not prior_history:
                 return
 
@@ -540,9 +539,10 @@ def _run_history_summarization_async(history_file: str, temperature: float) -> N
             if not cleaned_summary:
                 return
 
-            history.rewrite_history_with_summary_before_latest_user(
+            history.rewrite_history_with_summary_before_latest_role(
                 summary_text=cleaned_summary,
                 history_file=history_file,
+                pivot_role=pivot_role,
             )
         except Exception as e:
             print(f"Error running history summarization: {e}")

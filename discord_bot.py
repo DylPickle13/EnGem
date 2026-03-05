@@ -814,14 +814,6 @@ class DiscordBotWrapper:
 			existing_task.cancel()
 			await asyncio.gather(existing_task, return_exceptions=True)
 
-		if reset_previous_preview:
-			previous_message = self._execution_plan_progress_messages.pop(tracker_key, None)
-			if previous_message is not None:
-				try:
-					await previous_message.delete()
-				except Exception:
-					pass
-
 		task = asyncio.create_task(
 			self._run_execution_plan_progress_tracker(
 				channel=channel,
@@ -846,9 +838,9 @@ class DiscordBotWrapper:
 		execution_plan: list[dict[str, Any]],
 		attempt_number: int,
 	) -> None:
-		progress_message: discord.Message | None = None
-		last_sent_content: str | None = None
 		tracker_key = f"{id(channel)}::{history_file}"
+		progress_message: discord.Message | None = self._execution_plan_progress_messages.get(tracker_key)
+		last_sent_content: str | None = None
 
 		while True:
 			message_content, all_completed = await self._build_execution_plan_progress_message(
@@ -863,7 +855,11 @@ class DiscordBotWrapper:
 					last_sent_content = message_content
 					self._execution_plan_progress_messages[tracker_key] = progress_message
 				elif message_content != last_sent_content:
-					await progress_message.edit(content=message_content)
+					try:
+						await progress_message.edit(content=message_content)
+					except discord.NotFound:
+						progress_message = await channel.send(message_content)
+						self._execution_plan_progress_messages[tracker_key] = progress_message
 					last_sent_content = message_content
 			except Exception as exc:
 				logging.exception(

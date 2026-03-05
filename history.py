@@ -64,30 +64,48 @@ def _format_message_block(message: Dict[str, Optional[str]]) -> str:
     return f"## {timestamp} - {speaker}\n\n{text}\n\n---\n\n"
 
 
-def get_history_before_latest_user(history_file: str = "default") -> str:
-    """Return history text that occurred before the latest user message."""
+def _find_latest_speaker_index(messages: List[Dict[str, Optional[str]]], speaker: str) -> int:
+    target_speaker = (speaker or "").strip().lower()
+    if not target_speaker:
+        return -1
+
+    for idx in range(len(messages) - 1, -1, -1):
+        current_speaker = (messages[idx].get("speaker") or "").strip().lower()
+        if current_speaker == target_speaker:
+            return idx
+    return -1
+
+
+def get_history_before_latest_role(history_file: str = "default", role: str = "user") -> str:
+    """Return history text that occurred before the latest message for `role`."""
     messages = parse_history_file(history_file)
     if not messages:
         return ""
 
-    latest_user_index = -1
-    for idx in range(len(messages) - 1, -1, -1):
-        if (messages[idx].get("speaker") or "").strip().lower() == "user":
-            latest_user_index = idx
-            break
-
-    if latest_user_index <= 0:
+    latest_role_index = _find_latest_speaker_index(messages, role)
+    if latest_role_index <= 0:
         return ""
 
-    return "".join(_format_message_block(msg) for msg in messages[:latest_user_index]).strip()
+    return "".join(_format_message_block(msg) for msg in messages[:latest_role_index]).strip()
 
 
-def rewrite_history_with_summary_before_latest_user(
+def get_history_before_latest_user(history_file: str = "default") -> str:
+    """Return history text that occurred before the latest user message."""
+    return get_history_before_latest_role(history_file=history_file, role="user")
+
+
+def get_history_before_latest_manager(history_file: str = "default") -> str:
+    """Return history text that occurred before the latest manager response."""
+    return get_history_before_latest_role(history_file=history_file, role="manager")
+
+
+def rewrite_history_with_summary_before_latest_role(
     summary_text: str,
     history_file: str = "default",
+    pivot_role: str = "user",
     summary_role: str = "ConversationSummary",
 ) -> None:
-    """Rewrite history so first message is summary, then latest user request and following messages."""
+    """Rewrite history so summary is first, then latest `pivot_role` message and following messages."""
     cleaned_summary = (summary_text or "").strip()
     if not cleaned_summary:
         return
@@ -103,13 +121,8 @@ def rewrite_history_with_summary_before_latest_user(
         if not messages:
             return
 
-        latest_user_index = -1
-        for idx in range(len(messages) - 1, -1, -1):
-            if (messages[idx].get("speaker") or "").strip().lower() == "user":
-                latest_user_index = idx
-                break
-
-        if latest_user_index <= 0:
+        latest_pivot_index = _find_latest_speaker_index(messages, pivot_role)
+        if latest_pivot_index <= 0:
             return
 
         summary_message: Dict[str, Optional[str]] = {
@@ -117,9 +130,37 @@ def rewrite_history_with_summary_before_latest_user(
             "text": cleaned_summary,
             "timestamp": datetime.now(TORONTO_TZ).isoformat(),
         }
-        rewritten = [summary_message] + messages[latest_user_index:]
+        rewritten = [summary_message] + messages[latest_pivot_index:]
         payload = "".join(_format_message_block(msg) for msg in rewritten)
         target_file.write_text(payload, encoding="utf-8")
+
+
+def rewrite_history_with_summary_before_latest_user(
+    summary_text: str,
+    history_file: str = "default",
+    summary_role: str = "ConversationSummary",
+) -> None:
+    """Rewrite history so first message is summary, then latest user request and following messages."""
+    rewrite_history_with_summary_before_latest_role(
+        summary_text=summary_text,
+        history_file=history_file,
+        pivot_role="user",
+        summary_role=summary_role,
+    )
+
+
+def rewrite_history_with_summary_before_latest_manager(
+    summary_text: str,
+    history_file: str = "default",
+    summary_role: str = "ConversationSummary",
+) -> None:
+    """Rewrite history so first message is summary, then latest manager response and following messages."""
+    rewrite_history_with_summary_before_latest_role(
+        summary_text=summary_text,
+        history_file=history_file,
+        pivot_role="manager",
+        summary_role=summary_role,
+    )
 
 
 def parse_history(history_text: str) -> List[Dict[str, Optional[str]]]:
