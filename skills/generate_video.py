@@ -10,7 +10,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(_REPO_ROOT))
 
-from config import GEMINI_API_KEY as GEMINI_API_KEY
+from config import get_paid_gemini_api_key as get_paid_gemini_api_key
 from google import genai
 from google.genai import types
 
@@ -21,9 +21,7 @@ def generate_video(prompt: str) -> str:
   in a `generated_videos/` folder, and return the filesystem path to the
   saved video file. Returns an empty string on failure.
   """
-  os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
-
-  client = genai.Client()
+  client = genai.Client(api_key=get_paid_gemini_api_key())
 
   try:
     operation = client.models.generate_videos(

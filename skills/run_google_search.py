@@ -9,7 +9,7 @@ if str(_REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(_REPO_ROOT))
 
 import types
-from config import GEMINI_API_KEY as GEMINI_API_KEY
+from config import get_paid_gemini_api_key as get_paid_gemini_api_key
 from config import model as model
 from google import genai
 from google.genai import types
@@ -20,9 +20,7 @@ def run_google_search(query: str) -> str:
     Run a Google Search using the Gemini API's Google Search tool.
     Only returns summarized search results, not urls or article titles.
     """
-    os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
-
-    client = genai.Client()
+    client = genai.Client(api_key=get_paid_gemini_api_key())
     grounding_tool = types.Tool(
         google_search=types.GoogleSearch()
     )

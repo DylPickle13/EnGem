@@ -1,6 +1,6 @@
 import os
 import time
-from config import GEMINI_API_KEY as GEMINI_API_KEY
+from config import get_paid_gemini_api_key as get_paid_gemini_api_key
 from google import genai
 
 
@@ -8,8 +8,7 @@ def deep_research(query: str) -> str:
     """
     Run a background deep research interaction and return the final text result.
     """
-    os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
-    client = genai.Client()
+    client = genai.Client(api_key=get_paid_gemini_api_key())
 
     try:
         interaction = client.interactions.create(

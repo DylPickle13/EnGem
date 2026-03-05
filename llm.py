@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
-from config import GEMINI_API_KEY as GEMINI_API_KEY
+from config import get_gemini_api_key as get_gemini_api_key
 from config import model as model
 import history
 import memory as memory
@@ -475,8 +475,7 @@ def _convert_single_attachment_to_text(attachment: dict[str, bytes | str]) -> st
 
     prompt = IMAGE_EXTRACTOR_FILE.read_text(encoding="utf-8")
 
-    os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
-    client = genai.Client()
+    client = genai.Client(api_key=get_gemini_api_key())
 
     while True:
         try:
@@ -629,9 +628,7 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     tool_use_allowed: whether to allow the model to use tools for this generation (default: True)
     temperature: the temperature to use for this generation (default: 1)
     """
-    os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
-
-    client = genai.Client()
+    client = genai.Client(api_key=get_gemini_api_key())
     agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
     tool_config = types.ToolConfig(
         function_calling_config=types.FunctionCallingConfig(

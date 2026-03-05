@@ -7,7 +7,7 @@ from google.genai import types
 from google.genai.types import Content, Part
 from playwright.sync_api import Browser, Page, Playwright, sync_playwright
 
-from config import GEMINI_API_KEY
+from config import get_paid_gemini_api_key
 
 BROWSER_FILE = Path(__file__).parent / "agent_instructions/browser.md"
 SCREEN_WIDTH = 1440
@@ -468,8 +468,7 @@ def get_function_responses(page, results):
 
 
 def create_client() -> genai.Client:
-    os.environ.setdefault("GEMINI_API_KEY", GEMINI_API_KEY)
-    return genai.Client()
+    return genai.Client(api_key=get_paid_gemini_api_key())
 
 
 def create_model_config() -> types.GenerateContentConfig:

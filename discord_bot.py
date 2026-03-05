@@ -28,7 +28,7 @@ from google.genai import types
 import history
 import llm
 import memory as memory
-from config import GEMINI_API_KEY as GEMINI_API_KEY
+from config import get_gemini_api_key as get_gemini_api_key
 from config import VOICE_TOOL_TARGET_CHANNEL_NAME as VOICE_TOOL_TARGET_CHANNEL_NAME
 
 VOICE_INSTRUCTIONS = Path(__file__).parent / "agent_instructions" / "voice_instructions.md"
@@ -236,7 +236,7 @@ class _GeminiVoiceConversation:
 	def __init__(self, client: discord.Client, command_prefix: str = ">") -> None:
 		self._discord_client = client
 		self.command_prefix = command_prefix
-		self._genai_client = genai.Client(api_key=GEMINI_API_KEY, http_options={"api_version": "v1alpha"})
+		self._genai_client = genai.Client(api_key=get_gemini_api_key(), http_options={"api_version": "v1alpha"})
 		self._task: asyncio.Task[None] | None = None
 		self._stop_event = asyncio.Event()
 		self._voice_client: object | None = None
@@ -726,7 +726,7 @@ class DiscordBotWrapper:
 			self.voice_available = False
 
 		self.client = discord.Client(intents=intents)
-		if self.voice_available and VOICE_RECV_AVAILABLE and GEMINI_API_KEY:
+		if self.voice_available and VOICE_RECV_AVAILABLE and get_gemini_api_key():
 			self._voice_conversation = _GeminiVoiceConversation(self.client, self.command_prefix)
 		else:
 			self._voice_conversation = None
@@ -1807,7 +1807,7 @@ class DiscordBotWrapper:
 				logging.warning(
 					"discord-ext-voice-recv not found: incoming Discord voice audio cannot be captured. Install with: pip install discord-ext-voice-recv"
 				)
-			if not GEMINI_API_KEY:
+			if not get_gemini_api_key():
 				logging.warning("GEMINI_API_KEY is not set: Gemini Live voice conversation is disabled.")
 			self._ensure_channel_history_files()
 			self._start_cron_task_if_needed()
