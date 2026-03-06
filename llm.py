@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
-from config import get_gemini_api_key as get_gemini_api_key, get_paid_gemini_api_key as get_paid_gemini_api_key
+from config import get_paid_gemini_api_key as get_paid_gemini_api_key
 from config import FLASH_LITE_MODEL as FLASH_LITE_MODEL, FLASH_MODEL as FLASH_MODEL
 import history
 import memory as memory
@@ -479,7 +479,7 @@ def _convert_single_attachment_to_text(attachment: dict[str, bytes | str]) -> st
 
     prompt = IMAGE_EXTRACTOR_FILE.read_text(encoding="utf-8")
 
-    client = genai.Client(api_key=get_gemini_api_key())
+    client = genai.Client(api_key=get_paid_gemini_api_key())
 
     while True:
         try:
@@ -634,14 +634,7 @@ def _run_model_api(text: str, system_instructions: str, model: str, tool_use_all
     tool_use_allowed: whether to allow the model to use tools for this generation (default: True)
     temperature: the temperature to use for this generation (default: 1)
     """
-    client = None
-    if model == FLASH_MODEL:
-        client = genai.Client(api_key=get_paid_gemini_api_key())
-    elif model == FLASH_LITE_MODEL:
-        client = genai.Client(api_key=get_gemini_api_key())
-
-    if client is None:
-        raise ValueError("Failed to initialize model client with provided API keys.")
+    client = genai.Client(api_key=get_paid_gemini_api_key())
 
     agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
     tool_config = types.ToolConfig(

@@ -16,7 +16,7 @@ from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 
 import llm
-from config import get_gemini_api_key as get_gemini_api_key, FLASH_LITE_MODEL as FLASH_LITE_MODEL
+from config import FLASH_LITE_MODEL as FLASH_LITE_MODEL
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
