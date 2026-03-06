@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
-from config import get_gemini_api_key as get_gemini_api_key
-from config import model as model
+from config import get_gemini_api_key as get_gemini_api_key, get_paid_gemini_api_key as get_paid_gemini_api_key
+from config import FLASH_LITE_MODEL as FLASH_LITE_MODEL, FLASH_MODEL as FLASH_MODEL
 import history
 import memory as memory
 
@@ -92,7 +92,7 @@ def generate_response(
 
         intent_response = ""
         try:
-            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, FLASH_LITE_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         except Exception as e:
             print(f"Error generating intent response: {e}")
 
@@ -119,7 +119,7 @@ def generate_response(
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8") + history_file, tool_use_allowed=True, force_tool=True, temperature=temperature)
+            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8") + history_file, FLASH_MODEL, tool_use_allowed=True, force_tool=True, temperature=temperature)
             history.append_history(role="Manager", text=manager_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating manager response: {e}")
@@ -161,6 +161,7 @@ def generate_response(
                     return _run_model_api(
                         stage_history + "\n\n" + agent["instruction"],
                         system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"),
+                        model=FLASH_MODEL,
                         tool_use_allowed=True,
                         force_tool=False,
                         temperature=temperature,
@@ -195,6 +196,7 @@ def generate_response(
                         sub_agent_response = _run_model_api(
                             history.get_conversation_history(history_file=history_file) + "\n\n" + agent["instruction"],
                             system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"),
+                            model=FLASH_MODEL,
                             tool_use_allowed=True,
                             force_tool=False,
                             temperature=temperature,
@@ -213,7 +215,7 @@ def generate_response(
             continue
 
         try:
-            exit_string = _run_model_api(history.get_conversation_history(history_file=history_file), REVIEWER_FILE.read_text(encoding="utf-8") + user_message, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+            exit_string = _run_model_api(history.get_conversation_history(history_file=history_file), REVIEWER_FILE.read_text(encoding="utf-8") + user_message, FLASH_LITE_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
             history.append_history(role="Reviewer", text=exit_string, history_file=history_file)
         except Exception as e:
             print(f"Error generating reviewer response: {e}")
@@ -239,6 +241,7 @@ def generate_response(
             _run_model_api,
             history.get_conversation_history(history_file=history_file),
             TEXTER_FILE.read_text(encoding="utf-8"),
+            FLASH_LITE_MODEL,
             False,
             False,
             default_temperature,
@@ -347,6 +350,7 @@ def _select_media_paths(history_file: str, user_message: str, temperature: float
     selector_response = _run_model_api(
         selector_input,
         MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
+        model=FLASH_LITE_MODEL,
         tool_use_allowed=False,
         force_tool=False,
         temperature=temperature,
@@ -480,7 +484,7 @@ def _convert_single_attachment_to_text(attachment: dict[str, bytes | str]) -> st
     while True:
         try:
             response = client.models.generate_content(
-                model=model,
+                model=FLASH_LITE_MODEL,
                 contents=[
                     types.Content(
                         role="user",
@@ -506,6 +510,7 @@ def _run_memory_extraction_async(extraction_input: str, history_file: str, tempe
             memory_extractor_response = _run_model_api(
                 extraction_input,
                 MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
+                FLASH_LITE_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=temperature,
@@ -530,6 +535,7 @@ def _run_history_summarization_async(history_file: str, temperature: float, pivo
             summary = _run_model_api(
                 prior_history,
                 HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
+                FLASH_LITE_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=temperature,
@@ -620,7 +626,7 @@ def _get_skill(function_name: str, function_args: dict) -> str:
     return function_output
 
 
-def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool = True, force_tool: bool = False, temperature: float = 1) -> str:
+def _run_model_api(text: str, system_instructions: str, model: str, tool_use_allowed: bool = True, force_tool: bool = False, temperature: float = 1) -> str:
     """
     Helper function to call the model API with the given text and system instructions, and return the generated response.
     text: the input text to generate a response for
@@ -628,7 +634,15 @@ def _run_model_api(text: str, system_instructions: str, tool_use_allowed: bool =
     tool_use_allowed: whether to allow the model to use tools for this generation (default: True)
     temperature: the temperature to use for this generation (default: 1)
     """
-    client = genai.Client(api_key=get_gemini_api_key())
+    client = None
+    if model == FLASH_MODEL:
+        client = genai.Client(api_key=get_paid_gemini_api_key())
+    elif model == FLASH_LITE_MODEL:
+        client = genai.Client(api_key=get_gemini_api_key())
+
+    if client is None:
+        raise ValueError("Failed to initialize model client with provided API keys.")
+
     agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
     tool_config = types.ToolConfig(
         function_calling_config=types.FunctionCallingConfig(

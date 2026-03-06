@@ -11,7 +11,6 @@ When creating the modular plan, follow these steps strictly:
 4. Group sub-agents into execution stages:
    - Use "parallel" when agents are independent and can run at the same time.
    - Use "serial" when agents depend on prior stage outputs.
-   - Group serial stages together, rather than using multiple serial stages, if they are part of the same logical flow and can be executed in one run.
 5. Using run_python, create the file: `sub-agents/execution_order_{channel_name}.json` using the exact schema below.
 
 JSON schema rules:

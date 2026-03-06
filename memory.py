@@ -16,6 +16,7 @@ from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 
 import llm
+from config import get_gemini_api_key as get_gemini_api_key, FLASH_LITE_MODEL as FLASH_LITE_MODEL
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -169,6 +170,7 @@ def _select_related_memory_ids(topic: str, candidates: list[MemoryItem]) -> set[
     result = llm._run_model_api(
         text=prompt,
         system_instructions=MEMORY_RELATED.read_text(encoding="utf-8"),
+        model=FLASH_LITE_MODEL,
         tool_use_allowed=False,
         force_tool=False,
         temperature=0,
@@ -202,6 +204,7 @@ def _select_related_memory_ids(topic: str, candidates: list[MemoryItem]) -> set[
             retry = llm._run_model_api(
                 text=prompt,
                 system_instructions=retry_system,
+                model=FLASH_LITE_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=0,
@@ -264,9 +267,3 @@ def forget_memories(topic: str) -> str:
         )
     except Exception as error:
         return f"Failed to forget memories: {error}"
-
-
-
-if __name__ == "__main__":
-    store = get_default_store()
-    store.clear_memories()
