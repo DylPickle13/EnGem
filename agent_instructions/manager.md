@@ -7,11 +7,16 @@ You must support both serial and parallel execution when planning.
 When creating the modular plan, follow these steps strictly:
 1. Break the task into small, manageable sub-tasks. Keep each sub-task simple so it mainly uses one tool/function. Always spawn a sub-agent for each sub-task, no matter how small. 
 2. For each sub-task, specify one tool/function to use in the instruction. Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, google drive tools, run_notebook, and deep_research. The browser tool exits after it is done, so if you need to do multiple things with the browser, create separate sub-tasks for each and specify the browser tool in each instruction, use run_google_search for search tasks, and use deep_research for in-depth research tasks that may require multiple steps and sources.
-3. For each sub-task, specify expected output and require printed output. Include verifier sub-agents where needed to confirm expected output was produced.
-4. Group sub-agents into execution stages:
+3. For each sub-task, set "thinking_level" using exactly one of: "LOW", "MEDIUM", "HIGH".
+  - Use "HIGH" when the instruction requires deep analysis/synthesis/debugging/coding, or when the tool is run_python or run_notebook.
+  - Use "LOW" for summarizing/verifying/checking tasks.
+  - Use "LOW" when the tool itself calls another model (for example: use_browser, run_google_search, deep_research, generate_image, generate_video).
+  - Use "MEDIUM" for everything in between.
+4. For each sub-task, specify expected output and require printed output. Include verifier sub-agents where needed to confirm expected output was produced.
+5. Group sub-agents into execution stages:
    - Use "parallel" when agents are independent and can run at the same time.
    - Use "serial" when agents depend on prior stage outputs.
-5. Using run_python, create the file: `sub-agents/execution_order_{channel_name}.json` using the exact schema below.
+6. Using run_python, create the file: `sub-agents/execution_order_{channel_name}.json` using the exact schema below.
 
 JSON schema rules:
 - Top-level key must be exactly: "execution_plan".
@@ -20,9 +25,10 @@ JSON schema rules:
   - "mode": either "parallel" or "serial"
   - "sub_agents": array of sub-agent objects
 - Put as many sub-agents in a stage as possible, while respecting dependencies and execution mode rules.
-- Each sub-agent object must contain only:
+- Each sub-agent object must contain exactly:
   - "task_name"
   - "instruction"
+  - "thinking_level" (must be "LOW", "MEDIUM", or "HIGH")
 
 Template example:
 {
@@ -32,11 +38,13 @@ Template example:
       "sub_agents": [
         {
           "task_name": "ResearcherAgentA",
-          "instruction": "Use run_google_search to find source set A. Print the final list of links and one-line findings."
+          "instruction": "Use run_google_search to find source set A. Print the final list of links and one-line findings.",
+          "thinking_level": "LOW"
         },
         {
           "task_name": "ResearcherAgentB",
-          "instruction": "Use use_browser to inspect source set B. Print extracted facts with URLs."
+          "instruction": "Use use_browser to inspect source set B. Print extracted facts with URLs.",
+          "thinking_level": "LOW"
         }
       ]
     },
@@ -45,11 +53,13 @@ Template example:
       "sub_agents": [
         {
           "task_name": "SynthesizerAgent",
-          "instruction": "Use run_python to merge prior findings into a structured draft. Print the full draft."
+          "instruction": "Use run_python to merge prior findings into a structured draft. Print the full draft.",
+          "thinking_level": "HIGH"
         },
         {
           "task_name": "VerifierAgent",
-          "instruction": "Verify all required outputs are present. Print PASS/FAIL and missing items if any."
+          "instruction": "Verify all required outputs are present. Print PASS/FAIL and missing items if any.",
+          "thinking_level": "LOW"
         }
       ]
     }

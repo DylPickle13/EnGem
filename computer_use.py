@@ -427,7 +427,7 @@ def execute_function_calls(candidate, page: Page, screen_width: int, screen_heig
 
         fname = function_call.name
         args = function_call.args
-        print(f"  -> Executing: {fname}")
+        #print(f"  -> Executing: {fname}")
 
         try:
             action_result = _execute_single_action(page, fname, args, screen_width, screen_height)
@@ -481,15 +481,7 @@ def create_model_config() -> types.GenerateContentConfig:
     return config
 
 
-def _get_existing_open_page(browser: Browser) -> Page | None:
-    for context in reversed(browser.contexts):
-        for page in reversed(context.pages):
-            if not page.is_closed():
-                return page
-    return None
-
-
-def setup_browser(reuse_existing: bool = False) -> tuple[Playwright, Browser, Page]:
+def setup_browser() -> tuple[Playwright, Browser, Page]:
     """
     Always start a fresh Playwright and Browser for the current thread.
     This avoids reusing existing browser instances while keeping the pattern
@@ -538,7 +530,7 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
 
     responses = ""
     for i in range(TURN_LIMIT):
-        print(f"\n--- Turn {i+1} ---")
+        #print(f"\n--- Turn {i+1} ---")
         while True:
             try:
                 response = client.models.generate_content(
@@ -548,7 +540,7 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
                 )
                 break
             except Exception as e:
-                print(f"Error during content generation: {e}\nRetrying...")
+                #print(f"Error during content generation: {e}\nRetrying...")
                 time.sleep(1)
 
         candidate = response.candidates[0]
@@ -556,7 +548,7 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
 
         has_function_calls = any(part.function_call for part in candidate.content.parts)
         if not has_function_calls:
-            print("No function calls detected, ending agent loop.")
+            #print("No function calls detected, ending agent loop.")
             responses += "".join(part.text for part in candidate.content.parts if part.text)
             break
 

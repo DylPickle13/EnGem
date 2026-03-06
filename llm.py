@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
-from config import FLASH_LITE_MODEL as FLASH_LITE_MODEL, FLASH_MODEL as FLASH_MODEL
+from config import FLASH_LITE_MODEL as FLASH_LITE_MODEL, FLASH_MODEL as FLASH_MODEL, PRO_MODEL as PRO_MODEL
 import history
 import memory as memory
 
@@ -51,6 +51,17 @@ SUPPORTED_MEDIA_EXTENSIONS = {
 }
 MAX_INPUT_ATTACHMENTS = 10
 SUB_AGENT_INSTRUCTION_PREVIEW_CHARS = 200
+VALID_PLAN_THINKING_LEVELS = {"LOW", "MEDIUM", "HIGH"}
+THINKING_LEVEL_TO_MODEL = {
+    "LOW": FLASH_LITE_MODEL,
+    "MEDIUM": FLASH_MODEL,
+    "HIGH": PRO_MODEL,
+}
+THINKING_LEVEL_TO_API_LEVEL = {
+    "LOW": "low",
+    "MEDIUM": "medium",
+    "HIGH": "high",
+}
 
 
 @dataclass
@@ -150,6 +161,7 @@ def generate_response(
         )
 
         cannot_proceed = False
+        sub_agent_system_instructions = SUB_AGENT_FILE.read_text(encoding="utf-8")
         for stage in execution_plan:
             mode = stage["mode"]
             agents = stage["sub_agents"]
@@ -158,13 +170,15 @@ def generate_response(
                 base_history = history.get_conversation_history(history_file=history_file)
 
                 def _run_parallel_agent(agent: dict, stage_history: str) -> str:
+                    model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
                     return _run_model_api(
                         stage_history + "\n\n" + agent["instruction"],
-                        system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"),
-                        model=FLASH_MODEL,
+                        system_instructions=sub_agent_system_instructions,
+                        model=model_name,
                         tool_use_allowed=True,
                         force_tool=False,
                         temperature=temperature,
+                        thinking_level=api_thinking_level,
                     )
 
                 with ThreadPoolExecutor(max_workers=min(len(agents), 8)) as executor:
@@ -193,13 +207,15 @@ def generate_response(
                 for agent in agents:
                     sub_agent_response = ""
                     try:
+                        model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
                         sub_agent_response = _run_model_api(
                             history.get_conversation_history(history_file=history_file) + "\n\n" + agent["instruction"],
-                            system_instructions=SUB_AGENT_FILE.read_text(encoding="utf-8"),
-                            model=FLASH_MODEL,
+                            system_instructions=sub_agent_system_instructions,
+                            model=model_name,
                             tool_use_allowed=True,
                             force_tool=False,
                             temperature=temperature,
+                            thinking_level=api_thinking_level,
                         )
                         history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
                         if sub_agent_response.strip() == "<CANNOT_PROCEED>":
@@ -316,9 +332,11 @@ def _build_execution_plan_ascii_diagram(execution_plan: list[dict], history_file
 
             task_name = str(agent.get("task_name", "unnamed_task"))
             instruction = str(agent.get("instruction", ""))
+            plan_thinking_level = _normalize_plan_thinking_level(agent.get("thinking_level"))
             preview = _truncate_instruction_preview(instruction, SUB_AGENT_INSTRUCTION_PREVIEW_CHARS)
             lines.append(f"|   |-- Agent {agent_index}: {task_name}")
             lines.append(f"|   |   instruction: {preview}")
+            lines.append(f"|   |   thinking_level: {plan_thinking_level}")
 
     return "\n".join(lines)
 
@@ -580,6 +598,8 @@ def _normalize_execution_plan(execution_order_dict: dict) -> list[dict]:
     Required format:
     - {"execution_plan": [{"mode": "parallel|serial", "sub_agents": [...]}, ...]}
     - Each stage must explicitly include "mode" as "parallel" or "serial".
+    - Each sub-agent should include "thinking_level" (LOW/MEDIUM/HIGH).
+    - Missing or invalid thinking levels are normalized to MEDIUM for backward compatibility.
     """
     normalized_plan: list[dict] = []
 
@@ -603,7 +623,14 @@ def _normalize_execution_plan(execution_order_dict: dict) -> list[dict]:
                 instruction = agent.get("instruction")
                 if not isinstance(task_name, str) or not isinstance(instruction, str):
                     continue
-                cleaned_agents.append({"task_name": task_name, "instruction": instruction})
+                thinking_level = _normalize_plan_thinking_level(agent.get("thinking_level"))
+                cleaned_agents.append(
+                    {
+                        "task_name": task_name,
+                        "instruction": instruction,
+                        "thinking_level": thinking_level,
+                    }
+                )
 
             if cleaned_agents:
                 normalized_plan.append({"mode": mode, "sub_agents": cleaned_agents})
@@ -626,7 +653,38 @@ def _get_skill(function_name: str, function_args: dict) -> str:
     return function_output
 
 
-def _run_model_api(text: str, system_instructions: str, model: str, tool_use_allowed: bool = True, force_tool: bool = False, temperature: float = 1) -> str:
+def _normalize_plan_thinking_level(raw_level: object) -> str:
+    if isinstance(raw_level, str):
+        normalized = raw_level.strip().upper()
+        if normalized in VALID_PLAN_THINKING_LEVELS:
+            return normalized
+    return "MEDIUM"
+
+
+def _normalize_api_thinking_level(raw_level: object) -> str:
+    if isinstance(raw_level, str):
+        normalized = raw_level.strip().lower()
+        if normalized in {"low", "medium", "high"}:
+            return normalized
+    return "high"
+
+
+def _resolve_sub_agent_model_config(agent: dict) -> tuple[str, str]:
+    plan_thinking_level = _normalize_plan_thinking_level(agent.get("thinking_level"))
+    model_name = THINKING_LEVEL_TO_MODEL.get(plan_thinking_level, FLASH_MODEL)
+    api_thinking_level = THINKING_LEVEL_TO_API_LEVEL.get(plan_thinking_level, "medium")
+    return model_name, api_thinking_level
+
+
+def _run_model_api(
+    text: str,
+    system_instructions: str,
+    model: str,
+    tool_use_allowed: bool = True,
+    force_tool: bool = False,
+    temperature: float = 1,
+    thinking_level: str = "high",
+) -> str:
     """
     Helper function to call the model API with the given text and system instructions, and return the generated response.
     text: the input text to generate a response for
@@ -648,7 +706,7 @@ def _run_model_api(text: str, system_instructions: str, model: str, tool_use_all
         tools=[agent_tools] if tool_use_allowed else [],
         temperature=temperature,
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=force_tool),
-        thinking_config=types.ThinkingConfig(thinking_level="high")
+        thinking_config=types.ThinkingConfig(thinking_level=_normalize_api_thinking_level(thinking_level))
     )
 
     function_output = ""
