@@ -654,7 +654,8 @@ def _run_model_api(text: str, system_instructions: str, model: str, tool_use_all
         tool_config=tool_config if force_tool else None,
         tools=[agent_tools] if tool_use_allowed else [],
         temperature=temperature,
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=force_tool)
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=force_tool),
+        thinking_config=types.ThinkingConfig(thinking_level="high")
     )
 
     function_output = ""
