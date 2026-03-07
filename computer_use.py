@@ -515,11 +515,11 @@ def setup_browser() -> tuple[Playwright, Browser, Page]:
 
 
 def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
-    print("Prompt:", prompt)
+    #print("Prompt:", prompt)
     config = create_model_config()
     initial_screenshot = page.screenshot(type="png")
     model_to_use = _select_model_for_loop(prompt)
-    print(f"Using model for this loop: {model_to_use}")
+    #print(f"Using model for this loop: {model_to_use}")
 
     contents = [
         Content(role="user", parts=[

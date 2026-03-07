@@ -21,7 +21,7 @@ def use_browser(prompt: str) -> str:
     """
     output = ""
     client = computer_use.create_client()
-    _playwright, _browser, page = computer_use.setup_browser(reuse_existing=False)
+    _playwright, _browser, page = computer_use.setup_browser()
 
     try:
         output = computer_use.run_agent_loop(client, page, prompt=prompt)

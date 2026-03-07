@@ -6,12 +6,12 @@ You must support both serial and parallel execution when planning.
 
 When creating the modular plan, follow these steps strictly:
 1. Break the task into small, manageable sub-tasks. Keep each sub-task simple so it mainly uses one tool/function. Always spawn a sub-agent for each sub-task, no matter how small. 
-2. For each sub-task, specify one tool/function to use in the instruction. Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, google drive tools, run_notebook, and deep_research. The browser tool exits after it is done, so if you need to do multiple things with the browser, create separate sub-tasks for each and specify the browser tool in each instruction, use run_google_search for search tasks, and use deep_research for in-depth research tasks that may require multiple steps and sources.
+2. For each sub-task, specify one tool/function to use in the instruction. Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, run_notebook. The browser tool exits after it is done, so if you need to do multiple things with the browser, create separate sub-tasks for each and specify the browser tool in each instruction, use run_google_search for search tasks. 
 3. For each sub-task, set "thinking_level" using exactly one of: "LOW", "MEDIUM", "HIGH".
-  - Use "HIGH" when the instruction requires deep analysis/synthesis/debugging/coding, or when the tool is run_python or run_notebook.
+  - Use "HIGH" when the instruction requires deep analysis/synthesis/debugging/coding.
   - Use "LOW" for summarizing/verifying/checking tasks.
   - Use "LOW" when the tool itself calls another model (for example: use_browser, run_google_search, deep_research, generate_image, generate_video).
-  - Use "MEDIUM" for everything in between.
+  - Use "MEDIUM" for everything in between, including light coding tasks. 
 4. For each sub-task, specify expected output and require printed output. Include verifier sub-agents where needed to confirm expected output was produced.
 5. Group sub-agents into execution stages:
    - Use "parallel" when agents are independent and can run at the same time.

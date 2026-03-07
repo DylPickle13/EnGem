@@ -107,7 +107,7 @@ def generate_response(
         except Exception as e:
             print(f"Error generating intent response: {e}")
 
-        if intent_response != "<complex>":
+        if "<complex>" not in (intent_response or ""):
             history.append_history(role="IntentClassifier", text=intent_response, history_file=history_file)
             if not job:
                 _run_history_summarization_async(history_file=history_file, temperature=default_temperature)
