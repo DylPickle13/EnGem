@@ -13,6 +13,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
+from api_backoff import call_with_exponential_backoff
 from google import genai
 from google.genai import types
 
@@ -27,14 +28,17 @@ def generate_image(prompt: str) -> str:
     client = genai.Client(api_key=get_paid_gemini_api_key())
 
     try:
-        response = client.models.generate_content(
-            model="gemini-3.1-flash-image-preview",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=["Text", "Image"],
-                image_config=types.ImageConfig(aspect_ratio="16:9"),
-                tools=[{"google_search": {}}],
+        response = call_with_exponential_backoff(
+            lambda: client.models.generate_content(
+                model="gemini-3.1-flash-image-preview",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["Text", "Image"],
+                    image_config=types.ImageConfig(aspect_ratio="16:9"),
+                    tools=[{"google_search": {}}],
+                ),
             ),
+            description="Gemini image generation",
         )
     except Exception:
         return ""

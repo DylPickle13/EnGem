@@ -13,11 +13,16 @@ When creating the modular plan, follow these steps strictly:
   - Use "MEDIUM" when the instruction requires analysis/synthesis/debugging/coding, or uses run_python.
   - Use "HIGH" for the very highest level of reasoning, for example when asked to solve a complex problem or come up with a creative solution. This should be very rare. 
 4. For each non-reviewer sub-task, specify expected output and require printed output. Do not create step-by-step verifier sub-agents. Instead, always end the execution plan with exactly one final serial sub-agent named "Reviewer" that verifies whether the user's last request has been fulfilled. That final Reviewer sub-agent must follow reviewer.md behavior: respond with "<yes>" if the task is complete; otherwise print a concise failure lesson and the checks the main agent should make before retrying.
-5. Group sub-agents into execution stages:
+5. If a sub-task generates a downloadable file, explicitly instruct it to save the file in a tracked output directory and print the final absolute path:
+  - images: `generated_images/`
+  - videos: `generated_videos/`
+  - PDFs and documents: `generated_documents/`
+  - other downloadable files: `generated_files/`
+6. Group sub-agents into execution stages:
    - Use "parallel" when agents are independent and can run at the same time.
   - Use "serial" when agents depend on prior stage outputs.
   - The final stage must be "serial" and contain exactly one sub-agent: "Reviewer".
-6. Using run_python, create the file: `sub-agents/execution_order_{channel_name}.json` using the exact schema below.
+7. Using run_python, create the file: `sub-agents/execution_order_{channel_name}.json` using the exact schema below.
 
 JSON schema rules:
 - Top-level key must be exactly: "execution_plan".

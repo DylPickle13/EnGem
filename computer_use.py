@@ -7,6 +7,7 @@ from google.genai.types import Content, Part
 from playwright.sync_api import Browser, Page, Playwright, sync_playwright
 
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key, MEDIUM_MODEL as MEDIUM_MODEL
+from api_backoff import call_with_exponential_backoff
 
 BROWSER_FILE = Path(__file__).parent / "agent_instructions/browser.md"
 SCREEN_WIDTH = 1440
@@ -531,17 +532,14 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
     responses = ""
     for i in range(TURN_LIMIT):
         #print(f"\n--- Turn {i+1} ---")
-        while True:
-            try:
-                response = client.models.generate_content(
-                    model=model_to_use,
-                    contents=contents,
-                    config=config,
-                )
-                break
-            except Exception as e:
-                #print(f"Error during content generation: {e}\nRetrying...")
-                time.sleep(1)
+        response = call_with_exponential_backoff(
+            lambda: client.models.generate_content(
+                model=model_to_use,
+                contents=contents,
+                config=config,
+            ),
+            description=f"Gemini browser agent turn {i + 1}",
+        )
 
         candidate = response.candidates[0]
         contents.append(candidate.content)

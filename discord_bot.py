@@ -8,6 +8,7 @@ import audioop
 import array
 import datetime
 import logging
+import mimetypes
 import queue
 import time
 from pathlib import Path
@@ -1073,7 +1074,7 @@ class DiscordBotWrapper:
 				file_size = int(path.stat().st_size)
 				if file_size > upload_limit_bytes:
 					logging.warning(
-						"Skipping media '%s': file size %d exceeds upload limit %d bytes.",
+						"Skipping attachment '%s': file size %d exceeds upload limit %d bytes.",
 						path,
 						file_size,
 						upload_limit_bytes,
@@ -1093,7 +1094,7 @@ class DiscordBotWrapper:
 			if non_oversized_skips:
 				await self._send_long_message(
 					channel,
-					"Could not attach media files (missing/unreadable files).",
+					"Could not attach files (missing or unreadable files).",
 				)
 			return
 
@@ -1146,9 +1147,9 @@ class DiscordBotWrapper:
 			if skipped_count == 0:
 				return
 			if skipped_count == 1:
-				await self._send_long_message(channel, f"Skipped 1 media file that Discord would not accept: {non_oversized_skips[0]}")
+				await self._send_long_message(channel, f"Skipped 1 file that Discord would not accept: {non_oversized_skips[0]}")
 			else:
-				await self._send_long_message(channel, f"Skipped {skipped_count} media files that Discord would not accept.")
+				await self._send_long_message(channel, f"Skipped {skipped_count} files that Discord would not accept.")
 
 	async def _send_oversized_media_warning(
 		self,
@@ -1172,7 +1173,7 @@ class DiscordBotWrapper:
 
 		remaining = len(entries) - len(display_entries)
 		limit_text = f"{upload_limit_bytes / (1024 * 1024):.1f}MB"
-		message = "⚠️ Some media files are too large for this Discord channel upload limit "
+		message = "⚠️ Some files are too large for this Discord channel upload limit "
 		message += f"({limit_text}):\n" + "\n".join(lines)
 		if remaining > 0:
 			message += f"\n...and {remaining} more file(s)."
@@ -1206,7 +1207,7 @@ class DiscordBotWrapper:
 					return skipped
 
 				single_path = batch_paths[0]
-				logging.warning("Skipping media '%s': Discord rejected the file as too large.", single_path)
+				logging.warning("Skipping attachment '%s': Discord rejected the file as too large.", single_path)
 				return [str(single_path)]
 			raise
 		finally:
@@ -1264,19 +1265,52 @@ class DiscordBotWrapper:
 			return data.decode("utf-8", errors="replace").strip()
 
 	@staticmethod
+	def _get_attachment_mime_type(attachment: discord.Attachment) -> str:
+		content_type = (attachment.content_type or "").strip().lower()
+		if content_type:
+			return content_type
+
+		guessed_content_type, _ = mimetypes.guess_type(attachment.filename or "")
+		if guessed_content_type:
+			return guessed_content_type.lower()
+
+		return "application/octet-stream"
+
+	@staticmethod
 	def _is_image_attachment(attachment: discord.Attachment) -> bool:
-		content_type = (attachment.content_type or "").lower()
-		filename = (attachment.filename or "").lower()
-		return content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"))
+		return DiscordBotWrapper._get_attachment_mime_type(attachment).startswith("image/")
 
 	@staticmethod
 	def _is_video_attachment(attachment: discord.Attachment) -> bool:
-		content_type = (attachment.content_type or "").lower()
-		filename = (attachment.filename or "").lower()
-		return content_type.startswith("video/") or filename.endswith((".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"))
+		return DiscordBotWrapper._get_attachment_mime_type(attachment).startswith("video/")
+
+	@staticmethod
+	def _is_audio_attachment(attachment: discord.Attachment) -> bool:
+		return DiscordBotWrapper._get_attachment_mime_type(attachment).startswith("audio/")
+
+	@staticmethod
+	def _is_pdf_attachment(attachment: discord.Attachment) -> bool:
+		return DiscordBotWrapper._get_attachment_mime_type(attachment) == "application/pdf"
 
 	def _is_media_attachment(self, attachment: discord.Attachment) -> bool:
-		return self._is_image_attachment(attachment) or self._is_video_attachment(attachment)
+		return (
+			self._is_image_attachment(attachment)
+			or self._is_video_attachment(attachment)
+			or self._is_audio_attachment(attachment)
+			or self._is_pdf_attachment(attachment)
+		)
+
+	@staticmethod
+	def _default_attachment_name(mime_type: str) -> str:
+		if mime_type.startswith("image/"):
+			return "image"
+		if mime_type.startswith("video/"):
+			return "video"
+		if mime_type.startswith("audio/"):
+			return "audio"
+		if mime_type == "application/pdf":
+			return "document"
+		return "attachment"
 
 	async def _read_media_attachments(self, message: discord.Message) -> list[dict[str, bytes | str]]:
 		media_payloads: list[dict[str, bytes | str]] = []
@@ -1295,16 +1329,13 @@ class DiscordBotWrapper:
 			if not attachment_bytes:
 				continue
 
-			default_name = "attachment"
-			if self._is_video_attachment(attachment):
-				default_name = "video"
-			elif self._is_image_attachment(attachment):
-				default_name = "image"
+			mime_type = self._get_attachment_mime_type(attachment)
+			default_name = self._default_attachment_name(mime_type)
 
 			media_payloads.append(
 				{
 					"data": attachment_bytes,
-					"mime_type": attachment.content_type or "application/octet-stream",
+					"mime_type": mime_type,
 					"filename": attachment.filename or default_name,
 				}
 			)

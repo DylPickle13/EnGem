@@ -2,6 +2,7 @@ from google import genai
 from google.genai import types
 import json
 import inspect
+import mimetypes
 import threading
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Callable
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
 from config import MINIMAL_MODEL as MINIMAL_MODEL, LOW_MODEL as LOW_MODEL, MEDIUM_MODEL as MEDIUM_MODEL, HIGH_MODEL as HIGH_MODEL
+from api_backoff import call_with_exponential_backoff
 import history
 import memory as memory
 
@@ -44,9 +46,24 @@ IMAGE_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/image_extract
 
 GENERATED_IMAGES_DIR = (Path(__file__).parent / "generated_images").resolve()
 GENERATED_VIDEOS_DIR = (Path(__file__).parent / "generated_videos").resolve()
-SUPPORTED_MEDIA_EXTENSIONS = {
+GENERATED_FILES_DIR = (Path(__file__).parent / "generated_files").resolve()
+GENERATED_DOCUMENTS_DIR = (Path(__file__).parent / "generated_documents").resolve()
+RESTRICTED_OUTPUT_DIRECTORIES = (
+    GENERATED_IMAGES_DIR,
+    GENERATED_VIDEOS_DIR,
+)
+ALLOWED_OUTPUT_DIRECTORIES = (
+    GENERATED_IMAGES_DIR,
+    GENERATED_VIDEOS_DIR,
+    GENERATED_FILES_DIR,
+    GENERATED_DOCUMENTS_DIR,
+)
+SUPPORTED_OUTPUT_FILE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
     ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v",
+    ".pdf", ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
+    ".html", ".htm", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip",
 }
 MAX_INPUT_ATTACHMENTS = 10
 SUB_AGENT_INSTRUCTION_PREVIEW_CHARS = 200
@@ -81,7 +98,7 @@ def generate_response(
 ) -> LLMResponse:
     """
     Main function to generate a response from the model based on the user's message,
-    conversation history, and optionally image/video attachments.
+    conversation history, and optionally multimodal attachments.
     This function handles the entire flow of generating a response, including intent classification, sub-agent execution, and final response generation.
     If execution_plan_notifier is provided, it is called asynchronously with an
     ASCII diagram of the active execution plan whenever a new plan is detected.
@@ -430,10 +447,11 @@ def _normalize_media_path(raw_path: str) -> str | None:
 
     if not path.exists() or not path.is_file():
         return None
-    if path.suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS:
+    if not any(_is_under_directory(path, directory) for directory in ALLOWED_OUTPUT_DIRECTORIES):
         return None
-    if not _is_under_directory(path, GENERATED_IMAGES_DIR) and not _is_under_directory(path, GENERATED_VIDEOS_DIR):
-        return None
+    if any(_is_under_directory(path, directory) for directory in RESTRICTED_OUTPUT_DIRECTORIES):
+        if path.suffix.lower() not in SUPPORTED_OUTPUT_FILE_EXTENSIONS:
+            return None
     return str(path)
 
 
@@ -477,25 +495,23 @@ def _convert_single_attachment_to_text(attachment: dict[str, bytes | str]) -> st
         return ""
 
     attachment_bytes = attachment.get("data")
-    mime_type = attachment.get("mime_type")
     filename = attachment.get("filename")
 
     if not isinstance(attachment_bytes, bytes) or not attachment_bytes:
         return ""
 
-    if not isinstance(mime_type, str) or not mime_type:
-        mime_type = "application/octet-stream"
+    mime_type = _normalize_attachment_mime_type(attachment)
 
     if not isinstance(filename, str) or not filename:
-        filename = "image"
+        filename = _default_attachment_name_for_mime_type(mime_type)
 
-    prompt = IMAGE_EXTRACTOR_FILE.read_text(encoding="utf-8")
+    prompt = _build_attachment_extraction_prompt(mime_type)
 
     client = genai.Client(api_key=get_paid_gemini_api_key())
 
-    while True:
-        try:
-            response = client.models.generate_content(
+    try:
+        response = call_with_exponential_backoff(
+            lambda: client.models.generate_content(
                 model=LOW_MODEL,
                 contents=[
                     types.Content(
@@ -507,13 +523,64 @@ def _convert_single_attachment_to_text(attachment: dict[str, bytes | str]) -> st
                     )
                 ],
                 config=types.GenerateContentConfig(temperature=0.2),
-            )
-            return (getattr(response, "text", "") or "").strip()
-        except Exception as e:
-            print(f"Error converting image to text: {e}")
-            break
+            ),
+            description="Gemini attachment extraction",
+        )
+        return (getattr(response, "text", "") or "").strip()
+    except Exception as e:
+        print(f"Error converting attachment to text: {e}")
 
     return ""
+
+
+def _normalize_attachment_mime_type(attachment: dict[str, bytes | str]) -> str:
+    mime_type = attachment.get("mime_type")
+    if isinstance(mime_type, str) and mime_type.strip():
+        return mime_type.strip().lower()
+
+    filename = attachment.get("filename")
+    if isinstance(filename, str) and filename:
+        guessed_mime_type, _ = mimetypes.guess_type(filename)
+        if guessed_mime_type:
+            return guessed_mime_type.lower()
+
+    return "application/octet-stream"
+
+
+def _default_attachment_name_for_mime_type(mime_type: str) -> str:
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type.startswith("video/"):
+        return "video"
+    if mime_type.startswith("audio/"):
+        return "audio"
+    if mime_type == "application/pdf":
+        return "document"
+    return "attachment"
+
+
+def _build_attachment_extraction_prompt(mime_type: str) -> str:
+    if mime_type.startswith("image/"):
+        return IMAGE_EXTRACTOR_FILE.read_text(encoding="utf-8")
+    if mime_type.startswith("video/"):
+        return (
+            "Extract the useful content from this video. Return plain text only, concise but complete. "
+            "Include a brief description of important visual events, any visible on-screen text, and a transcript or summary of spoken audio when present."
+        )
+    if mime_type.startswith("audio/"):
+        return (
+            "Extract the useful content from this audio clip. Return plain text only, concise but complete. "
+            "Transcribe spoken words when possible and summarize relevant non-speech audio if it matters."
+        )
+    if mime_type == "application/pdf":
+        return (
+            "Extract the useful content from this PDF document. Return plain text only, concise but complete. "
+            "Preserve important wording, headings, lists, and key structured details when they matter to the user's request."
+        )
+    return (
+        "Extract the useful content from this attachment. Return plain text only, concise but complete. "
+        "Include readable text and summarize any relevant non-text content."
+    )
 
 
 def _run_memory_extraction_async(extraction_input: str, history_file: str, temperature: float) -> None:
@@ -753,17 +820,14 @@ def _run_model_api(
 
     function_output = ""
 
-    while True:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                config=config,
-                contents=text,
-            )
-            break
-        except Exception as e:
-            print(f"Error calling model API: {e}")
-        print("Retrying...")
+    response = call_with_exponential_backoff(
+        lambda: client.models.generate_content(
+            model=model,
+            config=config,
+            contents=text,
+        ),
+        description=f"Gemini generate_content ({model})",
+    )
 
     if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
         for part in response.candidates[0].content.parts:

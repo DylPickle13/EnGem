@@ -11,6 +11,7 @@ if str(_REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(_REPO_ROOT))
 
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
+from api_backoff import call_with_exponential_backoff
 from google import genai
 from google.genai import types
 
@@ -23,11 +24,20 @@ def generate_video(prompt: str) -> str:
   """
   client = genai.Client(api_key=get_paid_gemini_api_key())
 
+  def _get_operation_status(operation_ref: object) -> object:
+    try:
+      return client.operations.get(operation_ref)
+    except Exception:
+      return client.operations.get(getattr(operation_ref, "name", operation_ref))
+
   try:
-    operation = client.models.generate_videos(
-      model="veo-3.1-generate-preview",
-      prompt=prompt,
-      config=types.GenerateVideosConfig(aspect_ratio="16:9"),
+    operation = call_with_exponential_backoff(
+      lambda: client.models.generate_videos(
+        model="veo-3.1-generate-preview",
+        prompt=prompt,
+        config=types.GenerateVideosConfig(aspect_ratio="16:9"),
+      ),
+      description="Gemini video generation",
     )
   except Exception as exc:
     import traceback
@@ -41,11 +51,10 @@ def generate_video(prompt: str) -> str:
     op_ref = operation
     while not getattr(op_ref, "done", False):
       time.sleep(10)
-      # Call operations.get with either the operation object or its name
-      try:
-        op_ref = client.operations.get(op_ref)
-      except Exception:
-        op_ref = client.operations.get(getattr(op_ref, "name", op_ref))
+      op_ref = call_with_exponential_backoff(
+        lambda: _get_operation_status(op_ref),
+        description="Gemini video status poll",
+      )
     operation = op_ref
   except Exception as exc:
     import traceback
@@ -82,7 +91,10 @@ def generate_video(prompt: str) -> str:
 
   # Download and save the video file
   try:
-    client.files.download(file=generated_video.video)
+    call_with_exponential_backoff(
+      lambda: client.files.download(file=generated_video.video),
+      description="Gemini video download",
+    )
   except Exception as exc:
     import traceback
     print("Failed to download video file:", exc)

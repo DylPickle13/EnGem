@@ -10,6 +10,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import types
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key, LOW_MODEL as LOW_MODEL
+from api_backoff import call_with_exponential_backoff
 from google import genai
 from google.genai import types
 
@@ -27,17 +28,14 @@ def run_google_search(query: str) -> str:
         tools=[grounding_tool]
     )
 
-    while True:
-        try:
-            response = client.models.generate_content(
-                model=LOW_MODEL,
-                contents=query,
-                config=config,
-            )
-            break
-        except Exception as e:
-            print(f"Error running Google Search: {e}")
-        print("Retrying Google Search...")
+    response = call_with_exponential_backoff(
+        lambda: client.models.generate_content(
+            model=LOW_MODEL,
+            contents=query,
+            config=config,
+        ),
+        description="Gemini Google Search",
+    )
     
     return str(response.candidates[0]) or ""
 

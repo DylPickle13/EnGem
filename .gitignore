@@ -10,5 +10,7 @@ config.py
 /sandbox
 /generated_images
 /generated_videos
+/generated_documents
+/generated_files
 /DylPickle13.github.io
 /fnirs-ai-analysis

@@ -5,15 +5,22 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMAGES_DIR = _REPO_ROOT / "generated_images"
 _VIDEOS_DIR = _REPO_ROOT / "generated_videos"
+_FILES_DIR = _REPO_ROOT / "generated_files"
+_DOCUMENTS_DIR = _REPO_ROOT / "generated_documents"
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+_DOCUMENT_EXTENSIONS = {
+    ".pdf", ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
+    ".html", ".htm", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip",
+}
 
 
 def get_generated_media(max_items: str = "80") -> str:
-    """Return a JSON list of recent generated media files.
+    """Return a JSON list of recent generated output files.
 
     The output is a JSON object with a single key "media" that contains
-    both images and videos, sorted by newest first.
+    images, videos, and generated document/file outputs, sorted by newest first.
     """
     try:
         limit = int(str(max_items).strip())
@@ -34,18 +41,24 @@ def _collect_media_catalog(limit: int = 80) -> list[dict]:
     for file_path in _iter_files(_VIDEOS_DIR, _VIDEO_EXTENSIONS):
         entries.append(_build_entry(file_path, "video"))
 
+    for file_path in _iter_files(_DOCUMENTS_DIR):
+        entries.append(_build_entry(file_path, "document"))
+
+    for file_path in _iter_files(_FILES_DIR):
+        entries.append(_build_entry(file_path, "file"))
+
     entries.sort(key=lambda item: item.get("modified_ts", 0.0), reverse=True)
     return entries[:limit]
 
 
-def _iter_files(folder: Path, valid_suffixes: set[str]):
+def _iter_files(folder: Path, valid_suffixes: set[str] | None = None):
     if not folder.exists() or not folder.is_dir():
         return
 
     for path in folder.iterdir():
         if not path.is_file():
             continue
-        if path.suffix.lower() not in valid_suffixes:
+        if valid_suffixes is not None and path.suffix.lower() not in valid_suffixes:
             continue
         yield path
 

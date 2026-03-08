@@ -1,6 +1,14 @@
 import os
+import sys
 import time
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
+from api_backoff import call_with_exponential_backoff
 from google import genai
 
 
@@ -11,10 +19,13 @@ def deep_research(query: str) -> str:
     client = genai.Client(api_key=get_paid_gemini_api_key())
 
     try:
-        interaction = client.interactions.create(
-            input=query,
-            agent="deep-research-pro-preview-12-2025",
-            background=True,
+        interaction = call_with_exponential_backoff(
+            lambda: client.interactions.create(
+                input=query,
+                agent="deep-research-pro-preview-12-2025",
+                background=True,
+            ),
+            description="Gemini deep research start",
         )
     except Exception as exc:
         return f"Failed to start deep research: {exc}"
@@ -23,7 +34,10 @@ def deep_research(query: str) -> str:
 
     while True:
         try:
-            interaction = client.interactions.get(interaction.id)
+            interaction = call_with_exponential_backoff(
+                lambda: client.interactions.get(interaction.id),
+                description="Gemini deep research poll",
+            )
         except Exception as exc:
             return f"{start_message}\nError polling research status: {exc}"
 
