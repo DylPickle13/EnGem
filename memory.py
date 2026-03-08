@@ -16,7 +16,7 @@ from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 
 import llm
-from config import FLASH_LITE_MODEL as FLASH_LITE_MODEL
+from config import LOW_MODEL as LOW_MODEL
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -170,7 +170,7 @@ def _select_related_memory_ids(topic: str, candidates: list[MemoryItem]) -> set[
     result = llm._run_model_api(
         text=prompt,
         system_instructions=MEMORY_RELATED.read_text(encoding="utf-8"),
-        model=FLASH_LITE_MODEL,
+        model=LOW_MODEL,
         tool_use_allowed=False,
         force_tool=False,
         temperature=0,
@@ -204,7 +204,7 @@ def _select_related_memory_ids(topic: str, candidates: list[MemoryItem]) -> set[
             retry = llm._run_model_api(
                 text=prompt,
                 system_instructions=retry_system,
-                model=FLASH_LITE_MODEL,
+                model=LOW_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=0,

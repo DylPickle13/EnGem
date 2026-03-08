@@ -6,13 +6,13 @@ from google.genai import types
 from google.genai.types import Content, Part
 from playwright.sync_api import Browser, Page, Playwright, sync_playwright
 
-from config import get_paid_gemini_api_key as get_paid_gemini_api_key, FLASH_MODEL as FLASH_MODEL
+from config import get_paid_gemini_api_key as get_paid_gemini_api_key, MEDIUM_MODEL as MEDIUM_MODEL
 
 BROWSER_FILE = Path(__file__).parent / "agent_instructions/browser.md"
 SCREEN_WIDTH = 1440
 SCREEN_HEIGHT = 900
 TURN_LIMIT = 50
-MODEL_NAME = FLASH_MODEL
+MODEL_NAME = MEDIUM_MODEL
 ALT_MODEL_NAME = ""
 DEBUG_SCROLL = False
 DEFAULT_SCROLL_DELTA = 600

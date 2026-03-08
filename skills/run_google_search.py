@@ -9,7 +9,7 @@ if str(_REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(_REPO_ROOT))
 
 import types
-from config import get_paid_gemini_api_key as get_paid_gemini_api_key, FLASH_LITE_MODEL as FLASH_LITE_MODEL
+from config import get_paid_gemini_api_key as get_paid_gemini_api_key, LOW_MODEL as LOW_MODEL
 from google import genai
 from google.genai import types
 
@@ -30,7 +30,7 @@ def run_google_search(query: str) -> str:
     while True:
         try:
             response = client.models.generate_content(
-                model=FLASH_LITE_MODEL,
+                model=LOW_MODEL,
                 contents=query,
                 config=config,
             )

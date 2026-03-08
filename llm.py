@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
-from config import FLASH_LITE_MODEL as FLASH_LITE_MODEL, FLASH_MODEL as FLASH_MODEL, PRO_MODEL as PRO_MODEL
+from config import MINIMAL_MODEL as MINIMAL_MODEL, LOW_MODEL as LOW_MODEL, MEDIUM_MODEL as MEDIUM_MODEL, HIGH_MODEL as HIGH_MODEL
 import history
 import memory as memory
 
@@ -53,9 +53,9 @@ MAX_INPUT_ATTACHMENTS = 10
 SUB_AGENT_INSTRUCTION_PREVIEW_CHARS = 200
 VALID_PLAN_THINKING_LEVELS = {"LOW", "MEDIUM", "HIGH"}
 THINKING_LEVEL_TO_MODEL = {
-    "LOW": FLASH_LITE_MODEL,
-    "MEDIUM": FLASH_MODEL,
-    "HIGH": PRO_MODEL,
+    "LOW": LOW_MODEL,
+    "MEDIUM": MEDIUM_MODEL,
+    "HIGH": HIGH_MODEL,
 }
 THINKING_LEVEL_TO_API_LEVEL = {
     "LOW": "low",
@@ -103,7 +103,7 @@ def generate_response(
 
         intent_response = ""
         try:
-            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, FLASH_LITE_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, LOW_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
         except Exception as e:
             print(f"Error generating intent response: {e}")
 
@@ -130,7 +130,7 @@ def generate_response(
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8") + history_file, FLASH_MODEL, tool_use_allowed=True, force_tool=True, temperature=temperature)
+            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8") + history_file, MEDIUM_MODEL, tool_use_allowed=True, force_tool=True, temperature=temperature)
             history.append_history(role="Manager", text=manager_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating manager response: {e}")
@@ -231,7 +231,7 @@ def generate_response(
             continue
 
         try:
-            exit_string = _run_model_api(history.get_conversation_history(history_file=history_file), REVIEWER_FILE.read_text(encoding="utf-8") + user_message, FLASH_LITE_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+            exit_string = _run_model_api(history.get_conversation_history(history_file=history_file), REVIEWER_FILE.read_text(encoding="utf-8") + user_message, LOW_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
             history.append_history(role="Reviewer", text=exit_string, history_file=history_file)
         except Exception as e:
             print(f"Error generating reviewer response: {e}")
@@ -257,7 +257,7 @@ def generate_response(
             _run_model_api,
             history.get_conversation_history(history_file=history_file),
             TEXTER_FILE.read_text(encoding="utf-8"),
-            FLASH_LITE_MODEL,
+            MINIMAL_MODEL,
             False,
             False,
             default_temperature,
@@ -368,7 +368,7 @@ def _select_media_paths(history_file: str, user_message: str, temperature: float
     selector_response = _run_model_api(
         selector_input,
         MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
-        model=FLASH_LITE_MODEL,
+        model=MINIMAL_MODEL,
         tool_use_allowed=False,
         force_tool=False,
         temperature=temperature,
@@ -502,7 +502,7 @@ def _convert_single_attachment_to_text(attachment: dict[str, bytes | str]) -> st
     while True:
         try:
             response = client.models.generate_content(
-                model=FLASH_LITE_MODEL,
+                model=LOW_MODEL,
                 contents=[
                     types.Content(
                         role="user",
@@ -528,7 +528,7 @@ def _run_memory_extraction_async(extraction_input: str, history_file: str, tempe
             memory_extractor_response = _run_model_api(
                 extraction_input,
                 MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
-                FLASH_LITE_MODEL,
+                MINIMAL_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=temperature,
@@ -553,7 +553,7 @@ def _run_history_summarization_async(history_file: str, temperature: float, pivo
             summary = _run_model_api(
                 prior_history,
                 HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
-                FLASH_LITE_MODEL,
+                LOW_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=temperature,
@@ -671,7 +671,7 @@ def _normalize_api_thinking_level(raw_level: object) -> str:
 
 def _resolve_sub_agent_model_config(agent: dict) -> tuple[str, str]:
     plan_thinking_level = _normalize_plan_thinking_level(agent.get("thinking_level"))
-    model_name = THINKING_LEVEL_TO_MODEL.get(plan_thinking_level, FLASH_MODEL)
+    model_name = THINKING_LEVEL_TO_MODEL.get(plan_thinking_level, MEDIUM_MODEL)
     api_thinking_level = THINKING_LEVEL_TO_API_LEVEL.get(plan_thinking_level, "medium")
     return model_name, api_thinking_level
 
@@ -700,13 +700,19 @@ def _run_model_api(
             mode="ANY", allowed_function_names=["run_python"]
         )
     )
+
+    if model == MINIMAL_MODEL and "2.5" in MINIMAL_MODEL:
+        thinking_config = types.ThinkingConfig(thinking_budget=16384)
+    else:
+        thinking_config = types.ThinkingConfig(thinking_level=_normalize_api_thinking_level(thinking_level))
+
     config = types.GenerateContentConfig(
         system_instruction=system_instructions,
         tool_config=tool_config if force_tool else None,
         tools=[agent_tools] if tool_use_allowed else [],
         temperature=temperature,
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=force_tool),
-        thinking_config=types.ThinkingConfig(thinking_level=_normalize_api_thinking_level(thinking_level))
+        thinking_config=thinking_config
     )
 
     function_output = ""
