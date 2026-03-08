@@ -51,13 +51,16 @@ SUPPORTED_MEDIA_EXTENSIONS = {
 }
 MAX_INPUT_ATTACHMENTS = 10
 SUB_AGENT_INSTRUCTION_PREVIEW_CHARS = 200
-VALID_PLAN_THINKING_LEVELS = {"LOW", "MEDIUM", "HIGH"}
+REVIEWER_TASK_NAME = "Reviewer"
+VALID_PLAN_THINKING_LEVELS = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
 THINKING_LEVEL_TO_MODEL = {
+    "MINIMAL": MINIMAL_MODEL,
     "LOW": LOW_MODEL,
     "MEDIUM": MEDIUM_MODEL,
     "HIGH": HIGH_MODEL,
 }
 THINKING_LEVEL_TO_API_LEVEL = {
+    "MINIMAL": "low",
     "LOW": "low",
     "MEDIUM": "medium",
     "HIGH": "high",
@@ -116,6 +119,7 @@ def generate_response(
             return LLMResponse(text=intent_response, media_paths=[])
 
     while True:
+        exit_string = ""
         # Execution order file path
         EXECUTION_ORDER_FILE = Path(__file__).parent / f"sub-agents/execution_order_{history_file}.json"
 
@@ -151,6 +155,9 @@ def generate_response(
         if not execution_plan:
             print("No valid execution plan found in execution order file.")
             continue
+        if not _has_final_reviewer_agent(execution_plan):
+            print("Execution plan is missing a final serial Reviewer agent.")
+            continue
 
         _dispatch_execution_plan_preview_async(
             execution_plan,
@@ -160,9 +167,8 @@ def generate_response(
             attempt_number > 1,
         )
 
-        cannot_proceed = False
         sub_agent_system_instructions = SUB_AGENT_FILE.read_text(encoding="utf-8")
-        for stage in execution_plan:
+        for stage_index, stage in enumerate(execution_plan):
             mode = stage["mode"]
             agents = stage["sub_agents"]
 
@@ -197,44 +203,33 @@ def generate_response(
                             print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
 
                         history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
-                        if sub_agent_response.strip() == "<CANNOT_PROCEED>":
-                            cannot_proceed = True
-
-                if cannot_proceed:
-                    break
 
             else:
-                for agent in agents:
+                for agent_index, agent in enumerate(agents):
                     sub_agent_response = ""
                     try:
-                        model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
-                        sub_agent_response = _run_model_api(
-                            history.get_conversation_history(history_file=history_file) + "\n\n" + agent["instruction"],
-                            system_instructions=sub_agent_system_instructions,
-                            model=model_name,
-                            tool_use_allowed=True,
-                            force_tool=False,
-                            temperature=temperature,
-                            thinking_level=api_thinking_level,
-                        )
-                        history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
-                        if sub_agent_response.strip() == "<CANNOT_PROCEED>":
-                            cannot_proceed = True
-                            break
+                        if _is_final_execution_agent(execution_plan, stage_index, agent_index):
+                            sub_agent_response = _run_final_reviewer(history_file, user_message, default_temperature)
+                            exit_string = sub_agent_response
+                            history.append_history(role=REVIEWER_TASK_NAME, text=sub_agent_response, history_file=history_file)
+                        else:
+                            model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
+                            sub_agent_response = _run_model_api(
+                                history.get_conversation_history(history_file=history_file) + "\n\n" + agent["instruction"],
+                                system_instructions=sub_agent_system_instructions,
+                                model=model_name,
+                                tool_use_allowed=True,
+                                force_tool=False,
+                                temperature=temperature,
+                                thinking_level=api_thinking_level,
+                            )
+                            history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
                     except Exception as e:
                         print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
 
-                if cannot_proceed:
-                    break
-
-        if cannot_proceed:
+        if not exit_string:
+            print("Final Reviewer agent did not produce an exit string.")
             continue
-
-        try:
-            exit_string = _run_model_api(history.get_conversation_history(history_file=history_file), REVIEWER_FILE.read_text(encoding="utf-8") + user_message, LOW_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
-            history.append_history(role="Reviewer", text=exit_string, history_file=history_file)
-        except Exception as e:
-            print(f"Error generating reviewer response: {e}")
         if exit_string == "<yes>":
             break
         else:
@@ -598,7 +593,8 @@ def _normalize_execution_plan(execution_order_dict: dict) -> list[dict]:
     Required format:
     - {"execution_plan": [{"mode": "parallel|serial", "sub_agents": [...]}, ...]}
     - Each stage must explicitly include "mode" as "parallel" or "serial".
-    - Each sub-agent should include "thinking_level" (LOW/MEDIUM/HIGH).
+    - The final stage must be serial and end with a Reviewer sub-agent.
+    - Each sub-agent should include "thinking_level" (MINIMAL/LOW/MEDIUM/HIGH).
     - Missing or invalid thinking levels are normalized to MEDIUM for backward compatibility.
     """
     normalized_plan: list[dict] = []
@@ -651,6 +647,47 @@ def _get_skill(function_name: str, function_args: dict) -> str:
                 result = attr(function_args[next(iter(function_args))])
                 function_output += result
     return function_output
+
+
+def _has_final_reviewer_agent(execution_plan: list[dict]) -> bool:
+    if not execution_plan:
+        return False
+
+    final_stage = execution_plan[-1]
+    if final_stage.get("mode") != "serial":
+        return False
+
+    final_agents = final_stage.get("sub_agents")
+    if not isinstance(final_agents, list) or len(final_agents) != 1:
+        return False
+
+    final_agent = final_agents[0]
+    return isinstance(final_agent, dict) and final_agent.get("task_name") == REVIEWER_TASK_NAME
+
+
+def _is_final_execution_agent(execution_plan: list[dict], stage_index: int, agent_index: int) -> bool:
+    if not execution_plan:
+        return False
+
+    if stage_index != len(execution_plan) - 1:
+        return False
+
+    final_stage_agents = execution_plan[-1].get("sub_agents", [])
+    if not isinstance(final_stage_agents, list):
+        return False
+
+    return agent_index == len(final_stage_agents) - 1
+
+
+def _run_final_reviewer(history_file: str, user_message: str, temperature: float) -> str:
+    return _run_model_api(
+        history.get_conversation_history(history_file=history_file),
+        REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
+        LOW_MODEL,
+        tool_use_allowed=False,
+        force_tool=False,
+        temperature=temperature,
+    )
 
 
 def _normalize_plan_thinking_level(raw_level: object) -> str:

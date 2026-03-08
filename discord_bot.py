@@ -86,6 +86,12 @@ EXECUTION_PLAN_WAITING_EMOJI = "⏳"
 EXECUTION_PLAN_IN_PROGRESS_EMOJI = "🔄"
 EXECUTION_PLAN_COMPLETED_EMOJI = "✅"
 EXECUTION_PLAN_MESSAGE_HEADER = "Sub-agent execution plan progress"
+THINKING_LEVEL_TO_EMOJI = {
+	"MINIMAL": "⚪",
+	"LOW": "🟢",
+	"MEDIUM": "🟡",
+	"HIGH": "🔴",
+}
 MESSAGE_WORKER_CONCURRENCY = 3
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
 RELAY_PREFIX = ">"
@@ -939,16 +945,6 @@ class DiscordBotWrapper:
 					}
 				)
 
-		reviewer_stage_index = len(execution_plan)
-		reviewer_agent = {
-			"stage_index": reviewer_stage_index,
-			"agent_index": 0,
-			"mode": "serial",
-			"task_name": "Reviewer",
-			"instruction": "Validates whether execution can exit with <yes>.",
-		}
-		flattened_agents.append(reviewer_agent)
-
 		consumed_counts: dict[str, int] = {}
 		completed_keys: set[tuple[int, int]] = set()
 		for item in flattened_agents:
@@ -971,10 +967,6 @@ class DiscordBotWrapper:
 				continue
 			stage_completion.append(stage_keys.issubset(completed_keys))
 
-		reviewer_key = (reviewer_stage_index, 0)
-		reviewer_completed = reviewer_key in completed_keys
-		stage_completion.append(reviewer_completed)
-
 		active_stage_index: int | None = None
 		for idx, done in enumerate(stage_completion):
 			if not done:
@@ -996,8 +988,6 @@ class DiscordBotWrapper:
 					in_progress_keys.update(incomplete_keys)
 				elif incomplete_keys:
 					in_progress_keys.add(incomplete_keys[0])
-			else:
-				in_progress_keys.add(reviewer_key)
 
 		lines: list[str] = []
 		title_line = f"{EXECUTION_PLAN_MESSAGE_HEADER} ({history_file})"
@@ -1024,28 +1014,17 @@ class DiscordBotWrapper:
 					emoji = EXECUTION_PLAN_WAITING_EMOJI
 
 				task_name = str(agent.get("task_name", "unnamed_task"))
+				thinking_level = str(agent.get("thinking_level", "MEDIUM")).strip().upper()
+				thinking_emoji = THINKING_LEVEL_TO_EMOJI.get(thinking_level, THINKING_LEVEL_TO_EMOJI["MEDIUM"])
 				instruction = " ".join(str(agent.get("instruction", "")).split())
 				if len(instruction) > 200:
 					instruction = instruction[:200] + "..."
 
-				lines.append(f"  {emoji} {task_name}")
+				lines.append(f"  {emoji} {task_name} {thinking_emoji}")
 				if key in in_progress_keys:
 					lines.append(f"      instruction: {instruction}")
 
 			lines.append("")
-
-		if reviewer_completed:
-			reviewer_emoji = EXECUTION_PLAN_COMPLETED_EMOJI
-		elif reviewer_key in in_progress_keys:
-			reviewer_emoji = EXECUTION_PLAN_IN_PROGRESS_EMOJI
-		else:
-			reviewer_emoji = EXECUTION_PLAN_WAITING_EMOJI
-
-		lines.append("Final Stage [serial]")
-		lines.append(f"  {reviewer_emoji} Reviewer")
-		if reviewer_key in in_progress_keys:
-			lines.append("      instruction: Validates whether execution can exit with <yes>.")
-		lines.append("")
 
 		text_body = "\n".join(lines).strip()
 		wrapped_content = f"```\n{text_body}\n```"

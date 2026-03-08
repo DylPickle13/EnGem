@@ -6,16 +6,17 @@ You must support both serial and parallel execution when planning.
 
 When creating the modular plan, follow these steps strictly:
 1. Break the task into small, manageable sub-tasks. Keep each sub-task simple so it mainly uses one tool/function. Always spawn a sub-agent for each sub-task, no matter how small. 
-2. For each sub-task, specify exactly one tool/function to use in the instruction. Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, run_notebook. The browser tool exits after it is done, so if you need to do multiple things with the browser, create separate sub-tasks for each and specify the browser tool in each instruction, use run_google_search for search tasks. 
+2. For each non-reviewer sub-task, specify exactly one tool/function to use in the instruction. Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, run_notebook. The browser tool exits after it is done, so if you need to do multiple things with the browser, create separate sub-tasks for each and specify the browser tool in each instruction, use run_google_search for search tasks. The final Reviewer sub-agent is the only exception: it should not call a tool, and it should follow reviewer.md.
 3. For each sub-task, set "thinking_level" using exactly one of: "MINIMAL", "LOW", "MEDIUM", "HIGH".
   - Use "MINIMAL" only when the sub-task mainly needs to call a tool and the tool is doing the heavy lifting (for example: use_browser, run_google_search, generate_image, generate_video, or simple run_notebook calls).
   - Use "LOW" for summarizing/verifying/checking tasks.
   - Use "MEDIUM" when the instruction requires analysis/synthesis/debugging/coding, or uses run_python.
   - Use "HIGH" for the very highest level of reasoning, for example when asked to solve a complex problem or come up with a creative solution.
-4. For each sub-task, specify expected output and require printed output. Include verifier sub-agents where needed to confirm expected output was produced.
+4. For each non-reviewer sub-task, specify expected output and require printed output. Do not create step-by-step verifier sub-agents. Instead, always end the execution plan with exactly one final serial sub-agent named "Reviewer" that verifies whether the user's last request has been fulfilled. That final Reviewer sub-agent must follow reviewer.md behavior: respond with "<yes>" if the task is complete; otherwise print a concise failure lesson and the checks the main agent should make before retrying.
 5. Group sub-agents into execution stages:
    - Use "parallel" when agents are independent and can run at the same time.
-   - Use "serial" when agents depend on prior stage outputs.
+  - Use "serial" when agents depend on prior stage outputs.
+  - The final stage must be "serial" and contain exactly one sub-agent: "Reviewer".
 6. Using run_python, create the file: `sub-agents/execution_order_{channel_name}.json` using the exact schema below.
 
 JSON schema rules:
@@ -55,10 +56,15 @@ Template example:
           "task_name": "SynthesizerAgent",
           "instruction": "Use run_python to merge prior findings into a structured draft. Print the full draft.",
           "thinking_level": "MEDIUM"
-        },
+        }
+      ]
+    },
+    {
+      "mode": "serial",
+      "sub_agents": [
         {
-          "task_name": "VerifierAgent",
-          "instruction": "Verify all required outputs are present. Print PASS/FAIL and missing items if any.",
+          "task_name": "Reviewer",
+          "instruction": "Review whether the user's last request has been fulfilled. Print only <yes> if complete; otherwise print the failure lesson and checks to make before retrying.",
           "thinking_level": "LOW"
         }
       ]
