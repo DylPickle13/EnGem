@@ -54,7 +54,7 @@ python discord_bot.py
 
 - Conversation histories: `memory/channel_history/`.
 - Vector DB / embeddings: [memory/vector_db/chroma.sqlite3](memory/vector_db/chroma.sqlite3).
-- Generated media: `generated_images/` and `generated_videos/`.
+- Generated outputs: `generated_files/`.
 
 **Useful Commands**
 

@@ -7,7 +7,8 @@ from typing import Awaitable, Callable, TypeVar
 
 T = TypeVar("T")
 
-DEFAULT_MAX_ATTEMPTS = 6
+# If DEFAULT_MAX_ATTEMPTS is None, the backoff will retry indefinitely
+DEFAULT_MAX_ATTEMPTS: int | None = None
 DEFAULT_INITIAL_DELAY_SECONDS = 1.0
 DEFAULT_MAX_DELAY_SECONDS = 30.0
 DEFAULT_BACKOFF_MULTIPLIER = 2.0
@@ -92,20 +93,25 @@ def call_with_exponential_backoff(
     operation: Callable[[], T],
     *,
     description: str = "Gemini API call",
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_attempts: int | None = DEFAULT_MAX_ATTEMPTS,
 ) -> T:
     attempt_number = 1
     while True:
         try:
             return operation()
         except Exception as exc:
-            should_retry = attempt_number < max_attempts and _is_retryable_exception(exc)
+            if max_attempts is None:
+                should_retry = _is_retryable_exception(exc)
+            else:
+                should_retry = attempt_number < max_attempts and _is_retryable_exception(exc)
+
             if not should_retry:
                 raise
 
             delay_seconds = _compute_delay_seconds(attempt_number)
+            max_display = f"/{max_attempts}" if max_attempts is not None else ""
             print(
-                f"{description} failed on attempt {attempt_number}/{max_attempts}: {exc}. "
+                f"{description} failed on attempt {attempt_number}{max_display}: {exc}. "
                 f"Retrying in {delay_seconds:.1f}s..."
             )
             time.sleep(delay_seconds)
@@ -116,20 +122,25 @@ async def async_call_with_exponential_backoff(
     operation: Callable[[], Awaitable[T]],
     *,
     description: str = "Gemini API call",
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_attempts: int | None = DEFAULT_MAX_ATTEMPTS,
 ) -> T:
     attempt_number = 1
     while True:
         try:
             return await operation()
         except Exception as exc:
-            should_retry = attempt_number < max_attempts and _is_retryable_exception(exc)
+            if max_attempts is None:
+                should_retry = _is_retryable_exception(exc)
+            else:
+                should_retry = attempt_number < max_attempts and _is_retryable_exception(exc)
+
             if not should_retry:
                 raise
 
             delay_seconds = _compute_delay_seconds(attempt_number)
+            max_display = f"/{max_attempts}" if max_attempts is not None else ""
             print(
-                f"{description} failed on attempt {attempt_number}/{max_attempts}: {exc}. "
+                f"{description} failed on attempt {attempt_number}{max_display}: {exc}. "
                 f"Retrying in {delay_seconds:.1f}s..."
             )
             await asyncio.sleep(delay_seconds)

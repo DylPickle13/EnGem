@@ -44,19 +44,22 @@ HISTORY_SUMMARIZER_SYSTEM = Path(__file__).parent / "agent_instructions/history_
 # Image Extractor file located alongside this module
 IMAGE_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/image_extractor.md"
 
-GENERATED_IMAGES_DIR = (Path(__file__).parent / "generated_images").resolve()
-GENERATED_VIDEOS_DIR = (Path(__file__).parent / "generated_videos").resolve()
 GENERATED_FILES_DIR = (Path(__file__).parent / "generated_files").resolve()
-GENERATED_DOCUMENTS_DIR = (Path(__file__).parent / "generated_documents").resolve()
+# Keep legacy folders readable for previously generated assets, but route new
+# outputs into generated_files/.
+LEGACY_GENERATED_IMAGES_DIR = (Path(__file__).parent / "generated_images").resolve()
+LEGACY_GENERATED_VIDEOS_DIR = (Path(__file__).parent / "generated_videos").resolve()
+LEGACY_GENERATED_DOCUMENTS_DIR = (Path(__file__).parent / "generated_documents").resolve()
 RESTRICTED_OUTPUT_DIRECTORIES = (
-    GENERATED_IMAGES_DIR,
-    GENERATED_VIDEOS_DIR,
+    LEGACY_GENERATED_IMAGES_DIR,
+    LEGACY_GENERATED_VIDEOS_DIR,
+    LEGACY_GENERATED_DOCUMENTS_DIR,
 )
 ALLOWED_OUTPUT_DIRECTORIES = (
-    GENERATED_IMAGES_DIR,
-    GENERATED_VIDEOS_DIR,
     GENERATED_FILES_DIR,
-    GENERATED_DOCUMENTS_DIR,
+    LEGACY_GENERATED_IMAGES_DIR,
+    LEGACY_GENERATED_VIDEOS_DIR,
+    LEGACY_GENERATED_DOCUMENTS_DIR,
 )
 SUPPORTED_OUTPUT_FILE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",

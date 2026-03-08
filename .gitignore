@@ -8,9 +8,6 @@ config.py
 /agent_instructions/cron_jobs
 /agent_instructions/heartbeat_jobs
 /sandbox
-/generated_images
-/generated_videos
-/generated_documents
 /generated_files
 /DylPickle13.github.io
 /fnirs-ai-analysis

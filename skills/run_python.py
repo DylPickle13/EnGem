@@ -9,16 +9,13 @@ from pathlib import Path
 # Maximum number of characters to keep from tool stdout
 MAX_OUTPUT_CHARS = 100_000
 REPO_ROOT = Path(__file__).resolve().parent.parent
-GENERATED_IMAGES_DIR = REPO_ROOT / "generated_images"
-GENERATED_VIDEOS_DIR = REPO_ROOT / "generated_videos"
 GENERATED_FILES_DIR = REPO_ROOT / "generated_files"
-GENERATED_DOCUMENTS_DIR = REPO_ROOT / "generated_documents"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
 DOCUMENT_EXTENSIONS = {
     ".pdf", ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
     ".html", ".htm", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".zip",
+    ".zip", ".tex",
 }
 TRACKED_OUTPUT_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | DOCUMENT_EXTENSIONS
 
@@ -32,23 +29,17 @@ def _snapshot_repo_root_files() -> set[Path]:
 
 
 def _ensure_generated_output_directories() -> None:
-    for directory in (
-        GENERATED_IMAGES_DIR,
-        GENERATED_VIDEOS_DIR,
-        GENERATED_FILES_DIR,
-        GENERATED_DOCUMENTS_DIR,
-    ):
-        directory.mkdir(parents=True, exist_ok=True)
+    GENERATED_FILES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _get_output_directory(path: Path) -> Path | None:
     suffix = path.suffix.lower()
     if suffix in IMAGE_EXTENSIONS:
-        return GENERATED_IMAGES_DIR
+        return GENERATED_FILES_DIR
     if suffix in VIDEO_EXTENSIONS:
-        return GENERATED_VIDEOS_DIR
+        return GENERATED_FILES_DIR
     if suffix in DOCUMENT_EXTENSIONS:
-        return GENERATED_DOCUMENTS_DIR
+        return GENERATED_FILES_DIR
     return None
 
 

@@ -21,7 +21,7 @@ from google.genai import types
 def generate_image(prompt: str) -> str:
     """
     Generate an image from `prompt`, save it under the repository root
-    in a `generated_images/` folder, and return the filesystem path to
+    in the `generated_files/` folder, and return the filesystem path to
     the saved image. Returns an empty string on failure. 
     Can only create one image at a time. 
     """
@@ -44,7 +44,7 @@ def generate_image(prompt: str) -> str:
         return ""
 
     repo_root = Path(__file__).resolve().parent.parent
-    out_dir = repo_root / "generated_images"
+    out_dir = repo_root / "generated_files"
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except Exception:

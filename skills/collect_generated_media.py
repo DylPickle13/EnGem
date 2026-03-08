@@ -3,16 +3,18 @@ from pathlib import Path
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_IMAGES_DIR = _REPO_ROOT / "generated_images"
-_VIDEOS_DIR = _REPO_ROOT / "generated_videos"
-_FILES_DIR = _REPO_ROOT / "generated_files"
-_DOCUMENTS_DIR = _REPO_ROOT / "generated_documents"
+_OUTPUTS_DIR = _REPO_ROOT / "generated_files"
+_LEGACY_OUTPUT_DIRS = (
+    _REPO_ROOT / "generated_images",
+    _REPO_ROOT / "generated_videos",
+    _REPO_ROOT / "generated_documents",
+)
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
 _DOCUMENT_EXTENSIONS = {
     ".pdf", ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
     ".html", ".htm", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".zip",
+    ".zip", ".tex",
 }
 
 
@@ -35,32 +37,41 @@ def get_generated_media(max_items: str = "80") -> str:
 def _collect_media_catalog(limit: int = 80) -> list[dict]:
     entries: list[dict] = []
 
-    for file_path in _iter_files(_IMAGES_DIR, _IMAGE_EXTENSIONS):
-        entries.append(_build_entry(file_path, "image"))
-
-    for file_path in _iter_files(_VIDEOS_DIR, _VIDEO_EXTENSIONS):
-        entries.append(_build_entry(file_path, "video"))
-
-    for file_path in _iter_files(_DOCUMENTS_DIR):
-        entries.append(_build_entry(file_path, "document"))
-
-    for file_path in _iter_files(_FILES_DIR):
-        entries.append(_build_entry(file_path, "file"))
+    for file_path in _iter_files():
+        entries.append(_build_entry(file_path, _infer_media_type(file_path)))
 
     entries.sort(key=lambda item: item.get("modified_ts", 0.0), reverse=True)
     return entries[:limit]
 
 
-def _iter_files(folder: Path, valid_suffixes: set[str] | None = None):
-    if not folder.exists() or not folder.is_dir():
-        return
+def _iter_files():
+    seen_paths: set[Path] = set()
 
-    for path in folder.iterdir():
-        if not path.is_file():
+    for folder in (_OUTPUTS_DIR, *_LEGACY_OUTPUT_DIRS):
+        if not folder.exists() or not folder.is_dir():
             continue
-        if valid_suffixes is not None and path.suffix.lower() not in valid_suffixes:
-            continue
-        yield path
+
+        for path in folder.iterdir():
+            if not path.is_file():
+                continue
+
+            resolved_path = path.resolve()
+            if resolved_path in seen_paths:
+                continue
+
+            seen_paths.add(resolved_path)
+            yield path
+
+
+def _infer_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in _IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in _VIDEO_EXTENSIONS:
+        return "video"
+    if suffix in _DOCUMENT_EXTENSIONS:
+        return "document"
+    return "file"
 
 
 def _build_entry(path: Path, media_type: str) -> dict:

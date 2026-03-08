@@ -19,7 +19,7 @@ from google.genai import types
 def generate_video(prompt: str) -> str:
   """
   Generate a short video from `prompt`, save it under the repository root
-  in a `generated_videos/` folder, and return the filesystem path to the
+  in the `generated_files/` folder, and return the filesystem path to the
   saved video file. Returns an empty string on failure.
   """
   client = genai.Client(api_key=get_paid_gemini_api_key())
@@ -83,7 +83,7 @@ def generate_video(prompt: str) -> str:
 
   # Ensure output directory exists
   repo_root = Path(__file__).resolve().parent.parent
-  out_dir = repo_root / "generated_videos"
+  out_dir = repo_root / "generated_files"
   try:
     out_dir.mkdir(parents=True, exist_ok=True)
   except Exception:
