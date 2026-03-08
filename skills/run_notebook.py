@@ -6,8 +6,6 @@ import nbformat
 import papermill as pm
 from pathlib import Path
 from typing import Optional
-import subprocess
-import shutil
 
 
 def _resolve_notebook_path(notebook_path: str) -> Path:
@@ -33,92 +31,7 @@ def _resolve_notebook_path(notebook_path: str) -> Path:
             return match.resolve()
 
     return (Path.cwd() / notebook_path).resolve()
-
-
-def _collect_usage_metrics() -> dict:
-    """Collect simple CPU and GPU usage metrics.
-
-    - `cpu_percent`: system CPU utilization percentage (float) or None.
-    - `gpus`: list of GPU dicts or None. Each GPU dict may contain:
-        index, name, utilization_percent, memory_total_MB, memory_used_MB
-    """
-    metrics: dict = {"cpu_percent": None, "gpus": None}
-
-    # CPU: try psutil if available
-    try:
-        import psutil
-
-        try:
-            metrics["cpu_percent"] = float(psutil.cpu_percent(interval=0.1))
-        except Exception:
-            metrics["cpu_percent"] = None
-    except Exception:
-        metrics["cpu_percent"] = None
-
-    gpus_list: list = []
-
-    # Try nvidia-smi first (common on systems with NVIDIA GPUs)
-    try:
-        if shutil.which("nvidia-smi"):
-            out = subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=index,name,utilization.gpu,memory.total,memory.used",
-                    "--format=csv,noheader,nounits",
-                ],
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-            for line in out.strip().splitlines():
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 5:
-                    try:
-                        idx = int(parts[0])
-                        name = parts[1]
-                        util = float(parts[2])
-                        mem_tot = int(parts[3])
-                        mem_used = int(parts[4])
-                        gpus_list.append(
-                            {
-                                "index": idx,
-                                "name": name,
-                                "utilization_percent": util,
-                                "memory_total_MB": mem_tot,
-                                "memory_used_MB": mem_used,
-                            }
-                        )
-                    except Exception:
-                        continue
-    except Exception:
-        pass
-
-    # Fallback to GPUtil if available (import dynamically to avoid static linter warnings)
-    if not gpus_list:
-        try:
-            import importlib
-
-            GPUtil = importlib.import_module("GPUtil")
-
-            for g in GPUtil.getGPUs():
-                try:
-                    gpus_list.append(
-                        {
-                            "id": int(g.id),
-                            "name": g.name,
-                            "load_percent": float(g.load * 100),
-                            "memory_total_MB": int(g.memoryTotal),
-                            "memory_used_MB": int(g.memoryUsed),
-                        }
-                    )
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-    metrics["gpus"] = gpus_list if gpus_list else None
-    return metrics
-
+    
 
 def _base_dir(nb_path: Optional[Path] = None) -> str:
     """
@@ -166,7 +79,8 @@ def run_notebook(notebook_path: str) -> str:
 
     params = {}
     params["results_dir"] = output_dir
-    timeout = 600
+    # Disable execution timeout by passing None
+    timeout = None
 
     start_time = time.time()
     success = True
@@ -259,13 +173,7 @@ def run_notebook(notebook_path: str) -> str:
             summary["success"] = False
             summary["error"] = error_message
 
-    # Collect CPU/GPU usage metrics and attach before writing summary
-    try:
-        usage_metrics = _collect_usage_metrics()
-    except Exception:
-        usage_metrics = {"cpu_percent": None, "gpus": None}
-    summary["usage_metrics"] = usage_metrics
-
+    
     summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -280,7 +188,5 @@ def run_notebook(notebook_path: str) -> str:
         "image_paths": summary.get("image_paths", [])
     }
 
-    # Include usage metrics in the top-level result
-    result["usage_metrics"] = summary.get("usage_metrics")
-
+    
     return json.dumps(result, indent=2)

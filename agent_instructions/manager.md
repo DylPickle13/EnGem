@@ -11,7 +11,7 @@ When creating the modular plan, follow these steps strictly:
   - Use "MINIMAL" only when the sub-task mainly needs to call a tool and the tool is doing the heavy lifting (for example: use_browser, run_google_search, generate_image, generate_video, or simple run_notebook calls).
   - Use "LOW" for summarizing/verifying/checking tasks.
   - Use "MEDIUM" when the instruction requires analysis/synthesis/debugging/coding, or uses run_python.
-  - Use "HIGH" for the very highest level of reasoning, for example when asked to solve a complex problem or come up with a creative solution.
+  - Use "HIGH" for the very highest level of reasoning, for example when asked to solve a complex problem or come up with a creative solution. This should be very rare. 
 4. For each non-reviewer sub-task, specify expected output and require printed output. Do not create step-by-step verifier sub-agents. Instead, always end the execution plan with exactly one final serial sub-agent named "Reviewer" that verifies whether the user's last request has been fulfilled. That final Reviewer sub-agent must follow reviewer.md behavior: respond with "<yes>" if the task is complete; otherwise print a concise failure lesson and the checks the main agent should make before retrying.
 5. Group sub-agents into execution stages:
    - Use "parallel" when agents are independent and can run at the same time.
