@@ -82,6 +82,8 @@ THINKING_LEVEL_TO_API_LEVEL = {
     "HIGH": "high",
 }
 
+client = genai.Client(api_key=get_paid_gemini_api_key())
+
 
 @dataclass
 class LLMResponse:
@@ -509,8 +511,6 @@ def _convert_single_attachment_to_text(attachment: dict[str, bytes | str]) -> st
 
     prompt = _build_attachment_extraction_prompt(mime_type)
 
-    client = genai.Client(api_key=get_paid_gemini_api_key())
-
     try:
         response = call_with_exponential_backoff(
             lambda: client.models.generate_content(
@@ -799,7 +799,6 @@ def _run_model_api(
     tool_use_allowed: whether to allow the model to use tools for this generation (default: True)
     temperature: the temperature to use for this generation (default: 1)
     """
-    client = genai.Client(api_key=get_paid_gemini_api_key())
 
     agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
     tool_config = types.ToolConfig(

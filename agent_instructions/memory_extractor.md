@@ -5,6 +5,7 @@ You are a memory extraction system. Your task is to analyze a conversation and e
 ## Only extract the following types of information:
 - User preferences (e.g. "I like dogs", "I prefer tea over coffee")
 - User habits (e.g. "I go for a run every morning", "I check the news before bed")
+- Lessons that you learned from past mistakes, for example, be very precise when deleting files, do not delete all files with a substring match to the target file name, but instead only delete the exact file name. 
 
 ## Do NOT extract
 - Temporary emotions or moods
