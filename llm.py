@@ -44,22 +44,19 @@ HISTORY_SUMMARIZER_SYSTEM = Path(__file__).parent / "agent_instructions/history_
 # Image Extractor file located alongside this module
 IMAGE_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/image_extractor.md"
 
+GENERATED_IMAGES_DIR = (Path(__file__).parent / "generated_images").resolve()
+GENERATED_VIDEOS_DIR = (Path(__file__).parent / "generated_videos").resolve()
 GENERATED_FILES_DIR = (Path(__file__).parent / "generated_files").resolve()
-# Keep legacy folders readable for previously generated assets, but route new
-# outputs into generated_files/.
-LEGACY_GENERATED_IMAGES_DIR = (Path(__file__).parent / "generated_images").resolve()
-LEGACY_GENERATED_VIDEOS_DIR = (Path(__file__).parent / "generated_videos").resolve()
-LEGACY_GENERATED_DOCUMENTS_DIR = (Path(__file__).parent / "generated_documents").resolve()
+GENERATED_DOCUMENTS_DIR = (Path(__file__).parent / "generated_documents").resolve()
 RESTRICTED_OUTPUT_DIRECTORIES = (
-    LEGACY_GENERATED_IMAGES_DIR,
-    LEGACY_GENERATED_VIDEOS_DIR,
-    LEGACY_GENERATED_DOCUMENTS_DIR,
+    GENERATED_IMAGES_DIR,
+    GENERATED_VIDEOS_DIR,
 )
 ALLOWED_OUTPUT_DIRECTORIES = (
+    GENERATED_IMAGES_DIR,
+    GENERATED_VIDEOS_DIR,
     GENERATED_FILES_DIR,
-    LEGACY_GENERATED_IMAGES_DIR,
-    LEGACY_GENERATED_VIDEOS_DIR,
-    LEGACY_GENERATED_DOCUMENTS_DIR,
+    GENERATED_DOCUMENTS_DIR,
 )
 SUPPORTED_OUTPUT_FILE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
@@ -125,7 +122,7 @@ def generate_response(
 
         intent_response = ""
         try:
-            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, LOW_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature)
+            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, LOW_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature, thinking_level="low")
         except Exception as e:
             print(f"Error generating intent response: {e}")
 
@@ -153,7 +150,7 @@ def generate_response(
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8") + history_file, MEDIUM_MODEL, tool_use_allowed=True, force_tool=True, temperature=temperature)
+            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8") + history_file, MEDIUM_MODEL, tool_use_allowed=True, force_tool=True, temperature=temperature, thinking_level="high")
             history.append_history(role="Manager", text=manager_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating manager response: {e}")
@@ -275,6 +272,7 @@ def generate_response(
             False,
             False,
             default_temperature,
+            thinking_level="low",
         )
         media_future = executor.submit(
             _select_media_paths,
@@ -386,6 +384,7 @@ def _select_media_paths(history_file: str, user_message: str, temperature: float
         tool_use_allowed=False,
         force_tool=False,
         temperature=temperature,
+        thinking_level="low",
     )
     return _parse_selected_media_paths(selector_response)
 
@@ -596,6 +595,7 @@ def _run_memory_extraction_async(extraction_input: str, history_file: str, tempe
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=temperature,
+                thinking_level="low"
             )
             cleaned_response = memory_extractor_response.strip()
             if cleaned_response and cleaned_response != "<NO_MEMORY>":
@@ -621,6 +621,7 @@ def _run_history_summarization_async(history_file: str, temperature: float, pivo
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=temperature,
+                thinking_level="low",
             )
             cleaned_summary = (summary or "").strip()
             if not cleaned_summary:

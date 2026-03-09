@@ -208,6 +208,7 @@ def _select_related_memory_ids(topic: str, candidates: list[MemoryItem]) -> set[
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=0,
+                thinking_level="low"
             )
             retry_raw = (retry or "").strip()
             parsed = _try_parse(retry_raw)
