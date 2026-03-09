@@ -11,6 +11,7 @@ from typing import Callable
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
 from config import MINIMAL_MODEL as MINIMAL_MODEL, LOW_MODEL as LOW_MODEL, MEDIUM_MODEL as MEDIUM_MODEL, HIGH_MODEL as HIGH_MODEL
 from api_backoff import call_with_exponential_backoff
+from history_cache import CachedContentProfile, HistoryContextCache, compose_uncached_history_prompt, create_cached_content_profile, create_history_context_cache, resolve_history_cached_prompt
 import history
 import memory as memory
 
@@ -117,23 +118,62 @@ def generate_response(
         else:
             user_message = f"Attachment text:\n{attachment_text}"
     history.append_history(role="user", text=user_message, history_file=history_file)
+    active_history_cache = create_history_context_cache(
+        history_file=history_file,
+        history_text=history.get_conversation_history(history_file=history_file),
+        client=client,
+        backoff_call=call_with_exponential_backoff,
+    )
 
     if not job:
-        relevant_memories = memory.get_default_store().search_memories(history.get_conversation_history(history_file=history_file), limit=5)
+        current_history_text = history.get_conversation_history(history_file=history_file)
+        relevant_memories = memory.get_default_store().search_memories(current_history_text, limit=5)
         relevant_memories_text = "\n\n".join([f"Memory: {memory.text}\nMetadata: {json.dumps(memory.metadata)}" for memory in relevant_memories])
 
         intent_response = ""
         try:
-            intent_response = _run_model_api(history.get_conversation_history(history_file=history_file), INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text, LOW_MODEL, tool_use_allowed=False, force_tool=False, temperature=default_temperature, thinking_level="low")
+            intent_response = _run_model_api(
+                text="Classify the latest user request using the conversation context.",
+                system_instructions=INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text,
+                model=LOW_MODEL,
+                tool_use_allowed=False,
+                force_tool=False,
+                temperature=default_temperature,
+                thinking_level="low",
+                history_cache=active_history_cache,
+                current_history_text=current_history_text,
+            )
         except Exception as e:
             print(f"Error generating intent response: {e}")
 
         if "<complex>" not in (intent_response or ""):
             history.append_history(role="IntentClassifier", text=intent_response, history_file=history_file)
             if not job:
-                _run_history_summarization_async(history_file=history_file, temperature=default_temperature)
-                extraction_input = history.get_conversation_history(history_file=history_file)
-                _run_memory_extraction_async(extraction_input, history_file, default_temperature)
+                active_history_cache.release()
+                post_intent_cache = create_history_context_cache(
+                    history_file=history_file,
+                    history_text=history.get_conversation_history(history_file=history_file),
+                    client=client,
+                    backoff_call=call_with_exponential_backoff,
+                )
+                try:
+                    _run_history_summarization_async(
+                        history_file=history_file,
+                        temperature=default_temperature,
+                        history_cache=post_intent_cache.retain(),
+                    )
+                    summarized_history = history.get_conversation_history(history_file=history_file)
+                    relevant_memories_history = "\n\n".join(
+                        [f"Memory: {memory.text}" for memory in memory.get_default_store().search_memories(summarized_history, limit=10)]
+                    )
+                    _run_memory_extraction_async(
+                        history_file=history_file,
+                        temperature=default_temperature,
+                        relevant_memories_text=relevant_memories_history,
+                        history_cache=post_intent_cache.retain(),
+                    )
+                finally:
+                    post_intent_cache.release()
             return LLMResponse(text=intent_response, media_paths=[])
 
     while True:
@@ -152,8 +192,18 @@ def generate_response(
         manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(history.get_conversation_history(history_file=history_file), MANAGER_FILE.read_text(encoding="utf-8") + history_file, MEDIUM_MODEL, tool_use_allowed=True, force_tool=True, temperature=temperature, thinking_level="high")
-            history.append_history(role="Manager", text=manager_response, history_file=history_file)
+            manager_response = _run_model_api(
+                text="Review the conversation context and create the execution plan JSON file.",
+                system_instructions=MANAGER_FILE.read_text(encoding="utf-8") + history_file,
+                model=MEDIUM_MODEL,
+                tool_use_allowed=True,
+                force_tool=True,
+                temperature=temperature,
+                thinking_level="high",
+                history_cache=active_history_cache,
+                current_history_text=history.get_conversation_history(history_file=history_file),
+            )
+            history.append_history(role="Manager", text=f"{EXECUTION_ORDER_FILE} created.", history_file=history_file)
         except Exception as e:
             print(f"Error generating manager response: {e}")
 
@@ -196,13 +246,15 @@ def generate_response(
                 def _run_parallel_agent(agent: dict, stage_history: str) -> str:
                     model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
                     return _run_model_api(
-                        stage_history + "\n\n" + agent["instruction"],
+                        text=agent["instruction"],
                         system_instructions=sub_agent_system_instructions,
                         model=model_name,
                         tool_use_allowed=True,
                         force_tool=False,
                         temperature=temperature,
                         thinking_level=api_thinking_level,
+                        history_cache=active_history_cache,
+                        current_history_text=stage_history,
                     )
 
                 with ThreadPoolExecutor(max_workers=min(len(agents), 8)) as executor:
@@ -227,19 +279,26 @@ def generate_response(
                     sub_agent_response = ""
                     try:
                         if _is_final_execution_agent(execution_plan, stage_index, agent_index):
-                            sub_agent_response = _run_final_reviewer(history_file, user_message, default_temperature)
+                            sub_agent_response = _run_final_reviewer(
+                                history_file,
+                                user_message,
+                                default_temperature,
+                                history_cache=active_history_cache,
+                            )
                             exit_string = sub_agent_response
                             history.append_history(role=REVIEWER_TASK_NAME, text=sub_agent_response, history_file=history_file)
                         else:
                             model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
                             sub_agent_response = _run_model_api(
-                                history.get_conversation_history(history_file=history_file) + "\n\n" + agent["instruction"],
+                                text=agent["instruction"],
                                 system_instructions=sub_agent_system_instructions,
                                 model=model_name,
                                 tool_use_allowed=True,
                                 force_tool=False,
                                 temperature=temperature,
                                 thinking_level=api_thinking_level,
+                                history_cache=active_history_cache,
+                                current_history_text=history.get_conversation_history(history_file=history_file),
                             )
                             history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
                     except Exception as e:
@@ -251,10 +310,19 @@ def generate_response(
         if exit_string == "<yes>":
             break
         else:
-            _run_history_summarization_async(
+            _run_history_summarization(
                 history_file=history_file,
                 temperature=default_temperature,
                 pivot_role="manager",
+                history_cache=active_history_cache.retain(),
+                current_history_text=history.get_conversation_history(history_file=history_file),
+            )
+            active_history_cache.release()
+            active_history_cache = create_history_context_cache(
+                history_file=history_file,
+                history_text=history.get_conversation_history(history_file=history_file),
+                client=client,
+                backoff_call=call_with_exponential_backoff,
             )
             if temperature < 2.0:
                 temperature += 0.1
@@ -263,47 +331,68 @@ def generate_response(
     text_response = ""
     media_paths: list[str] = []
 
-    _run_history_summarization_async(history_file=history_file, temperature=default_temperature)
+    active_history_cache.release()
+    post_review_cache = create_history_context_cache(
+        history_file=history_file,
+        history_text=history.get_conversation_history(history_file=history_file),
+        client=client,
+        backoff_call=call_with_exponential_backoff,
+    )
+    _run_history_summarization_async(
+        history_file=history_file,
+        temperature=default_temperature,
+        history_cache=post_review_cache.retain(),
+    )
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        text_future = executor.submit(
-            _run_model_api,
-            history.get_conversation_history(history_file=history_file),
-            TEXTER_FILE.read_text(encoding="utf-8"),
-            MINIMAL_MODEL,
-            False,
-            False,
-            default_temperature,
-            thinking_level="low",
-        )
-        media_future = executor.submit(
-            _select_media_paths,
-            history_file,
-            user_message,
-            default_temperature,
-        )
-
-        try:
-            text_response = text_future.result()
-            history.append_history(role="Texter", text=text_response, history_file=history_file)
-        except Exception as e:
-            print(f"Error generating texter response: {e}")
-
-        try:
-            media_paths = media_future.result()
-            history.append_history(
-                role="MediaSelector",
-                text=json.dumps({"media_paths": media_paths}, ensure_ascii=False),
-                history_file=history_file,
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            text_future = executor.submit(
+                _run_model_api,
+                text="Use the conversation context to answer the user's latest request.",
+                system_instructions=TEXTER_FILE.read_text(encoding="utf-8"),
+                model=MINIMAL_MODEL,
+                tool_use_allowed=False,
+                force_tool=False,
+                temperature=default_temperature,
+                thinking_level="low",
+                history_cache=post_review_cache,
+                current_history_text=post_review_cache.history_text,
             )
-        except Exception as e:
-            print(f"Error selecting media paths: {e}")
-            media_paths = []
+            media_future = executor.submit(
+                _select_media_paths,
+                history_file,
+                user_message,
+                default_temperature,
+                post_review_cache,
+            )
 
-    if not job:
-        relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in memory.get_default_store().search_memories(history.get_conversation_history(history_file=history_file), limit=10)])
-        extraction_input = "History: " + history.get_conversation_history(history_file=history_file) + "\n\nRelevant memories: \n\n" + relevant_memories_history
-        _run_memory_extraction_async(extraction_input, history_file, default_temperature)
+            try:
+                text_response = text_future.result()
+                history.append_history(role="Texter", text=text_response, history_file=history_file)
+            except Exception as e:
+                print(f"Error generating texter response: {e}")
+
+            try:
+                media_paths = media_future.result()
+                history.append_history(
+                    role="MediaSelector",
+                    text=json.dumps({"media_paths": media_paths}, ensure_ascii=False),
+                    history_file=history_file,
+                )
+            except Exception as e:
+                print(f"Error selecting media paths: {e}")
+                media_paths = []
+
+        if not job:
+            relevant_memories_history = "\n\n".join([f"Memory: {memory.text}" for memory in memory.get_default_store().search_memories(history.get_conversation_history(history_file=history_file), limit=10)])
+            _run_memory_extraction_async(
+                history_file=history_file,
+                temperature=default_temperature,
+                relevant_memories_text=relevant_memories_history,
+                history_cache=post_review_cache.retain(),
+            )
+    finally:
+        post_review_cache.release()
     return LLMResponse(text=text_response, media_paths=media_paths)
 
 
@@ -362,7 +451,12 @@ def _truncate_instruction_preview(instruction: str, limit: int) -> str:
     return compact[:limit] + "..."
 
 
-def _select_media_paths(history_file: str, user_message: str, temperature: float) -> list[str]:
+def _select_media_paths(
+    history_file: str,
+    user_message: str,
+    temperature: float,
+    history_cache: HistoryContextCache | None = None,
+) -> list[str]:
     try:
         from skills.collect_generated_media import get_generated_media
     except Exception as e:
@@ -373,21 +467,33 @@ def _select_media_paths(history_file: str, user_message: str, temperature: float
     selector_input = (
         "Latest user request:\n"
         f"{user_message}\n\n"
-        "Conversation history:\n"
-        f"{history.get_conversation_history(history_file=history_file)}\n\n"
-        "Generated media catalog JSON:\n"
+        "Use the conversation history and this generated media catalog JSON:\n"
         f"{catalog_json}"
     )
 
-    selector_response = _run_model_api(
-        selector_input,
-        MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
-        model=MINIMAL_MODEL,
-        tool_use_allowed=False,
-        force_tool=False,
-        temperature=temperature,
-        thinking_level="low",
-    )
+    if history_cache is not None:
+        selector_response = _run_model_api(
+            text=selector_input,
+            system_instructions=MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
+            model=MINIMAL_MODEL,
+            tool_use_allowed=False,
+            force_tool=False,
+            temperature=temperature,
+            thinking_level="low",
+            history_cache=history_cache,
+            current_history_text=history_cache.history_text,
+        )
+    else:
+        selector_response = _run_model_api(
+            text=selector_input,
+            system_instructions=MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
+            model=MINIMAL_MODEL,
+            tool_use_allowed=False,
+            force_tool=False,
+            temperature=temperature,
+            thinking_level="low",
+            current_history_text=history.get_conversation_history(history_file=history_file),
+        )
     return _parse_selected_media_paths(selector_response)
 
 
@@ -585,31 +691,74 @@ def _build_attachment_extraction_prompt(mime_type: str) -> str:
     )
 
 
-def _run_memory_extraction_async(extraction_input: str, history_file: str, temperature: float) -> None:
+def _run_memory_extraction_async(
+    history_file: str,
+    temperature: float,
+    relevant_memories_text: str = "",
+    history_cache: HistoryContextCache | None = None,
+) -> None:
     def _worker() -> None:
         try:
-            memory_extractor_response = _run_model_api(
-                extraction_input,
-                MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
-                MINIMAL_MODEL,
-                tool_use_allowed=False,
-                force_tool=False,
-                temperature=temperature,
-                thinking_level="low"
-            )
+            if history_cache is not None:
+                memory_extractor_response = _run_model_api(
+                    text="Relevant memories:\n\n" + relevant_memories_text,
+                    system_instructions=MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
+                    model=MINIMAL_MODEL,
+                    tool_use_allowed=False,
+                    force_tool=False,
+                    temperature=temperature,
+                    thinking_level="low",
+                    history_cache=history_cache,
+                    current_history_text=history_cache.history_text,
+                )
+            else:
+                extraction_input = "History: " + history.get_conversation_history(history_file=history_file) + "\n\nRelevant memories: \n\n" + relevant_memories_text
+                memory_extractor_response = _run_model_api(
+                    text=extraction_input,
+                    system_instructions=MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
+                    model=MINIMAL_MODEL,
+                    tool_use_allowed=False,
+                    force_tool=False,
+                    temperature=temperature,
+                    thinking_level="low"
+                )
             cleaned_response = memory_extractor_response.strip()
             if cleaned_response and cleaned_response != "<NO_MEMORY>":
                 memory.get_default_store().write_memory(cleaned_response)
                 history.append_history(role="MemoryExtractor", text=cleaned_response, history_file=history_file)
         except Exception as e:
             print(f"Error generating memory extractor response: {e}")
+        finally:
+            if history_cache is not None:
+                history_cache.release()
 
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def _run_history_summarization_async(history_file: str, temperature: float, pivot_role: str = "user") -> None:
-    def _worker() -> None:
-        try:
+def _run_history_summarization(
+    history_file: str,
+    temperature: float,
+    pivot_role: str = "user",
+    history_cache: HistoryContextCache | None = None,
+    current_history_text: str | None = None,
+) -> None:
+    try:
+        if history_cache is not None:
+            summary = _run_model_api(
+                text=(
+                    f"Summarize only the conversation history before the latest '{pivot_role}' message. "
+                    f"Do not include that latest '{pivot_role}' message or anything after it."
+                ),
+                system_instructions=HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
+                model=LOW_MODEL,
+                tool_use_allowed=False,
+                force_tool=False,
+                temperature=temperature,
+                thinking_level="low",
+                history_cache=history_cache,
+                current_history_text=current_history_text,
+            )
+        else:
             prior_history = history.get_history_before_latest_role(history_file=history_file, role=pivot_role)
             if not prior_history:
                 return
@@ -623,17 +772,38 @@ def _run_history_summarization_async(history_file: str, temperature: float, pivo
                 temperature=temperature,
                 thinking_level="low",
             )
-            cleaned_summary = (summary or "").strip()
-            if not cleaned_summary:
-                return
 
-            history.rewrite_history_with_summary_before_latest_role(
-                summary_text=cleaned_summary,
-                history_file=history_file,
-                pivot_role=pivot_role,
-            )
-        except Exception as e:
-            print(f"Error running history summarization: {e}")
+        cleaned_summary = (summary or "").strip()
+        if not cleaned_summary:
+            return
+
+        history.rewrite_history_with_summary_before_latest_role(
+            summary_text=cleaned_summary,
+            history_file=history_file,
+            pivot_role=pivot_role,
+        )
+    except Exception as e:
+        print(f"Error running history summarization: {e}")
+    finally:
+        if history_cache is not None:
+            history_cache.release()
+
+
+def _run_history_summarization_async(
+    history_file: str,
+    temperature: float,
+    pivot_role: str = "user",
+    history_cache: HistoryContextCache | None = None,
+    current_history_text: str | None = None,
+) -> None:
+    def _worker() -> None:
+        _run_history_summarization(
+            history_file=history_file,
+            temperature=temperature,
+            pivot_role=pivot_role,
+            history_cache=history_cache,
+            current_history_text=current_history_text,
+        )
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -749,14 +919,33 @@ def _is_final_execution_agent(execution_plan: list[dict], stage_index: int, agen
     return agent_index == len(final_stage_agents) - 1
 
 
-def _run_final_reviewer(history_file: str, user_message: str, temperature: float) -> str:
+def _run_final_reviewer(
+    history_file: str,
+    user_message: str,
+    temperature: float,
+    history_cache: HistoryContextCache | None = None,
+) -> str:
+    if history_cache is not None:
+        return _run_model_api(
+            text="Review the conversation context and determine whether the user's request is complete.",
+            system_instructions=REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
+            model=LOW_MODEL,
+            tool_use_allowed=False,
+            force_tool=False,
+            temperature=temperature,
+            thinking_level="low",
+            history_cache=history_cache,
+            current_history_text=history.get_conversation_history(history_file=history_file),
+        )
+
     return _run_model_api(
-        history.get_conversation_history(history_file=history_file),
-        REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
-        LOW_MODEL,
+        text=history.get_conversation_history(history_file=history_file),
+        system_instructions=REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
+        model=LOW_MODEL,
         tool_use_allowed=False,
         force_tool=False,
         temperature=temperature,
+        thinking_level="low",
     )
 
 
@@ -791,6 +980,8 @@ def _run_model_api(
     force_tool: bool = False,
     temperature: float = 1,
     thinking_level: str = "high",
+    history_cache: HistoryContextCache | None = None,
+    current_history_text: str | None = None,
 ) -> str:
     """
     Helper function to call the model API with the given text and system instructions, and return the generated response.
@@ -806,20 +997,51 @@ def _run_model_api(
             mode="ANY", allowed_function_names=["run_python"]
         )
     )
+    cache_tools = [agent_tools] if tool_use_allowed else None
+    cache_tool_config = tool_config if force_tool else None
 
     if model == MINIMAL_MODEL and "2.5" in MINIMAL_MODEL:
         thinking_config = types.ThinkingConfig(thinking_budget=16384)
     else:
         thinking_config = types.ThinkingConfig(thinking_level=_normalize_api_thinking_level(thinking_level))
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_instructions,
-        tool_config=tool_config if force_tool else None,
-        tools=[agent_tools] if tool_use_allowed else [],
-        temperature=temperature,
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=force_tool),
-        thinking_config=thinking_config
-    )
+    prompt_text = text
+    cached_content_name = None
+    cache_profile: CachedContentProfile | None = None
+    if history_cache is not None:
+        cache_profile = create_cached_content_profile(
+            model=model,
+            system_instruction=system_instructions,
+            tools=cache_tools,
+            tool_config=cache_tool_config,
+        )
+        prompt_text, cached_content_name = resolve_history_cached_prompt(
+            history_cache=history_cache,
+            profile=cache_profile,
+            model=model,
+            dynamic_text=text,
+            current_history_text=current_history_text,
+        )
+    elif current_history_text is not None:
+        prompt_text = compose_uncached_history_prompt(current_history_text, text)
+
+    if cached_content_name:
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=force_tool),
+            thinking_config=thinking_config,
+            cached_content=cached_content_name,
+        )
+    else:
+        config = types.GenerateContentConfig(
+            system_instruction=system_instructions,
+            tool_config=cache_tool_config,
+            tools=cache_tools or [],
+            temperature=temperature,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=force_tool),
+            thinking_config=thinking_config,
+            cached_content=None,
+        )
 
     function_output = ""
 
@@ -827,7 +1049,7 @@ def _run_model_api(
         lambda: client.models.generate_content(
             model=model,
             config=config,
-            contents=text,
+            contents=prompt_text,
         ),
         description=f"Gemini generate_content ({model})",
     )
