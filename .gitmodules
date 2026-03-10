@@ -2,3 +2,7 @@
 	path = DylPickle13.github.io
 	url = https://github.com/DylPickle13/DylPickle13.github.io.git
 	branch = main
+[submodule "fnirs-ai-analysis"]
+	path = fnirs-ai-analysis
+	url = https://github.com/DylPickle13/fnirs-ai-analysis.git
+	branch = main
