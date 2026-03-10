@@ -354,7 +354,7 @@ def generate_response(
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=default_temperature,
-                thinking_level="low",
+                thinking_level="high",
                 history_cache=post_review_cache,
                 current_history_text=post_review_cache.history_text,
             )
@@ -458,7 +458,7 @@ def _select_media_paths(
     history_cache: HistoryContextCache | None = None,
 ) -> list[str]:
     try:
-        from skills.collect_generated_media import get_generated_media
+        from tools.collect_generated_media import get_generated_media
     except Exception as e:
         print(f"Error importing media selection skill: {e}")
         return []

@@ -5,7 +5,7 @@ import time
 import nbformat
 import papermill as pm
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 def _resolve_notebook_path(notebook_path: str) -> Path:
@@ -48,6 +48,83 @@ def _base_dir(nb_path: Optional[Path] = None) -> str:
     return str(repo_root)
 
 
+def _normalize_source(source: Any) -> str:
+    if isinstance(source, list):
+        source_lines = [str(line) for line in source]
+        if any(line.endswith("\n") for line in source_lines):
+            return "".join(source_lines)
+        return "\n".join(source_lines)
+    if source is None:
+        return ""
+    return str(source)
+
+
+def _sanitize_cell_metadata(metadata: Any) -> dict[str, Any]:
+    if isinstance(metadata, dict):
+        return dict(metadata)
+    return {}
+
+
+def _build_notebook_node(raw_notebook: dict[str, Any], parameters: dict[str, Any]) -> nbformat.NotebookNode:
+    cells = []
+    has_parameters_cell = False
+
+    for raw_cell in raw_notebook.get("cells", []):
+        if not isinstance(raw_cell, dict):
+            continue
+
+        cell_type = raw_cell.get("cell_type", "code")
+        metadata = _sanitize_cell_metadata(raw_cell.get("metadata"))
+        tags = metadata.get("tags")
+        if isinstance(tags, list) and "parameters" in tags:
+            has_parameters_cell = True
+
+        source = _normalize_source(raw_cell.get("source", ""))
+        if cell_type == "markdown":
+            cell = nbformat.v4.new_markdown_cell(source=source, metadata=metadata)
+        elif cell_type == "raw":
+            cell = nbformat.v4.new_raw_cell(source=source, metadata=metadata)
+        else:
+            cell = nbformat.v4.new_code_cell(source=source, metadata=metadata)
+            execution_count = raw_cell.get("execution_count")
+            cell.execution_count = execution_count if isinstance(execution_count, int) else None
+            raw_outputs = raw_cell.get("outputs")
+            cell.outputs = raw_outputs if isinstance(raw_outputs, list) else []
+
+        cells.append(cell)
+
+    if not has_parameters_cell and parameters:
+        parameter_lines = ["# Parameters"]
+        for name, value in parameters.items():
+            parameter_lines.append(f"{name} = {json.dumps(value)}")
+        parameter_cell = nbformat.v4.new_code_cell(
+            source="\n".join(parameter_lines),
+            metadata={"tags": ["parameters"]},
+        )
+        cells.insert(0, parameter_cell)
+
+    notebook_metadata = _sanitize_cell_metadata(raw_notebook.get("metadata"))
+    notebook = nbformat.v4.new_notebook(cells=cells, metadata=notebook_metadata)
+
+    return notebook
+
+
+def _prepare_notebook_for_execution(
+    nb_path: Path,
+    output_dir: str,
+    parameters: dict[str, Any],
+) -> str:
+    with open(nb_path, "r", encoding="utf-8") as f:
+        raw_notebook = json.load(f)
+
+    notebook = _build_notebook_node(raw_notebook, parameters)
+    prepared_nb_path = os.path.join(output_dir, "prepared.ipynb")
+    with open(prepared_nb_path, "w", encoding="utf-8") as f:
+        nbformat.write(notebook, f)
+
+    return prepared_nb_path
+
+
 def run_notebook(notebook_path: str) -> str:
     """
     Execute a notebook via papermill and store outputs.
@@ -87,13 +164,14 @@ def run_notebook(notebook_path: str) -> str:
     error_message = None
 
     try:
+        prepared_nb_path = _prepare_notebook_for_execution(nb_path, output_dir, params)
         # Run from the notebook folder so relative writes go to expected paths.
         notebook_dir = str(nb_path.parent)
         old_cwd = os.getcwd()
         try:
             os.chdir(notebook_dir)
             pm.execute_notebook(
-                str(nb_path),
+                prepared_nb_path,
                 executed_nb_path,
                 parameters=params,
                 execution_timeout=timeout,
