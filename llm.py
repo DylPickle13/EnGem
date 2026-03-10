@@ -812,18 +812,18 @@ def _get_function_declarations(client: genai.Client = None) -> list[types.Functi
     """
     Helper function to return a list of available tools for the agent to use, based on the functions defined in the skills directory.
     """
-    # get all modules in the skills directory and return only functions defined in those modules
+    # get all modules in the tools directory and return only functions defined in those modules
     function_declarations = []
-    skills_dir = Path(__file__).parent / "skills"
-    for skill_file in skills_dir.glob("*.py"):
-        module_name = skill_file.stem
+    tools_dir = Path(__file__).parent / "tools"
+    for tool_file in tools_dir.glob("*.py"):
+        module_name = tool_file.stem
         try:
-            module = __import__(f"skills.{module_name}", fromlist=[module_name])
+            module = __import__(f"tools.{module_name}", fromlist=[module_name])
             for _, attr in inspect.getmembers(module, inspect.isfunction):
                 if attr.__module__ == module.__name__ and not attr.__name__.startswith("_"):
                     function_declarations.append(types.FunctionDeclaration.from_callable(client=client, callable=attr))
         except Exception as e:
-            print(f"Error importing skill module '{module_name}': {e}")
+            print(f"Error importing tool module '{module_name}': {e}")
     return function_declarations
 
 
@@ -879,9 +879,9 @@ def _normalize_execution_plan(execution_order_dict: dict) -> list[dict]:
 def _get_skill(function_name: str, function_args: dict) -> str:
     """Helper function to execute a tool function based on its name and arguments, and return the output as a string."""
     function_output = ""
-    for skill_file in (Path(__file__).parent / "skills").glob("*.py"):
-        module_name = skill_file.stem
-        module = __import__(f"skills.{module_name}", fromlist=[module_name])
+    for tool_file in (Path(__file__).parent / "tools").glob("*.py"):
+        module_name = tool_file.stem
+        module = __import__(f"tools.{module_name}", fromlist=[module_name])
         for _, attr in inspect.getmembers(module, inspect.isfunction):
             if attr.__module__ == module.__name__ and attr.__name__ == function_name:
                 result = attr(function_args[next(iter(function_args))])
