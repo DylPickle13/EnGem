@@ -9,7 +9,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(_REPO_ROOT))
 
-from config import LOW_MODEL as LOW_MODEL
+from config import MINIMAL_MODEL as MINIMAL_MODEL
 
 # Browser Summarizer file located alongside this module
 BROWSER_SUMMARIZER_FILE = Path(__file__).parent.parent / "agent_instructions/browser_summarizer.md"
@@ -26,7 +26,7 @@ def use_browser(prompt: str) -> str:
     try:
         output = computer_use.run_agent_loop(client, page, prompt=prompt)
 
-        output = llm._run_model_api(output, system_instructions=BROWSER_SUMMARIZER_FILE.read_text(encoding="utf-8"), model=LOW_MODEL, tool_use_allowed=False, force_tool=False, temperature=1.0, thinking_level="low")
+        output = llm._run_model_api(output, system_instructions=BROWSER_SUMMARIZER_FILE.read_text(encoding="utf-8"), model=MINIMAL_MODEL, tool_use_allowed=False, force_tool=False, temperature=1.0, thinking_level="low")
     except Exception as e:
         output = f"An error occurred: {str(e)}"
     finally:
