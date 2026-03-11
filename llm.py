@@ -42,8 +42,6 @@ MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extra
 # History summarizer system instructions located alongside this module
 HISTORY_SUMMARIZER_SYSTEM = Path(__file__).parent / "agent_instructions/history_summarizer.md"
 
-# Image Extractor file located alongside this module
-IMAGE_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/image_extractor.md"
 
 GENERATED_IMAGES_DIR = (Path(__file__).parent / "generated_images").resolve()
 GENERATED_VIDEOS_DIR = (Path(__file__).parent / "generated_videos").resolve()
@@ -458,7 +456,7 @@ def _select_media_paths(
     history_cache: HistoryContextCache | None = None,
 ) -> list[str]:
     try:
-        from tools.collect_generated_media import get_generated_media
+        from collect_generated_media import get_generated_media, parse_selected_media_paths
     except Exception as e:
         print(f"Error importing media selection skill: {e}")
         return []
@@ -494,83 +492,7 @@ def _select_media_paths(
             thinking_level="low",
             current_history_text=history.get_conversation_history(history_file=history_file),
         )
-    return _parse_selected_media_paths(selector_response)
-
-
-def _parse_selected_media_paths(selector_response: str) -> list[str]:
-    text = (selector_response or "").strip()
-    if not text:
-        return []
-
-    payload = _extract_json_payload(text)
-    if not isinstance(payload, dict):
-        return []
-
-    raw_paths = payload.get("media_paths", [])
-    if not isinstance(raw_paths, list):
-        return []
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-
-    for item in raw_paths:
-        if not isinstance(item, str):
-            continue
-        safe_path = _normalize_media_path(item)
-        if not safe_path or safe_path in seen:
-            continue
-        seen.add(safe_path)
-        normalized.append(safe_path)
-        if len(normalized) >= 10:
-            break
-
-    return normalized
-
-
-def _extract_json_payload(text: str) -> dict | None:
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-
-    try:
-        parsed = json.loads(text[start : end + 1])
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        return None
-    return None
-
-
-def _normalize_media_path(raw_path: str) -> str | None:
-    try:
-        path = Path(raw_path).expanduser().resolve()
-    except Exception:
-        return None
-
-    if not path.exists() or not path.is_file():
-        return None
-    if not any(_is_under_directory(path, directory) for directory in ALLOWED_OUTPUT_DIRECTORIES):
-        return None
-    if any(_is_under_directory(path, directory) for directory in RESTRICTED_OUTPUT_DIRECTORIES):
-        if path.suffix.lower() not in SUPPORTED_OUTPUT_FILE_EXTENSIONS:
-            return None
-    return str(path)
-
-
-def _is_under_directory(path: Path, directory: Path) -> bool:
-    try:
-        path.relative_to(directory)
-        return True
-    except Exception:
-        return False
+    return parse_selected_media_paths(selector_response)
 
 
 def _convert_attachments_to_text(attachments: dict[str, bytes | str] | list[dict[str, bytes | str]] | None) -> str:
@@ -669,7 +591,10 @@ def _default_attachment_name_for_mime_type(mime_type: str) -> str:
 
 def _build_attachment_extraction_prompt(mime_type: str) -> str:
     if mime_type.startswith("image/"):
-        return IMAGE_EXTRACTOR_FILE.read_text(encoding="utf-8")
+        return  (
+            "Extract the useful content from this image. Return plain text only, concise but complete. "
+            "Include a description of important visual elements, any visible on-screen text, and relevant contextual details."
+        )
     if mime_type.startswith("video/"):
         return (
             "Extract the useful content from this video. Return plain text only, concise but complete. "

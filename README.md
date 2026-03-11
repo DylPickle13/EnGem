@@ -48,7 +48,7 @@ The repository contains several helper tools under `tools/` (previously document
 - `tools/run_notebook.py` — Execute notebooks via Papermill; outputs are saved under `results/<timestamp>`.
 - `tools/use_browser.py` — High-level browser automation that uses the `computer_use` client and Playwright.
 - `tools/generate_image.py`, `tools/generate_video.py` — Media generation helpers.
-- `tools/collect_generated_media.py` — List recent generated outputs.
+- `collect_generated_media.py` — List recent generated outputs.
 
 You can run most tools as small scripts or import their main functions. Example (run the built-in example in `run_google_search`):
 
