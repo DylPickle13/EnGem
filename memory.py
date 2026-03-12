@@ -22,9 +22,8 @@ from config import (
     GEMINI_EMBEDDING_BATCH_SIZE,
     GEMINI_EMBEDDING_DIM,
     GEMINI_EMBEDDING_MODEL,
-    LOW_MODEL,
+    MINIMAL_MODEL,
     MEMORY_ARCHIVE_DIR,
-    MEMORY_ENABLE_LEGACY_MIGRATION,
     MEMORY_FILE_COLLECTION_NAME,
     MEMORY_SEMANTIC_COLLECTION_NAME,
     get_paid_gemini_api_key,
@@ -36,7 +35,6 @@ logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 
 DEFAULT_DB_PATH = Path(__file__).parent / "memory" / "vector_db"
-LEGACY_COLLECTION_NAME = "engem_memory"
 DEFAULT_COLLECTION_NAME = MEMORY_SEMANTIC_COLLECTION_NAME
 DEFAULT_FILE_COLLECTION_NAME = MEMORY_FILE_COLLECTION_NAME
 DEFAULT_ARCHIVE_PATH = Path(MEMORY_ARCHIVE_DIR)
@@ -48,7 +46,6 @@ _SUPPORTED_ATTACHMENT_EMBEDDING_TYPES = {"application/pdf"}
 _embedding_service: GeminiEmbeddingService | None = None
 _default_store: VectorMemoryStore | None = None
 _attachment_store: VectorMemoryStore | None = None
-_legacy_migration_attempted = False
 
 
 def _utcnow_iso() -> str:
@@ -336,7 +333,6 @@ def get_default_store() -> VectorMemoryStore:
             db_path=DEFAULT_DB_PATH,
             collection_name=DEFAULT_COLLECTION_NAME,
         )
-    _ensure_legacy_semantic_migration(_default_store)
     return _default_store
 
 
@@ -349,63 +345,6 @@ def get_attachment_store() -> VectorMemoryStore:
             collection_name=DEFAULT_FILE_COLLECTION_NAME,
         )
     return _attachment_store
-
-
-def _ensure_legacy_semantic_migration(target_store: VectorMemoryStore) -> None:
-    global _legacy_migration_attempted
-    if _legacy_migration_attempted or not MEMORY_ENABLE_LEGACY_MIGRATION:
-        return
-    _legacy_migration_attempted = True
-
-    if target_store.collection_name == LEGACY_COLLECTION_NAME or target_store.count() > 0:
-        return
-
-    legacy_client = chromadb.PersistentClient(
-        path=str(DEFAULT_DB_PATH),
-        settings=Settings(anonymized_telemetry=False),
-    )
-    try:
-        legacy_collection = legacy_client.get_collection(name=LEGACY_COLLECTION_NAME)
-    except Exception:
-        return
-
-    legacy_payload = legacy_collection.get(include=["documents", "metadatas"])
-    legacy_ids = legacy_payload.get("ids") or []
-    legacy_docs = legacy_payload.get("documents") or []
-    legacy_metadatas = legacy_payload.get("metadatas") or []
-
-    migrated_ids: list[str] = []
-    migrated_docs: list[str] = []
-    migrated_metadatas: list[dict[str, Any]] = []
-
-    for index, legacy_id in enumerate(legacy_ids):
-        text = (legacy_docs[index] if index < len(legacy_docs) else "") or ""
-        cleaned_text = text.strip()
-        if not cleaned_text:
-            continue
-
-        metadata = dict(legacy_metadatas[index] if index < len(legacy_metadatas) and legacy_metadatas[index] else {})
-        metadata.setdefault("created_at", _utcnow_iso())
-        metadata.setdefault("schema_version", MEMORY_SCHEMA_VERSION)
-        metadata.setdefault("embedding_model", GEMINI_EMBEDDING_MODEL)
-        metadata.setdefault("embedding_dim", GEMINI_EMBEDDING_DIM)
-        metadata.setdefault("record_type", "semantic_memory")
-        metadata.setdefault("migrated_from_collection", LEGACY_COLLECTION_NAME)
-
-        migrated_ids.append(legacy_id)
-        migrated_docs.append(cleaned_text)
-        migrated_metadatas.append(metadata)
-
-    if not migrated_docs:
-        return
-
-    migrated_embeddings = target_store.embedding_service.embed_texts(migrated_docs, task_type="RETRIEVAL_DOCUMENT")
-    target_store.collection.upsert(
-        ids=migrated_ids,
-        documents=migrated_docs,
-        metadatas=migrated_metadatas,
-        embeddings=migrated_embeddings,
-    )
 
 
 def archive_attachment(
@@ -603,10 +542,11 @@ def _select_related_memory_ids(topic: str, candidates: list[MemoryItem]) -> set[
     result = llm._run_model_api(
         text=prompt,
         system_instructions=MEMORY_RELATED.read_text(encoding="utf-8"),
-        model=LOW_MODEL,
+        model=MINIMAL_MODEL,
         tool_use_allowed=False,
         force_tool=False,
         temperature=0,
+        thinking_level="low",
     )
 
     raw = (result or "").strip()
@@ -635,7 +575,7 @@ def _select_related_memory_ids(topic: str, candidates: list[MemoryItem]) -> set[
             retry = llm._run_model_api(
                 text=prompt,
                 system_instructions=retry_system,
-                model=LOW_MODEL,
+                model=MINIMAL_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=0,

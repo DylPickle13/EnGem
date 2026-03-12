@@ -9,7 +9,7 @@ if str(_REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(_REPO_ROOT))
 
 import types
-from config import get_paid_gemini_api_key as get_paid_gemini_api_key, LOW_MODEL as LOW_MODEL
+from config import get_paid_gemini_api_key as get_paid_gemini_api_key, MINIMAL_MODEL as MINIMAL_MODEL
 from api_backoff import call_with_exponential_backoff
 from google import genai
 from google.genai import types
@@ -30,7 +30,7 @@ def run_google_search(query: str) -> str:
 
     response = call_with_exponential_backoff(
         lambda: client.models.generate_content(
-            model=LOW_MODEL,
+            model=MINIMAL_MODEL,
             contents=query,
             config=config,
         ),

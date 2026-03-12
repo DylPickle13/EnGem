@@ -14,6 +14,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from config import MINIMAL_MODEL as planner_model
 
 PLANNER_INSTRUCTIONS_FILE = _REPO_ROOT / "agent_instructions" / "google_workspace_planner.md"
 RUNTIME_SETTING_KEYS = [
@@ -1509,11 +1510,6 @@ def _run_query_action(query: str, *, runtime_data: dict[str, Any]) -> str:
     normalized_query = (query or "").strip()
     if not normalized_query:
         return _error_payload("access_google_workspace requires a plain-text query.", executed=False)
-
-    try:
-        from config import LOW_MODEL as planner_model
-    except Exception:
-        planner_model = "gemini-2.0-flash"
 
     root_help_result = _run_gws_command(["--help"], runtime_data=runtime_data)
     root_help_text = str(root_help_result.get("stdout") or root_help_result.get("stderr") or "")

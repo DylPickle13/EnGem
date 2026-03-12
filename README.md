@@ -2,7 +2,7 @@
 
 EnGem is a local assistant and automation framework that connects a streaming LLM (Gemini) to host-side tooling and exposes a Discord bot interface. It coordinates sub-agent execution plans, browser automation, code and notebook execution, and media generation — then captures artifacts in `generated_files/`.
 
-This README was updated on 2026-03-11 to reflect the current repository layout and usage.
+This README was updated on 2026-03-12 to reflect the current repository layout and usage.
 
 Quick start
 
@@ -48,7 +48,6 @@ The repository contains several helper tools under `tools/` (previously document
 - `tools/run_notebook.py` — Execute notebooks via Papermill; outputs are saved under `results/<timestamp>`.
 - `tools/use_browser.py` — High-level browser automation that uses the `computer_use` client and Playwright.
 - `tools/generate_image.py`, `tools/generate_video.py` — Media generation helpers.
-- `collect_generated_media.py` — List recent generated outputs.
 
 You can run most tools as small scripts or import their main functions. Example (run the built-in example in `run_google_search`):
 
@@ -65,8 +64,9 @@ python -c "from tools.run_google_search import run_google_search; print(run_goog
 Data, storage, and runtime artifacts
 
 - Conversation histories: `memory/channel_history/*.md` (one file per Discord channel).
-- Vector DB: `memory/vector_db/` (ChromaDB persistent client; default collection `engem_memory`).
-- Generated outputs and artifacts: `generated_files/`. Several tools also reference legacy directories like `generated_images/` and `generated_videos/`.
+- Vector DB: `memory/vector_db/` (ChromaDB persistent client). The repository generates embeddings via the configured Gemini embedding service (`GEMINI_EMBEDDING_MODEL`) and stores semantic memories in the collection named by `MEMORY_SEMANTIC_COLLECTION_NAME` in `config.py` (default: `engem_memory_semantic_gemini2`). File-based records use the collection named by `MEMORY_FILE_COLLECTION_NAME`.
+- Legacy migration: automatic migration from older collection names (for example, `engem_memory`) has been removed. If you have older ChromaDB collections you want to preserve, migrate them manually before upgrading.
+- Generated outputs and artifacts: `generated_files/`. Several tools still reference legacy directories like `generated_images/` and `generated_videos/` for backward compatibility.
 - Sub-agent execution orders: `sub-agents/` (JSON files written at runtime, e.g. `sub-agents/execution_order_<history_name>.json`).
 - Agent instruction templates and scheduled tasks: `agent_instructions/` (contains templates such as `manager.md`, `sub_agent.md`, and `cron_jobs/`).
 
@@ -87,7 +87,7 @@ Developer notes & conventions
 - Tool discovery: LLM sub-agents call the `tools` helpers; if you add a tool, ensure its function signatures are discoverable by any function-calling logic in `llm.py`.
 - Artifact relocation: `tools/run_python.py` snapshots the repo root, runs code, and moves generated artifacts into `generated_files/` to keep the repo clean.
 - Playwright: required for browser automation. After `pip install -r requirements.txt`, run `python -m playwright install`.
-- ChromaDB: embeddings use `sentence-transformers` by default (falls back if unavailable). Back up `memory/vector_db/` to preserve memories.
+- ChromaDB: embeddings are generated using Gemini via the repository's embedding service (configured by `GEMINI_EMBEDDING_MODEL` and requiring `PAID_GEMINI_API_KEY`). Make sure a paid Gemini API key is available in the environment for embedding operations. Back up `memory/vector_db/` to preserve memories.
 
 Troubleshooting
 
