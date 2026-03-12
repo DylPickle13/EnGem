@@ -10,8 +10,8 @@ from config import get_paid_gemini_api_key as get_paid_gemini_api_key, MEDIUM_MO
 from api_backoff import call_with_exponential_backoff
 
 BROWSER_FILE = Path(__file__).parent / "agent_instructions/browser.md"
-SCREEN_WIDTH = 1440
-SCREEN_HEIGHT = 900
+SCREEN_WIDTH = 1920
+SCREEN_HEIGHT = 1080
 TURN_LIMIT = 50
 MODEL_NAME = MEDIUM_MODEL
 ALT_MODEL_NAME = ""

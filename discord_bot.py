@@ -989,9 +989,12 @@ class DiscordBotWrapper:
 			await message.channel.send("Conversation history cleared.")
 			return True
 		if content in {f"{self.command_prefix}clear memory", f"{self.command_prefix}clear_memory"}:
-			store = memory.get_default_store()
-			cleared_count = store.clear_memories()
-			await message.channel.send(f"Memory cleared. Removed {cleared_count} entr{'y' if cleared_count == 1 else 'ies'}.")
+			cleared_counts = memory.clear_all_memory_stores()
+			await message.channel.send(
+				"Memory cleared. Removed "
+				f"{cleared_counts['total']} entr{'y' if cleared_counts['total'] == 1 else 'ies'} "
+				f"({cleared_counts['semantic']} semantic, {cleared_counts['files']} file)."
+			)
 			return True
 		if content.startswith(f"{self.command_prefix}forget memories"):
 			topic = content[len(f"{self.command_prefix}forget memories"):].strip()
@@ -1013,8 +1016,7 @@ class DiscordBotWrapper:
 						f"Usage: {self.command_prefix}list memories [limit] — limit must be an integer."
 					)
 					return True
-			store = memory.get_default_store()
-			memories = store.read_all_memories(limit=limit)
+			memories = memory.read_all_memory_records(limit=limit)
 			if not memories:
 				await message.channel.send("No memories stored.")
 				return True
@@ -1023,7 +1025,8 @@ class DiscordBotWrapper:
 				text = (m.text or "").strip().replace("\n", " ")
 				if len(text) > 300:
 					text = text[:297] + "..."
-				formatted.append(f"- {text}")
+				record_type = m.metadata.get("record_type", "semantic_memory")
+				formatted.append(f"- [{record_type}] {text}")
 			await self._send_long_message(message.channel, "Memories:\n" + "\n".join(formatted))
 			return True
 		if content == f"{self.command_prefix}list cron jobs":
