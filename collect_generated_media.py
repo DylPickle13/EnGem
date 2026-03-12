@@ -1,5 +1,8 @@
 import json
+from importlib import import_module
 from pathlib import Path
+
+import history
 
 
 def _find_repo_root() -> Path:
@@ -24,6 +27,8 @@ _DOCUMENT_EXTENSIONS = {
     ".html", ".htm", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".zip", ".tex",
 }
+
+MEDIA_SELECTOR_FILE = Path(__file__).parent / "agent_instructions" / "media_selector.md"
 
 
 # Directories and allowed/restricted outputs (match llm.py expectations)
@@ -146,6 +151,54 @@ def get_generated_media(max_items: str = "80") -> str:
     limit = max(1, min(limit, 300))
     media = _collect_media_catalog(limit=limit)
     return json.dumps({"media": media}, ensure_ascii=False)
+
+
+def select_media_paths(
+    history_file: str,
+    user_message: str,
+    temperature: float,
+    history_cache: object | None = None,
+) -> list[str]:
+    try:
+        llm = import_module("llm")
+        run_model_api = llm._run_model_api
+    except Exception as exc:
+        print(f"Error importing media selection model helper: {exc}")
+        return []
+
+    catalog_json = get_generated_media("120")
+    selector_input = (
+        "Latest user request:\n"
+        f"{user_message}\n\n"
+        "Use the conversation history and this generated media catalog JSON:\n"
+        f"{catalog_json}"
+    )
+
+    if history_cache is not None:
+        selector_response = run_model_api(
+            text=selector_input,
+            system_instructions=MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
+            model=llm.MINIMAL_MODEL,
+            tool_use_allowed=False,
+            force_tool=False,
+            temperature=temperature,
+            thinking_level="low",
+            history_cache=history_cache,
+            current_history_text=history_cache.history_text,
+        )
+    else:
+        selector_response = run_model_api(
+            text=selector_input,
+            system_instructions=MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
+            model=llm.MINIMAL_MODEL,
+            tool_use_allowed=False,
+            force_tool=False,
+            temperature=temperature,
+            thinking_level="low",
+            current_history_text=history.get_conversation_history(history_file=history_file),
+        )
+
+    return parse_selected_media_paths(selector_response)
 
 
 def _collect_media_catalog(limit: int = 80) -> list[dict]:

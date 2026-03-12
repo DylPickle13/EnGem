@@ -2,15 +2,14 @@ from google import genai
 from google.genai import types
 import json
 import inspect
-import mimetypes
-import re
-import threading
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 from progress_indicator import dispatch_execution_plan_preview_async as _dispatch_execution_plan_preview_async
 from progress_indicator import normalize_plan_thinking_level as _normalize_plan_thinking_level
+import attachments
+import collect_generated_media
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
 from config import MINIMAL_MODEL as MINIMAL_MODEL, LOW_MODEL as LOW_MODEL, MEDIUM_MODEL as MEDIUM_MODEL, HIGH_MODEL as HIGH_MODEL
 from api_backoff import call_with_exponential_backoff
@@ -36,28 +35,6 @@ REVIEWER_FILE = Path(__file__).parent / "agent_instructions/reviewer.md"
 # Summarize file located alongside this module
 TEXTER_FILE = Path(__file__).parent / "agent_instructions/texter.md"
 
-# Media selector file located alongside this module
-MEDIA_SELECTOR_FILE = Path(__file__).parent / "agent_instructions/media_selector.md"
-
-# Memory Extractor file located alongside this module
-MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extractor.md"
-
-# History summarizer system instructions located alongside this module
-HISTORY_SUMMARIZER_SYSTEM = Path(__file__).parent / "agent_instructions/history_summarizer.md"
-
-
-GENERATED_FILES_DIR = (Path(__file__).parent / "generated_files").resolve()
-ALLOWED_OUTPUT_DIRECTORIES = (
-    GENERATED_FILES_DIR,
-)
-SUPPORTED_OUTPUT_FILE_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
-    ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v",
-    ".pdf", ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml",
-    ".html", ".htm", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".zip",
-}
-MAX_INPUT_ATTACHMENTS = 10
 REVIEWER_TASK_NAME = "Reviewer"
 THINKING_LEVEL_TO_MODEL = {
     "MINIMAL": MINIMAL_MODEL,
@@ -100,8 +77,8 @@ def generate_response(
     default_temperature = 1.0
     temperature = default_temperature
     attempt_number = 1
-    normalized_attachments = _normalize_attachments(image)
-    attachment_text, attachment_memory_context = _ingest_attachments_for_memory(
+    normalized_attachments = attachments.normalize_attachments(image)
+    attachment_text, attachment_memory_context = attachments.ingest_attachments_for_memory(
         normalized_attachments,
         history_file,
     )
@@ -120,7 +97,11 @@ def generate_response(
 
     if not job:
         current_history_text = history.get_conversation_history(history_file=history_file)
-        relevant_memories_text = _build_relevant_memories_text(current_history_text, semantic_limit=5, file_limit=3)
+        relevant_memories_text = memory.build_relevant_memories_text(
+            current_history_text,
+            semantic_limit=5,
+            file_limit=3,
+        )
 
         intent_response = ""
         try:
@@ -149,12 +130,12 @@ def generate_response(
                     backoff_call=call_with_exponential_backoff,
                 )
                 try:
-                    relevant_memories_history = _build_relevant_memories_text(
+                    relevant_memories_history = memory.build_relevant_memories_text(
                         history.get_conversation_history(history_file=history_file),
                         semantic_limit=10,
                         file_limit=4,
                     )
-                    _run_memory_extraction_async(
+                    memory.run_memory_extraction_async(
                         history_file=history_file,
                         temperature=default_temperature,
                         relevant_memories_text=relevant_memories_history,
@@ -298,7 +279,7 @@ def generate_response(
         if exit_string == "<yes>":
             break
         else:
-            _run_history_summarization(
+            history.run_history_summarization(
                 history_file=history_file,
                 temperature=default_temperature,
                 pivot_role="manager",
@@ -326,7 +307,7 @@ def generate_response(
         client=client,
         backoff_call=call_with_exponential_backoff,
     )
-    _run_history_summarization_async(
+    history.run_history_summarization_async(
         history_file=history_file,
         temperature=default_temperature,
         history_cache=post_review_cache.retain(),
@@ -347,7 +328,7 @@ def generate_response(
                 current_history_text=post_review_cache.history_text,
             )
             media_future = executor.submit(
-                _select_media_paths,
+                collect_generated_media.select_media_paths,
                 history_file,
                 user_message,
                 default_temperature,
@@ -372,12 +353,12 @@ def generate_response(
                 media_paths = []
 
         if not job:
-            relevant_memories_history = _build_relevant_memories_text(
+            relevant_memories_history = memory.build_relevant_memories_text(
                 history.get_conversation_history(history_file=history_file),
                 semantic_limit=10,
                 file_limit=4,
             )
-            _run_memory_extraction_async(
+            memory.run_memory_extraction_async(
                 history_file=history_file,
                 temperature=default_temperature,
                 relevant_memories_text=relevant_memories_history,
@@ -387,401 +368,6 @@ def generate_response(
     finally:
         post_review_cache.release()
     return LLMResponse(text=text_response, media_paths=media_paths)
-
-
-def _select_media_paths(
-    history_file: str,
-    user_message: str,
-    temperature: float,
-    history_cache: HistoryContextCache | None = None,
-) -> list[str]:
-    try:
-        from collect_generated_media import get_generated_media, parse_selected_media_paths
-    except Exception as e:
-        print(f"Error importing media selection skill: {e}")
-        return []
-
-    catalog_json = get_generated_media("120")
-    selector_input = (
-        "Latest user request:\n"
-        f"{user_message}\n\n"
-        "Use the conversation history and this generated media catalog JSON:\n"
-        f"{catalog_json}"
-    )
-
-    if history_cache is not None:
-        selector_response = _run_model_api(
-            text=selector_input,
-            system_instructions=MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
-            model=MINIMAL_MODEL,
-            tool_use_allowed=False,
-            force_tool=False,
-            temperature=temperature,
-            thinking_level="low",
-            history_cache=history_cache,
-            current_history_text=history_cache.history_text,
-        )
-    else:
-        selector_response = _run_model_api(
-            text=selector_input,
-            system_instructions=MEDIA_SELECTOR_FILE.read_text(encoding="utf-8"),
-            model=MINIMAL_MODEL,
-            tool_use_allowed=False,
-            force_tool=False,
-            temperature=temperature,
-            thinking_level="low",
-            current_history_text=history.get_conversation_history(history_file=history_file),
-        )
-    return parse_selected_media_paths(selector_response)
-
-
-def _normalize_attachments(attachments: dict[str, bytes | str] | list[dict[str, bytes | str]] | None) -> list[dict[str, bytes | str]]:
-    normalized_attachments: list[dict[str, bytes | str]] = []
-    if not attachments:
-        return normalized_attachments
-    if isinstance(attachments, dict):
-        normalized_attachments = [attachments]
-    elif isinstance(attachments, list):
-        normalized_attachments = [item for item in attachments if isinstance(item, dict)]
-    return normalized_attachments[:MAX_INPUT_ATTACHMENTS]
-
-
-def _ingest_attachments_for_memory(
-    attachments: list[dict[str, bytes | str]],
-    history_file: str,
-) -> tuple[str, str]:
-    if not attachments:
-        return "", ""
-
-    extracted_segments: list[str] = []
-    attachment_memory_contexts: list[str] = []
-
-    for index, attachment in enumerate(attachments, start=1):
-        extracted_text = _convert_single_attachment_to_text(attachment)
-
-        indexed_item = None
-        try:
-            indexed_item = memory.write_attachment_memory(
-                attachment=attachment,
-                history_file=history_file,
-                extracted_text=extracted_text,
-            )
-        except Exception as e:
-            print(f"Error writing attachment memory: {e}")
-
-        filename = attachment.get("filename")
-        if extracted_text and isinstance(filename, str) and filename:
-            extracted_segments.append(f"[Attachment {index}: {filename}]\n{extracted_text}")
-        elif extracted_text:
-            extracted_segments.append(f"[Attachment {index}]\n{extracted_text}")
-
-        if indexed_item is not None:
-            attachment_memory_contexts.append(memory.render_memory_for_prompt(indexed_item))
-
-    return "\n\n".join(extracted_segments), "\n\n".join(attachment_memory_contexts)
-
-
-def _build_relevant_memories_text(query: str, semantic_limit: int, file_limit: int) -> str:
-    relevant_memories = memory.search_all_memories(
-        query,
-        semantic_limit=semantic_limit,
-        file_limit=file_limit,
-    )
-    return "\n\n".join(memory.render_memory_for_prompt(item) for item in relevant_memories)
-
-
-def _convert_single_attachment_to_text(attachment: dict[str, bytes | str]) -> str:
-    if not attachment:
-        return ""
-
-    attachment_bytes = attachment.get("data")
-    filename = attachment.get("filename")
-
-    if not isinstance(attachment_bytes, bytes) or not attachment_bytes:
-        return ""
-
-    mime_type = _normalize_attachment_mime_type(attachment)
-
-    if not isinstance(filename, str) or not filename:
-        filename = _default_attachment_name_for_mime_type(mime_type)
-
-    prompt = _build_attachment_extraction_prompt(mime_type)
-
-    try:
-        response = call_with_exponential_backoff(
-            lambda: client.models.generate_content(
-                model=LOW_MODEL,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part(text=f"Attachment filename: {filename}\nAttachment MIME type: {mime_type}\n{prompt}"),
-                            types.Part.from_bytes(data=attachment_bytes, mime_type=mime_type),
-                        ],
-                    )
-                ],
-                config=types.GenerateContentConfig(temperature=0.2),
-            ),
-            description="Gemini attachment extraction",
-        )
-        return (getattr(response, "text", "") or "").strip()
-    except Exception as e:
-        print(f"Error converting attachment to text: {e}")
-
-    return ""
-
-
-def _normalize_attachment_mime_type(attachment: dict[str, bytes | str]) -> str:
-    mime_type = attachment.get("mime_type")
-    if isinstance(mime_type, str) and mime_type.strip():
-        return mime_type.strip().lower()
-
-    filename = attachment.get("filename")
-    if isinstance(filename, str) and filename:
-        guessed_mime_type, _ = mimetypes.guess_type(filename)
-        if guessed_mime_type:
-            return guessed_mime_type.lower()
-
-    return "application/octet-stream"
-
-
-def _default_attachment_name_for_mime_type(mime_type: str) -> str:
-    if mime_type.startswith("image/"):
-        return "image"
-    if mime_type.startswith("video/"):
-        return "video"
-    if mime_type.startswith("audio/"):
-        return "audio"
-    if mime_type == "application/pdf":
-        return "document"
-    return "attachment"
-
-
-def _build_attachment_extraction_prompt(mime_type: str) -> str:
-    if mime_type.startswith("image/"):
-        return  (
-            "Extract the useful content from this image. Return plain text only, concise but complete. "
-            "Include a description of important visual elements, any visible on-screen text, and relevant contextual details."
-        )
-    if mime_type.startswith("video/"):
-        return (
-            "Extract the useful content from this video. Return plain text only, concise but complete. "
-            "Include a brief description of important visual events, any visible on-screen text, and a transcript or summary of spoken audio when present."
-        )
-    if mime_type.startswith("audio/"):
-        return (
-            "Extract the useful content from this audio clip. Return plain text only, concise but complete. "
-            "Transcribe spoken words when possible and summarize relevant non-speech audio if it matters."
-        )
-    if mime_type == "application/pdf":
-        return (
-            "Extract the useful content from this PDF document. Return plain text only, concise but complete. "
-            "Preserve important wording, headings, lists, and key structured details when they matter to the user's request."
-        )
-    return (
-        "Extract the useful content from this attachment. Return plain text only, concise but complete. "
-        "Include readable text and summarize any relevant non-text content."
-    )
-
-
-def _run_memory_extraction_async(
-    history_file: str,
-    temperature: float,
-    relevant_memories_text: str = "",
-    attachment_context_text: str = "",
-    history_cache: HistoryContextCache | None = None,
-) -> None:
-    def _worker() -> None:
-        try:
-            extraction_context = "Relevant memories:\n\n" + relevant_memories_text
-            if attachment_context_text.strip():
-                extraction_context += "\n\nRecent attachment memories:\n\n" + attachment_context_text.strip()
-
-            if history_cache is not None:
-                memory_extractor_response = _run_model_api(
-                    text=extraction_context,
-                    system_instructions=MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
-                    model=MINIMAL_MODEL,
-                    tool_use_allowed=False,
-                    force_tool=False,
-                    temperature=temperature,
-                    thinking_level="low",
-                    history_cache=history_cache,
-                    current_history_text=history_cache.history_text,
-                )
-            else:
-                extraction_input = (
-                    "History: "
-                    + history.get_conversation_history(history_file=history_file)
-                    + "\n\n"
-                    + extraction_context
-                )
-                memory_extractor_response = _run_model_api(
-                    text=extraction_input,
-                    system_instructions=MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
-                    model=MINIMAL_MODEL,
-                    tool_use_allowed=False,
-                    force_tool=False,
-                    temperature=temperature,
-                    thinking_level="low"
-                )
-
-            raw_response = (memory_extractor_response or "").strip()
-            parsed_candidates = _parse_memory_extraction_response(raw_response)
-            if parsed_candidates:
-                for candidate in parsed_candidates:
-                    metadata = {
-                        "source_type": "memory_extractor",
-                        "history_file": history_file,
-                        "memory_category": candidate["category"],
-                    }
-                    if candidate["related_file_ids"]:
-                        metadata["related_file_ids_json"] = json.dumps(candidate["related_file_ids"], ensure_ascii=False)
-                    memory.write_semantic_memory(candidate["memory"], metadata=metadata)
-                history.append_history(
-                    role="MemoryExtractor",
-                    text=json.dumps({"memories": parsed_candidates}, ensure_ascii=False),
-                    history_file=history_file,
-                )
-            elif raw_response and raw_response != "<NO_MEMORY>":
-                memory.write_semantic_memory(
-                    raw_response,
-                    metadata={
-                        "source_type": "memory_extractor_fallback",
-                        "history_file": history_file,
-                    },
-                )
-                history.append_history(role="MemoryExtractor", text=raw_response, history_file=history_file)
-        except Exception as e:
-            print(f"Error generating memory extractor response: {e}")
-        finally:
-            if history_cache is not None:
-                history_cache.release()
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def _parse_memory_extraction_response(response_text: str) -> list[dict[str, Any]]:
-    cleaned_text = (response_text or "").strip()
-    if not cleaned_text or cleaned_text == "<NO_MEMORY>":
-        return []
-
-    def _try_parse_json(text: str) -> Any:
-        try:
-            return json.loads(text)
-        except Exception:
-            return None
-
-    parsed = _try_parse_json(cleaned_text)
-    if parsed is None:
-        match = re.search(r"(\{.*\}|\[.*\])", cleaned_text, re.S)
-        if match:
-            parsed = _try_parse_json(match.group(1))
-
-    if isinstance(parsed, dict):
-        candidates = parsed.get("memories")
-    else:
-        candidates = parsed
-
-    if not isinstance(candidates, list):
-        return []
-
-    normalized_candidates: list[dict[str, Any]] = []
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-
-        memory_text = str(candidate.get("memory") or candidate.get("text") or "").strip()
-        if not memory_text:
-            continue
-
-        category = str(candidate.get("category") or "general").strip() or "general"
-        raw_related_file_ids = candidate.get("related_file_ids") or []
-        if not isinstance(raw_related_file_ids, list):
-            raw_related_file_ids = []
-
-        normalized_candidates.append(
-            {
-                "memory": memory_text,
-                "category": category,
-                "related_file_ids": [str(file_id) for file_id in raw_related_file_ids if str(file_id).strip()],
-            }
-        )
-
-    return normalized_candidates
-
-
-def _run_history_summarization(
-    history_file: str,
-    temperature: float,
-    pivot_role: str = "user",
-    history_cache: HistoryContextCache | None = None,
-    current_history_text: str | None = None,
-) -> None:
-    try:
-        if history_cache is not None:
-            summary = _run_model_api(
-                text=(
-                    f"Summarize only the conversation history before the latest '{pivot_role}' message. "
-                    f"Do not include that latest '{pivot_role}' message or anything after it."
-                ),
-                system_instructions=HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
-                model=MINIMAL_MODEL,
-                tool_use_allowed=False,
-                force_tool=False,
-                temperature=temperature,
-                thinking_level="low",
-                history_cache=history_cache,
-                current_history_text=current_history_text,
-            )
-        else:
-            prior_history = history.get_history_before_latest_role(history_file=history_file, role=pivot_role)
-            if not prior_history:
-                return
-
-            summary = _run_model_api(
-                prior_history,
-                HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
-                MINIMAL_MODEL,
-                tool_use_allowed=False,
-                force_tool=False,
-                temperature=temperature,
-                thinking_level="low",
-            )
-
-        cleaned_summary = (summary or "").strip()
-        if not cleaned_summary:
-            return
-
-        history.rewrite_history_with_summary_before_latest_role(
-            summary_text=cleaned_summary,
-            history_file=history_file,
-            pivot_role=pivot_role,
-        )
-    except Exception as e:
-        print(f"Error running history summarization: {e}")
-    finally:
-        if history_cache is not None:
-            history_cache.release()
-
-
-def _run_history_summarization_async(
-    history_file: str,
-    temperature: float,
-    pivot_role: str = "user",
-    history_cache: HistoryContextCache | None = None,
-    current_history_text: str | None = None,
-) -> None:
-    def _worker() -> None:
-        _run_history_summarization(
-            history_file=history_file,
-            temperature=temperature,
-            pivot_role=pivot_role,
-            history_cache=history_cache,
-            current_history_text=current_history_text,
-        )
-
-    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _get_function_declarations(client: genai.Client = None) -> list[types.FunctionDeclaration]:

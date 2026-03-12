@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import shutil
+import threading
 from pathlib import Path
 import re
 from typing import Any, Iterable
@@ -29,6 +30,7 @@ from config import (
     MEMORY_SEMANTIC_COLLECTION_NAME,
     get_paid_gemini_api_key,
 )
+import history
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -40,6 +42,7 @@ DEFAULT_COLLECTION_NAME = MEMORY_SEMANTIC_COLLECTION_NAME
 DEFAULT_FILE_COLLECTION_NAME = MEMORY_FILE_COLLECTION_NAME
 DEFAULT_ARCHIVE_PATH = Path(MEMORY_ARCHIVE_DIR)
 MEMORY_RELATED = Path(__file__).parent / "agent_instructions" / "memory_related.md"
+MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions" / "memory_extractor.md"
 MEMORY_SCHEMA_VERSION = "2026-03-11-gemini2"
 _SUPPORTED_ATTACHMENT_EMBEDDING_PREFIXES = ("image/", "video/", "audio/")
 _SUPPORTED_ATTACHMENT_EMBEDDING_TYPES = {"application/pdf"}
@@ -464,6 +467,147 @@ def write_attachment_memory(
         embedding=embedding,
     )
     return MemoryItem(memory_id=archived_attachment.file_id, text=document_text, metadata=metadata)
+
+
+def build_relevant_memories_text(query: str, semantic_limit: int, file_limit: int) -> str:
+    relevant_memories = search_all_memories(
+        query,
+        semantic_limit=semantic_limit,
+        file_limit=file_limit,
+    )
+    return "\n\n".join(render_memory_for_prompt(item) for item in relevant_memories)
+
+
+def run_memory_extraction_async(
+    history_file: str,
+    temperature: float,
+    relevant_memories_text: str = "",
+    attachment_context_text: str = "",
+    history_cache: object | None = None,
+) -> None:
+    def _worker() -> None:
+        try:
+            from importlib import import_module
+
+            llm = import_module("llm")
+            run_model_api = llm._run_model_api
+
+            extraction_context = "Relevant memories:\n\n" + relevant_memories_text
+            if attachment_context_text.strip():
+                extraction_context += "\n\nRecent attachment memories:\n\n" + attachment_context_text.strip()
+
+            if history_cache is not None:
+                memory_extractor_response = run_model_api(
+                    text=extraction_context,
+                    system_instructions=MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
+                    model=MINIMAL_MODEL,
+                    tool_use_allowed=False,
+                    force_tool=False,
+                    temperature=temperature,
+                    thinking_level="low",
+                    history_cache=history_cache,
+                    current_history_text=history_cache.history_text,
+                )
+            else:
+                extraction_input = (
+                    "History: "
+                    + history.get_conversation_history(history_file=history_file)
+                    + "\n\n"
+                    + extraction_context
+                )
+                memory_extractor_response = run_model_api(
+                    text=extraction_input,
+                    system_instructions=MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
+                    model=MINIMAL_MODEL,
+                    tool_use_allowed=False,
+                    force_tool=False,
+                    temperature=temperature,
+                    thinking_level="low",
+                )
+
+            raw_response = (memory_extractor_response or "").strip()
+            parsed_candidates = _parse_memory_extraction_response(raw_response)
+            if parsed_candidates:
+                for candidate in parsed_candidates:
+                    metadata = {
+                        "source_type": "memory_extractor",
+                        "history_file": history_file,
+                        "memory_category": candidate["category"],
+                    }
+                    if candidate["related_file_ids"]:
+                        metadata["related_file_ids_json"] = json.dumps(candidate["related_file_ids"], ensure_ascii=False)
+                    write_semantic_memory(candidate["memory"], metadata=metadata)
+                history.append_history(
+                    role="MemoryExtractor",
+                    text=json.dumps({"memories": parsed_candidates}, ensure_ascii=False),
+                    history_file=history_file,
+                )
+            elif raw_response and raw_response != "<NO_MEMORY>":
+                write_semantic_memory(
+                    raw_response,
+                    metadata={
+                        "source_type": "memory_extractor_fallback",
+                        "history_file": history_file,
+                    },
+                )
+                history.append_history(role="MemoryExtractor", text=raw_response, history_file=history_file)
+        except Exception as exc:
+            print(f"Error generating memory extractor response: {exc}")
+        finally:
+            if history_cache is not None:
+                history_cache.release()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _parse_memory_extraction_response(response_text: str) -> list[dict[str, Any]]:
+    cleaned_text = (response_text or "").strip()
+    if not cleaned_text or cleaned_text == "<NO_MEMORY>":
+        return []
+
+    def _try_parse_json(text: str) -> Any:
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    parsed = _try_parse_json(cleaned_text)
+    if parsed is None:
+        match = re.search(r"(\{.*\}|\[.*\])", cleaned_text, re.S)
+        if match:
+            parsed = _try_parse_json(match.group(1))
+
+    if isinstance(parsed, dict):
+        candidates = parsed.get("memories")
+    else:
+        candidates = parsed
+
+    if not isinstance(candidates, list):
+        return []
+
+    normalized_candidates: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+
+        memory_text = str(candidate.get("memory") or candidate.get("text") or "").strip()
+        if not memory_text:
+            continue
+
+        category = str(candidate.get("category") or "general").strip() or "general"
+        raw_related_file_ids = candidate.get("related_file_ids") or []
+        if not isinstance(raw_related_file_ids, list):
+            raw_related_file_ids = []
+
+        normalized_candidates.append(
+            {
+                "memory": memory_text,
+                "category": category,
+                "related_file_ids": [str(file_id) for file_id in raw_related_file_ids if str(file_id).strip()],
+            }
+        )
+
+    return normalized_candidates
 
 
 def render_memory_for_prompt(memory_item: MemoryItem) -> str:

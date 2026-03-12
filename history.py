@@ -3,9 +3,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import re
 import threading
+from importlib import import_module
 from typing import List, Dict, Optional
 
+from config import MINIMAL_MODEL
+
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
+HISTORY_SUMMARIZER_SYSTEM = Path(__file__).parent / "agent_instructions" / "history_summarizer.md"
 TORONTO_TZ = ZoneInfo("America/Toronto")
 _HISTORY_FILE_LOCK = threading.RLock()
 
@@ -220,3 +224,79 @@ def parse_history_file(history_file: str = "default") -> List[Dict[str, Optional
     if not raw or raw == "No history available.":
         return []
     return parse_history(raw)
+
+
+def run_history_summarization(
+    history_file: str,
+    temperature: float,
+    pivot_role: str = "user",
+    history_cache: object | None = None,
+    current_history_text: str | None = None,
+) -> None:
+    try:
+        llm = import_module("llm")
+        run_model_api = llm._run_model_api
+
+        if history_cache is not None:
+            summary = run_model_api(
+                text=(
+                    f"Summarize only the conversation history before the latest '{pivot_role}' message. "
+                    f"Do not include that latest '{pivot_role}' message or anything after it."
+                ),
+                system_instructions=HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
+                model=MINIMAL_MODEL,
+                tool_use_allowed=False,
+                force_tool=False,
+                temperature=temperature,
+                thinking_level="low",
+                history_cache=history_cache,
+                current_history_text=current_history_text,
+            )
+        else:
+            prior_history = get_history_before_latest_role(history_file=history_file, role=pivot_role)
+            if not prior_history:
+                return
+
+            summary = run_model_api(
+                prior_history,
+                HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
+                MINIMAL_MODEL,
+                tool_use_allowed=False,
+                force_tool=False,
+                temperature=temperature,
+                thinking_level="low",
+            )
+
+        cleaned_summary = (summary or "").strip()
+        if not cleaned_summary:
+            return
+
+        rewrite_history_with_summary_before_latest_role(
+            summary_text=cleaned_summary,
+            history_file=history_file,
+            pivot_role=pivot_role,
+        )
+    except Exception as exc:
+        print(f"Error running history summarization: {exc}")
+    finally:
+        if history_cache is not None:
+            history_cache.release()
+
+
+def run_history_summarization_async(
+    history_file: str,
+    temperature: float,
+    pivot_role: str = "user",
+    history_cache: object | None = None,
+    current_history_text: str | None = None,
+) -> None:
+    def _worker() -> None:
+        run_history_summarization(
+            history_file=history_file,
+            temperature=temperature,
+            pivot_role=pivot_role,
+            history_cache=history_cache,
+            current_history_text=current_history_text,
+        )
+
+    threading.Thread(target=_worker, daemon=True).start()
