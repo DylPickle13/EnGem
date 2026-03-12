@@ -19,7 +19,6 @@ Return either:
 ## Only extract the following types of information:
 - User preferences (for example, "The user prefers tea over coffee")
 - User habits (for example, "The user checks the news before bed")
-- Lessons learned from mistakes that should influence future behavior (for example, "Delete only exact file names, not substring matches")
 
 ## Do NOT extract
 - File records or attachment records directly. Those are handled by the application code.

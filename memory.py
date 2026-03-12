@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import shutil
 from pathlib import Path
 import re
 from typing import Any, Iterable
@@ -515,14 +516,34 @@ def read_all_memory_records(limit: int | None = None) -> list[MemoryItem]:
     return combined
 
 
+def _clear_memory_archive() -> int:
+    """Remove all files under DEFAULT_ARCHIVE_PATH and recreate the directory.
+    Returns the number of files removed.
+    """
+    try:
+        archive_dir = DEFAULT_ARCHIVE_PATH
+        if not archive_dir.exists() or not archive_dir.is_dir():
+            return 0
+        files_to_remove = sum(1 for p in archive_dir.rglob("*") if p.is_file())
+        shutil.rmtree(archive_dir)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        return files_to_remove
+    except Exception:
+        logging.exception("Failed clearing memory archive at '%s'", str(DEFAULT_ARCHIVE_PATH))
+        return 0
+
+
 def clear_all_memory_stores() -> dict[str, int]:
     """Clear semantic and attachment collections."""
     semantic_cleared = get_default_store().clear_memories()
     file_cleared = get_attachment_store().clear_memories()
+    archive_cleared = _clear_memory_archive()
+    total_files = file_cleared + archive_cleared
     return {
         "semantic": semantic_cleared,
-        "files": file_cleared,
-        "total": semantic_cleared + file_cleared,
+        "files": total_files,
+        "archives": archive_cleared,
+        "total": semantic_cleared + total_files,
     }
 
 

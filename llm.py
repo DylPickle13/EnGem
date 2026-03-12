@@ -44,19 +44,9 @@ MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions/memory_extra
 HISTORY_SUMMARIZER_SYSTEM = Path(__file__).parent / "agent_instructions/history_summarizer.md"
 
 
-GENERATED_IMAGES_DIR = (Path(__file__).parent / "generated_images").resolve()
-GENERATED_VIDEOS_DIR = (Path(__file__).parent / "generated_videos").resolve()
 GENERATED_FILES_DIR = (Path(__file__).parent / "generated_files").resolve()
-GENERATED_DOCUMENTS_DIR = (Path(__file__).parent / "generated_documents").resolve()
-RESTRICTED_OUTPUT_DIRECTORIES = (
-    GENERATED_IMAGES_DIR,
-    GENERATED_VIDEOS_DIR,
-)
 ALLOWED_OUTPUT_DIRECTORIES = (
-    GENERATED_IMAGES_DIR,
-    GENERATED_VIDEOS_DIR,
     GENERATED_FILES_DIR,
-    GENERATED_DOCUMENTS_DIR,
 )
 SUPPORTED_OUTPUT_FILE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
@@ -137,7 +127,7 @@ def generate_response(
             intent_response = _run_model_api(
                 text="Classify the latest user request using the conversation context.",
                 system_instructions=INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text,
-                model=LOW_MODEL,
+                model=MINIMAL_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=default_temperature,
@@ -200,7 +190,7 @@ def generate_response(
             manager_response = _run_model_api(
                 text="Review the conversation context and create the execution plan JSON file.",
                 system_instructions=MANAGER_FILE.read_text(encoding="utf-8") + history_file,
-                model=MEDIUM_MODEL,
+                model=LOW_MODEL,
                 tool_use_allowed=True,
                 force_tool=True,
                 temperature=temperature,
@@ -553,24 +543,6 @@ def _ingest_attachments_for_memory(
     return "\n\n".join(extracted_segments), "\n\n".join(attachment_memory_contexts)
 
 
-def _convert_attachments_to_text(attachments: dict[str, bytes | str] | list[dict[str, bytes | str]] | None) -> str:
-    normalized_attachments = _normalize_attachments(attachments)
-    extracted_segments: list[str] = []
-
-    for index, attachment in enumerate(normalized_attachments, start=1):
-        extracted_text = _convert_single_attachment_to_text(attachment)
-        if not extracted_text:
-            continue
-
-        filename = attachment.get("filename")
-        if isinstance(filename, str) and filename:
-            extracted_segments.append(f"[Attachment {index}: {filename}]\n{extracted_text}")
-        else:
-            extracted_segments.append(f"[Attachment {index}]\n{extracted_text}")
-
-    return "\n\n".join(extracted_segments)
-
-
 def _build_relevant_memories_text(query: str, semantic_limit: int, file_limit: int) -> str:
     relevant_memories = memory.search_all_memories(
         query,
@@ -816,7 +788,7 @@ def _run_history_summarization(
                     f"Do not include that latest '{pivot_role}' message or anything after it."
                 ),
                 system_instructions=HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
-                model=LOW_MODEL,
+                model=MINIMAL_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=temperature,
@@ -832,7 +804,7 @@ def _run_history_summarization(
             summary = _run_model_api(
                 prior_history,
                 HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
-                LOW_MODEL,
+                MINIMAL_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=temperature,
