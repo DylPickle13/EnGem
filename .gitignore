@@ -9,3 +9,4 @@ config.py
 /agent_instructions/heartbeat_jobs
 /sandbox
 /generated_files
+/skills

@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
+from progress_indicator import dispatch_execution_plan_preview_async as _dispatch_execution_plan_preview_async
+from progress_indicator import normalize_plan_thinking_level as _normalize_plan_thinking_level
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
 from config import MINIMAL_MODEL as MINIMAL_MODEL, LOW_MODEL as LOW_MODEL, MEDIUM_MODEL as MEDIUM_MODEL, HIGH_MODEL as HIGH_MODEL
 from api_backoff import call_with_exponential_backoff
@@ -56,9 +58,7 @@ SUPPORTED_OUTPUT_FILE_EXTENSIONS = {
     ".zip",
 }
 MAX_INPUT_ATTACHMENTS = 10
-SUB_AGENT_INSTRUCTION_PREVIEW_CHARS = 200
 REVIEWER_TASK_NAME = "Reviewer"
-VALID_PLAN_THINKING_LEVELS = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
 THINKING_LEVEL_TO_MODEL = {
     "MINIMAL": MINIMAL_MODEL,
     "LOW": LOW_MODEL,
@@ -149,14 +149,8 @@ def generate_response(
                     backoff_call=call_with_exponential_backoff,
                 )
                 try:
-                    _run_history_summarization_async(
-                        history_file=history_file,
-                        temperature=default_temperature,
-                        history_cache=post_intent_cache.retain(),
-                    )
-                    summarized_history = history.get_conversation_history(history_file=history_file)
                     relevant_memories_history = _build_relevant_memories_text(
-                        summarized_history,
+                        history.get_conversation_history(history_file=history_file),
                         semantic_limit=10,
                         file_limit=4,
                     )
@@ -184,10 +178,9 @@ def generate_response(
                 print(f"Error clearing execution order file before manager run: {e}")
                 continue
 
-        manager_response = ""
         # Get the manager's response based on the conversation history and the new user message
         try:
-            manager_response = _run_model_api(
+            _run_model_api(
                 text="Review the conversation context and create the execution plan JSON file.",
                 system_instructions=MANAGER_FILE.read_text(encoding="utf-8") + history_file,
                 model=LOW_MODEL,
@@ -394,61 +387,6 @@ def generate_response(
     finally:
         post_review_cache.release()
     return LLMResponse(text=text_response, media_paths=media_paths)
-
-
-def _dispatch_execution_plan_preview_async(
-    execution_plan: list[dict],
-    history_file: str,
-    execution_plan_notifier: Callable[[str, list[dict], int, bool], None] | None,
-    attempt_number: int,
-    reset_previous_preview: bool,
-) -> None:
-    if execution_plan_notifier is None or not execution_plan:
-        return
-
-    def _worker() -> None:
-        try:
-            diagram = _build_execution_plan_ascii_diagram(execution_plan, history_file)
-            if diagram:
-                try:
-                    execution_plan_notifier(diagram, execution_plan, attempt_number, reset_previous_preview)
-                except TypeError:
-                    execution_plan_notifier(diagram, execution_plan)  # type: ignore[misc, call-arg]
-        except Exception as e:
-            print(f"Error dispatching execution plan preview: {e}")
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def _build_execution_plan_ascii_diagram(execution_plan: list[dict], history_file: str) -> str:
-    lines: list[str] = []
-    lines.append(f"+-- Execution Plan ({history_file})")
-
-    for stage_index, stage in enumerate(execution_plan, start=1):
-        mode = str(stage.get("mode", "serial"))
-        sub_agents = stage.get("sub_agents", []) if isinstance(stage.get("sub_agents"), list) else []
-        lines.append(f"|-- Stage {stage_index} [{mode}]")
-
-        for agent_index, agent in enumerate(sub_agents, start=1):
-            if not isinstance(agent, dict):
-                continue
-
-            task_name = str(agent.get("task_name", "unnamed_task"))
-            instruction = str(agent.get("instruction", ""))
-            plan_thinking_level = _normalize_plan_thinking_level(agent.get("thinking_level"))
-            preview = _truncate_instruction_preview(instruction, SUB_AGENT_INSTRUCTION_PREVIEW_CHARS)
-            lines.append(f"|   |-- Agent {agent_index}: {task_name}")
-            lines.append(f"|   |   instruction: {preview}")
-            lines.append(f"|   |   thinking_level: {plan_thinking_level}")
-
-    return "\n".join(lines)
-
-
-def _truncate_instruction_preview(instruction: str, limit: int) -> str:
-    compact = " ".join((instruction or "").split())
-    if len(compact) <= limit:
-        return compact
-    return compact[:limit] + "..."
 
 
 def _select_media_paths(
@@ -985,14 +923,6 @@ def _run_final_reviewer(
         temperature=temperature,
         thinking_level="low",
     )
-
-
-def _normalize_plan_thinking_level(raw_level: object) -> str:
-    if isinstance(raw_level, str):
-        normalized = raw_level.strip().upper()
-        if normalized in VALID_PLAN_THINKING_LEVELS:
-            return normalized
-    return "MEDIUM"
 
 
 def _normalize_api_thinking_level(raw_level: object) -> str:
