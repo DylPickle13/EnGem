@@ -14,7 +14,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from config import MINIMAL_MODEL as planner_model
+from config import MINIMAL_MODEL as MINIMAL_MODEL
 
 PLANNER_INSTRUCTIONS_FILE = _REPO_ROOT / "agent_instructions" / "google_workspace_planner.md"
 RUNTIME_SETTING_KEYS = [
@@ -1532,8 +1532,7 @@ def _run_query_action(query: str, *, runtime_data: dict[str, Any]) -> str:
             normalized_query,
             root_help=root_help,
             feedback=planner_feedback,
-            model_name=str(runtime_data.get("planner_model") or planner_model),
-            thinking_level=str(runtime_data.get("planner_thinking_level") or "low"),
+            model_name=MINIMAL_MODEL,
         )
         last_planner_output = planner_output
 

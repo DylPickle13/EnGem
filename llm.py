@@ -608,7 +608,7 @@ def _run_model_api(
         description=f"Gemini generate_content ({model})",
     )
 
-    if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+    if response.candidates[0].content.parts:
         for part in response.candidates[0].content.parts:
             if part.function_call:
                 function_output += _get_skill(part.function_call.name, part.function_call.args)
