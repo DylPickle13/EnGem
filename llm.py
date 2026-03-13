@@ -102,12 +102,20 @@ def generate_response(
             semantic_limit=5,
             file_limit=3,
         )
+        relevant_skills_text = memory.build_relevant_skills_text(
+            user_message,
+            limit=5,
+        )
+
+        intent_system_instructions = INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text
+        if relevant_skills_text:
+            intent_system_instructions += "\n\nRelevant reusable planning skills:\n\n" + relevant_skills_text
 
         intent_response = ""
         try:
             intent_response = _run_model_api(
                 text="Classify the latest user request using the conversation context.",
-                system_instructions=INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text,
+                system_instructions=intent_system_instructions,
                 model=LOW_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
@@ -161,18 +169,24 @@ def generate_response(
 
         # Get the manager's response based on the conversation history and the new user message
         try:
+            manager_history_text = history.get_conversation_history(history_file=history_file)
+            manager_skill_names = memory.build_skill_names_text(limit=200)
+            manager_system_instructions = MANAGER_FILE.read_text(encoding="utf-8") + history_file
+            if manager_skill_names:
+                manager_system_instructions += "\n\n" + manager_skill_names
+
             _run_model_api(
                 text="Review the conversation context and create the execution plan JSON file.",
-                system_instructions=MANAGER_FILE.read_text(encoding="utf-8") + history_file,
+                system_instructions=manager_system_instructions,
                 model=MEDIUM_MODEL,
                 tool_use_allowed=True,
                 force_tool=True,
                 temperature=temperature,
                 thinking_level="high",
                 history_cache=active_history_cache,
-                current_history_text=history.get_conversation_history(history_file=history_file),
+                current_history_text=manager_history_text,
             )
-            history.append_history(role="Manager", text=f"{EXECUTION_ORDER_FILE} created.", history_file=history_file)
+            history.append_history(role="Manager", text=f"{EXECUTION_ORDER_FILE} created. \nRelevant skills: {manager_skill_names}", history_file=history_file)
         except Exception as e:
             print(f"Error generating manager response: {e}")
 
@@ -359,6 +373,13 @@ def generate_response(
                 file_limit=4,
             )
             memory.run_memory_extraction_async(
+                history_file=history_file,
+                temperature=default_temperature,
+                relevant_memories_text=relevant_memories_history,
+                attachment_context_text=attachment_memory_context,
+                history_cache=post_review_cache.retain(),
+            )
+            memory.run_skill_extraction_async(
                 history_file=history_file,
                 temperature=default_temperature,
                 relevant_memories_text=relevant_memories_history,
@@ -608,9 +629,18 @@ def _run_model_api(
         description=f"Gemini generate_content ({model})",
     )
 
-    if response.candidates[0].content.parts:
-        for part in response.candidates[0].content.parts:
-            if part.function_call:
+    # The API may return a candidate whose `content` is None (no function-calling parts).
+    # Guard against that case before iterating `parts`.
+    parts = None
+    if getattr(response, "candidates", None):
+        candidate0 = response.candidates[0]
+        if candidate0 is not None:
+            content = getattr(candidate0, "content", None)
+            parts = getattr(content, "parts", None) if content is not None else None
+
+    if parts:
+        for part in parts:
+            if getattr(part, "function_call", None):
                 function_output += _get_skill(part.function_call.name, part.function_call.args)
                     
     output = ""

@@ -27,6 +27,8 @@ from config import (
     MEMORY_ARCHIVE_DIR,
     MEMORY_FILE_COLLECTION_NAME,
     MEMORY_SEMANTIC_COLLECTION_NAME,
+    SKILL_COLLECTION_NAME,
+    SKILL_DB_DIR,
     get_paid_gemini_api_key,
 )
 import history
@@ -36,12 +38,17 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 
-DEFAULT_DB_PATH = Path(__file__).parent / "memory" / "vector_db"
+DEFAULT_MEMORY_DB_PATH = Path(__file__).parent / "memory" / "memories_vector_db"
+DEFAULT_DB_PATH = DEFAULT_MEMORY_DB_PATH
+DEFAULT_SKILL_DB_PATH = Path(SKILL_DB_DIR)
 DEFAULT_COLLECTION_NAME = MEMORY_SEMANTIC_COLLECTION_NAME
 DEFAULT_FILE_COLLECTION_NAME = MEMORY_FILE_COLLECTION_NAME
+DEFAULT_SKILL_COLLECTION_NAME = SKILL_COLLECTION_NAME
 DEFAULT_ARCHIVE_PATH = Path(MEMORY_ARCHIVE_DIR)
 MEMORY_RELATED = Path(__file__).parent / "agent_instructions" / "memory_related.md"
 MEMORY_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions" / "memory_extractor.md"
+SKILL_EXTRACTOR_FILE = Path(__file__).parent / "agent_instructions" / "skill_extractor.md"
+SKILLS_DIR = Path(__file__).parent / "skills"
 MEMORY_SCHEMA_VERSION = "2026-03-11-gemini2"
 _SUPPORTED_ATTACHMENT_EMBEDDING_PREFIXES = ("image/", "video/", "audio/")
 _SUPPORTED_ATTACHMENT_EMBEDDING_TYPES = {"application/pdf"}
@@ -49,6 +56,9 @@ _SUPPORTED_ATTACHMENT_EMBEDDING_TYPES = {"application/pdf"}
 _embedding_service: GeminiEmbeddingService | None = None
 _default_store: VectorMemoryStore | None = None
 _attachment_store: VectorMemoryStore | None = None
+_skill_store: VectorMemoryStore | None = None
+_skill_file_lock = threading.RLock()
+_skill_migration_checked = False
 
 
 def _utcnow_iso() -> str:
@@ -224,6 +234,64 @@ class VectorMemoryStore:
         )
         self.collection: Collection = self.client.get_or_create_collection(name=collection_name)
 
+        # Ensure the collection's embedding dimensionality matches the embedding service.
+        # If the existing collection contains vectors with a different dimensionality
+        # (e.g. 1536) than the configured Gemini embedding dimension (e.g. 3072),
+        # switch to / create a collection suffixed with the required dimension
+        # to avoid upsert/query failures due to vector size mismatches.
+        try:
+            existing_dim: int | None = None
+            # Only attempt checks if collection has items
+            try:
+                existing_count = self.collection.count()
+            except Exception:
+                existing_count = 0
+
+            if existing_count and existing_count > 0:
+                # Prefer explicit per-item metadata if present
+                try:
+                    meta_res = self.collection.get(include=["metadatas"], limit=1)
+                    metadatas = meta_res.get("metadatas") or []
+                    if metadatas and isinstance(metadatas[0], dict) and "embedding_dim" in metadatas[0]:
+                        existing_dim = int(metadatas[0].get("embedding_dim") or 0)
+                except Exception:
+                    existing_dim = None
+
+                # Fall back to inspecting stored embedding vector length
+                if existing_dim is None:
+                    try:
+                        emb_res = self.collection.get(include=["embeddings"], limit=1)
+                        embeddings = emb_res.get("embeddings") or []
+                        if embeddings:
+                            emb = embeddings[0]
+                            # Handle possible nesting (e.g. [[...]])
+                            if isinstance(emb, list) and emb and isinstance(emb[0], list):
+                                emb = emb[0]
+                            if isinstance(emb, list):
+                                existing_dim = len(emb)
+                    except Exception:
+                        existing_dim = None
+
+            desired_dim = int(getattr(self.embedding_service, "output_dimensionality", 0) or 0)
+            if existing_dim and desired_dim and existing_dim != desired_dim:
+                suffix = f"_{desired_dim}"
+                # Avoid duplicating suffix if already present
+                if not str(self.collection_name).endswith(suffix):
+                    new_name = f"{self.collection_name}{suffix}"
+                else:
+                    new_name = self.collection_name
+                logging.warning(
+                    "Collection '%s' has embedding dim %s but configured dim is %s; switching to '%s'",
+                    self.collection_name,
+                    existing_dim,
+                    desired_dim,
+                    new_name,
+                )
+                self.collection_name = new_name
+                self.collection = self.client.get_or_create_collection(name=self.collection_name)
+        except Exception:
+            logging.exception("Failed to verify or migrate collection embedding dimensionality")
+
     def write_memory(
         self,
         text: str,
@@ -331,7 +399,7 @@ def get_default_store() -> VectorMemoryStore:
     global _default_store
     if _default_store is None:
         _default_store = VectorMemoryStore(
-            db_path=DEFAULT_DB_PATH,
+            db_path=DEFAULT_MEMORY_DB_PATH,
             collection_name=DEFAULT_COLLECTION_NAME,
         )
     return _default_store
@@ -342,10 +410,70 @@ def get_attachment_store() -> VectorMemoryStore:
     global _attachment_store
     if _attachment_store is None:
         _attachment_store = VectorMemoryStore(
-            db_path=DEFAULT_DB_PATH,
+            db_path=DEFAULT_MEMORY_DB_PATH,
             collection_name=DEFAULT_FILE_COLLECTION_NAME,
         )
     return _attachment_store
+
+
+def get_skill_store() -> VectorMemoryStore:
+    """Convenience factory for the reusable skill memory store."""
+    global _skill_store, _skill_migration_checked
+    if _skill_store is None:
+        _skill_store = VectorMemoryStore(
+            db_path=DEFAULT_SKILL_DB_PATH,
+            collection_name=DEFAULT_SKILL_COLLECTION_NAME,
+        )
+    if not _skill_migration_checked:
+        _migrate_legacy_skill_records()
+        _skill_migration_checked = True
+    return _skill_store
+
+
+def _migrate_legacy_skill_records() -> None:
+    """Move legacy skill records from semantic store into dedicated skill store."""
+    try:
+        legacy_records = get_default_store().read_all_memories(where={"record_type": "skill"})
+    except Exception:
+        return
+
+    if not legacy_records:
+        return
+
+    try:
+        destination_store = _skill_store or VectorMemoryStore(
+            db_path=DEFAULT_SKILL_DB_PATH,
+            collection_name=DEFAULT_SKILL_COLLECTION_NAME,
+        )
+    except Exception:
+        return
+
+    try:
+        existing_ids = {
+            item.memory_id
+            for item in destination_store.read_all_memories(where={"record_type": "skill"})
+        }
+    except Exception:
+        existing_ids = set()
+
+    migrated_ids: list[str] = []
+    for item in legacy_records:
+        if item.memory_id not in existing_ids:
+            try:
+                destination_store.write_memory(
+                    text=item.text,
+                    metadata=dict(item.metadata or {}),
+                    memory_id=item.memory_id,
+                )
+            except Exception:
+                continue
+        migrated_ids.append(item.memory_id)
+
+    if migrated_ids:
+        try:
+            get_default_store().collection.delete(ids=migrated_ids)
+        except Exception:
+            pass
 
 
 def archive_attachment(
@@ -473,6 +601,322 @@ def build_relevant_memories_text(query: str, semantic_limit: int, file_limit: in
         file_limit=file_limit,
     )
     return "\n\n".join(render_memory_for_prompt(item) for item in relevant_memories)
+
+
+def _slugify_skill_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug or "skill"
+
+
+def _coerce_skill_confidence(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except Exception:
+        return 0.7
+    return max(0.0, min(1.0, numeric))
+
+
+def _build_skill_document_text(skill: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            f"Skill: {skill['name']}",
+            f"Summary: {skill['summary']}",
+            f"When to use: {skill['when_to_use']}",
+            f"Planning pattern: {skill['planning_pattern']}",
+            f"Tags: {', '.join(skill['tags']) if skill['tags'] else 'none'}",
+            f"Confidence: {skill['confidence']:.2f}",
+        ]
+    )
+
+
+def _render_skill_markdown(
+    skill: dict[str, Any],
+    history_file: str,
+    created_at: str,
+) -> str:
+    cleaned_history_file = (history_file or "default").replace("\n", " ").strip() or "default"
+    return (
+        f"# {skill['name']}\n\n"
+        "## Summary\n"
+        f"{skill['summary']}\n\n"
+        "## When To Use\n"
+        f"{skill['when_to_use']}\n\n"
+        "## Planning Pattern\n"
+        f"{skill['planning_pattern']}\n\n"
+        "## Source\n"
+        f"Extracted from conversation history `{cleaned_history_file}` on {created_at}.\n"
+    )
+
+
+def _write_skill_markdown_file(
+    skill_id: str,
+    skill: dict[str, Any],
+    history_file: str,
+    created_at: str,
+) -> Path:
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    base_name = _slugify_skill_name(skill['name'])
+
+    with _skill_file_lock:
+        counter = 0
+        while True:
+            suffix = f"_{counter}" if counter else ""
+            candidate_path = SKILLS_DIR / f"{base_name}{suffix}.md"
+            if not candidate_path.exists():
+                break
+            counter += 1
+
+        candidate_path.write_text(
+            _render_skill_markdown(
+                skill=skill,
+                history_file=history_file,
+                created_at=created_at,
+            ),
+            encoding="utf-8",
+        )
+    return candidate_path
+
+
+def _persist_skill_candidate(skill: dict[str, Any], history_file: str) -> dict[str, Any]:
+    normalized_name = _normalize_text(skill["name"])
+    existing_skill_records = get_skill_store().read_all_memories(where={"record_type": "skill"})
+    for item in existing_skill_records:
+        existing_name = _normalize_text(str((item.metadata or {}).get("skill_name") or ""))
+        if existing_name and existing_name == normalized_name:
+            return {
+                "status": "duplicate",
+                "skill_name": skill["name"],
+                "memory_id": item.memory_id,
+                "skill_file": str((item.metadata or {}).get("skill_file") or ""),
+            }
+
+    created_at = _utcnow_iso()
+    document_text = _build_skill_document_text(skill)
+    skill_id = hashlib.sha256(f"{history_file}|{document_text}".encode("utf-8")).hexdigest()
+
+    metadata = {
+        "record_type": "skill",
+        "source_type": "skill_extractor",
+        "history_file": history_file,
+        "skill_name": skill["name"],
+        "skill_status": "draft",
+        "skill_confidence": skill["confidence"],
+        "skill_tags_json": json.dumps(skill["tags"], ensure_ascii=False),
+        "schema_version": MEMORY_SCHEMA_VERSION,
+        "created_at": created_at,
+    }
+
+    skill_path = _write_skill_markdown_file(
+        skill_id=skill_id,
+        skill=skill,
+        history_file=history_file,
+        created_at=created_at,
+    )
+
+    skill_file = str(skill_path)
+    metadata["skill_file"] = skill_file
+    memory_id = get_skill_store().write_memory(
+        text=document_text,
+        metadata=metadata,
+        memory_id=skill_id,
+    )
+
+    return {
+        "status": "created",
+        "skill_name": skill["name"],
+        "memory_id": memory_id,
+        "skill_file": skill_file,
+    }
+
+
+def run_skill_extraction_async(
+    history_file: str,
+    temperature: float,
+    relevant_memories_text: str = "",
+    attachment_context_text: str = "",
+    history_cache: object | None = None,
+) -> None:
+    def _worker() -> None:
+        try:
+            from importlib import import_module
+
+            llm = import_module("llm")
+            run_model_api = llm._run_model_api
+
+            extraction_context = "Relevant memories:\n\n" + (relevant_memories_text or "none")
+            if attachment_context_text.strip():
+                extraction_context += "\n\nRecent attachment memories:\n\n" + attachment_context_text.strip()
+
+            if history_cache is not None:
+                extractor_response = run_model_api(
+                    text=extraction_context,
+                    system_instructions=SKILL_EXTRACTOR_FILE.read_text(encoding="utf-8"),
+                    model=MINIMAL_MODEL,
+                    tool_use_allowed=False,
+                    force_tool=False,
+                    temperature=temperature,
+                    thinking_level="low",
+                    history_cache=history_cache,
+                    current_history_text=history_cache.history_text,
+                )
+            else:
+                extraction_input = (
+                    "History: "
+                    + history.get_conversation_history(history_file=history_file)
+                    + "\n\n"
+                    + extraction_context
+                )
+                extractor_response = run_model_api(
+                    text=extraction_input,
+                    system_instructions=SKILL_EXTRACTOR_FILE.read_text(encoding="utf-8"),
+                    model=MINIMAL_MODEL,
+                    tool_use_allowed=False,
+                    force_tool=False,
+                    temperature=temperature,
+                    thinking_level="low",
+                )
+
+            raw_response = (extractor_response or "").strip()
+            parsed_skills = _parse_skill_extraction_response(raw_response)
+
+            if parsed_skills:
+                outcomes = [_persist_skill_candidate(skill=skill, history_file=history_file) for skill in parsed_skills]
+                history.append_history(
+                    role="SkillExtractor",
+                    text=json.dumps({"skills": parsed_skills, "outcomes": outcomes}, ensure_ascii=False),
+                    history_file=history_file,
+                )
+            elif raw_response and raw_response != "<NO_SKILL>":
+                history.append_history(role="SkillExtractor", text=raw_response, history_file=history_file)
+        except Exception as exc:
+            print(f"Error generating skill extractor response: {exc}")
+        finally:
+            if history_cache is not None:
+                history_cache.release()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _parse_skill_extraction_response(response_text: str) -> list[dict[str, Any]]:
+    cleaned_text = (response_text or "").strip()
+    if not cleaned_text or cleaned_text == "<NO_SKILL>":
+        return []
+
+    def _try_parse_json(text: str) -> Any:
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    parsed = _try_parse_json(cleaned_text)
+    if parsed is None:
+        match = re.search(r"(\{.*\}|\[.*\])", cleaned_text, re.S)
+        if match:
+            parsed = _try_parse_json(match.group(1))
+
+    if isinstance(parsed, dict):
+        candidates = parsed.get("skills")
+    else:
+        candidates = parsed
+
+    if not isinstance(candidates, list):
+        return []
+
+    normalized_candidates: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+
+        name = str(candidate.get("name") or "").strip()
+        summary = str(candidate.get("summary") or "").strip()
+        when_to_use = str(candidate.get("when_to_use") or "").strip()
+        planning_pattern = str(candidate.get("planning_pattern") or "").strip()
+        if not all([name, summary, when_to_use, planning_pattern]):
+            continue
+
+        raw_tags = candidate.get("tags")
+        if not isinstance(raw_tags, list):
+            raw_tags = []
+        tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+
+        normalized_candidates.append(
+            {
+                "name": name,
+                "summary": summary,
+                "when_to_use": when_to_use,
+                "planning_pattern": planning_pattern,
+                "tags": tags,
+                "confidence": _coerce_skill_confidence(candidate.get("confidence")),
+            }
+        )
+
+    return normalized_candidates
+
+
+def build_relevant_skills_text(query: str, limit: int = 4) -> str:
+    cleaned_query = (query or "").strip()
+    if not cleaned_query:
+        return ""
+
+    try:
+        skills = get_skill_store().search_memories(
+            cleaned_query,
+            limit=max(1, limit),
+            where={"record_type": "skill"},
+        )
+    except Exception:
+        return ""
+
+    sections: list[str] = []
+    for item in skills:
+        metadata = dict(item.metadata or {})
+        skill_name = str(metadata.get("skill_name") or "Unnamed skill").strip()
+        tags_raw = metadata.get("skill_tags_json")
+        tags_list: list[str] = []
+        if isinstance(tags_raw, str) and tags_raw.strip():
+            try:
+                parsed_tags = json.loads(tags_raw)
+                if isinstance(parsed_tags, list):
+                    tags_list = [str(tag).strip() for tag in parsed_tags if str(tag).strip()]
+            except Exception:
+                tags_list = []
+        tags_text = ", ".join(tags_list) if tags_list else "none"
+        sections.append(
+            "\n".join(
+                [
+                    f"Skill: {skill_name}",
+                    f"Details: {item.text}",
+                    f"Tags: {tags_text}",
+                    f"Status: {metadata.get('skill_status', 'draft')}",
+                ]
+            )
+        )
+
+    return "\n\n".join(sections)
+
+
+def build_skill_names_text(limit: int = 200) -> str:
+    """Return a compact list of available skill names for planner prompts."""
+    try:
+        records = get_skill_store().read_all_memories(
+            limit=max(1, limit),
+            where={"record_type": "skill"},
+        )
+    except Exception:
+        return ""
+
+    names = sorted(
+        {
+            str((item.metadata or {}).get("skill_name") or "").strip()
+            for item in records
+            if str((item.metadata or {}).get("skill_name") or "").strip()
+        }
+    )
+    if not names:
+        return ""
+
+    return "\n".join(["Available reusable planning skill names:", *[f"- {name}" for name in names]])
 
 
 def run_memory_extraction_async(
@@ -625,7 +1069,13 @@ def render_memory_for_prompt(memory_item: MemoryItem) -> str:
 def search_all_memories(query: str, semantic_limit: int = 5, file_limit: int = 3) -> list[MemoryItem]:
     """Query semantic and file memories together."""
     combined: list[MemoryItem] = []
-    combined.extend(get_default_store().search_memories(query, limit=semantic_limit))
+    combined.extend(
+        get_default_store().search_memories(
+            query,
+            limit=semantic_limit,
+            where={"record_type": "semantic_memory"},
+        )
+    )
     combined.extend(get_attachment_store().search_memories(query, limit=file_limit))
     return combined
 
@@ -636,7 +1086,11 @@ def write_semantic_memory(text: str, metadata: dict[str, Any] | None = None) -> 
     if not cleaned_text:
         return None
 
-    existing = get_default_store().search_memories(cleaned_text, limit=5)
+    existing = get_default_store().search_memories(
+        cleaned_text,
+        limit=5,
+        where={"record_type": "semantic_memory"},
+    )
     normalized_candidate = _normalize_text(cleaned_text)
     for item in existing:
         if _normalize_text(item.text) == normalized_candidate:
@@ -648,10 +1102,14 @@ def write_semantic_memory(text: str, metadata: dict[str, Any] | None = None) -> 
 
 
 def read_all_memory_records(limit: int | None = None) -> list[MemoryItem]:
-    """Return semantic and file records together for admin surfaces."""
-    semantic_records = get_default_store().read_all_memories(limit=limit)
+    """Return semantic, file, and skill records together for admin surfaces."""
+    semantic_records = get_default_store().read_all_memories(
+        limit=limit,
+        where={"record_type": "semantic_memory"},
+    )
     file_records = get_attachment_store().read_all_memories(limit=limit)
-    combined = semantic_records + file_records
+    skill_records = get_skill_store().read_all_memories(limit=limit)
+    combined = semantic_records + file_records + skill_records
     if limit is not None:
         return combined[:limit]
     return combined
@@ -675,16 +1133,18 @@ def _clear_memory_archive() -> int:
 
 
 def clear_all_memory_stores() -> dict[str, int]:
-    """Clear semantic and attachment collections."""
+    """Clear semantic, attachment, and skill collections."""
     semantic_cleared = get_default_store().clear_memories()
     file_cleared = get_attachment_store().clear_memories()
+    skill_cleared = get_skill_store().clear_memories()
     archive_cleared = _clear_memory_archive()
     total_files = file_cleared + archive_cleared
     return {
         "semantic": semantic_cleared,
         "files": total_files,
+        "skills": skill_cleared,
         "archives": archive_cleared,
-        "total": semantic_cleared + total_files,
+        "total": semantic_cleared + total_files + skill_cleared,
     }
 
 
@@ -773,7 +1233,11 @@ def forget_memories(topic: str) -> str:
 
     try:
         store = get_default_store()
-        matches = store.search_memories(normalized_topic, limit=5)
+        matches = store.search_memories(
+            normalized_topic,
+            limit=5,
+            where={"record_type": "semantic_memory"},
+        )
 
         if not matches:
             return f"No memories found for topic: '{normalized_topic}'."

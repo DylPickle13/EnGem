@@ -473,7 +473,7 @@ class DiscordBotWrapper:
 			await message.channel.send(
 				"Memory cleared. Removed "
 				f"{cleared_counts['total']} entr{'y' if cleared_counts['total'] == 1 else 'ies'} "
-				f"({cleared_counts['semantic']} semantic, {cleared_counts['files']} file)."
+				f"({cleared_counts['semantic']} semantic, {cleared_counts['files']} file, {cleared_counts.get('skills', 0)} skill)."
 			)
 			return True
 		if content.startswith(f"{self.command_prefix}forget memories"):
