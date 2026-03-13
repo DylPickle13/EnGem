@@ -1533,6 +1533,7 @@ def _run_query_action(query: str, *, runtime_data: dict[str, Any]) -> str:
             root_help=root_help,
             feedback=planner_feedback,
             model_name=MINIMAL_MODEL,
+            thinking_level="low"
         )
         last_planner_output = planner_output
 
