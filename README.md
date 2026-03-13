@@ -25,7 +25,7 @@ python -m playwright install
 - `DISCORD_BOT_TOKEN` — Discord bot token (required to run the bot).
 - `PAID_GEMINI_API_KEY` — Gemini API key used by the LLM clients/tools.
 - `DISCORD_ALLOWED_CHANNELS` — Comma-separated allowed channel names (optional).
-- Optional: `REPO_PATH`, `CRON_JOB_HOUR`, `CRON_JOB_MINUTE`, `HEARTBEAT_INTERVAL_SECONDS`, `MODEL` — see `config.py` for defaults and comments.
+- Optional: `REPO_PATH`, `MODEL` — see `config.py` for defaults and comments.
 
 Important: `config.py` currently contains default placeholders for convenience. Do not commit real secrets — set them in the environment or a secrets manager.
 
@@ -68,11 +68,11 @@ Data, storage, and runtime artifacts
 - Legacy migration: automatic migration from older collection names (for example, `engem_memory`) has been removed. If you have older ChromaDB collections you want to preserve, migrate them manually before upgrading.
 - Generated outputs and artifacts: `generated_files/`. Several tools still reference legacy directories like `generated_images/` and `generated_videos/` for backward compatibility.
 - Sub-agent execution orders: `sub-agents/` (JSON files written at runtime, e.g. `sub-agents/execution_order_<history_name>.json`).
-- Agent instruction templates and scheduled tasks: `agent_instructions/` (contains templates such as `manager.md`, `sub_agent.md`, and `cron_jobs/`).
+- Agent instruction templates: `agent_instructions/` (contains templates such as `manager.md` and `sub_agent.md`).
 
 Key modules (what to look at)
 
-- `discord_bot.py` — Main bot entrypoint and message handling, heartbeat and cron scheduling.
+- `discord_bot.py` — Main bot entrypoint and message handling.
 - `llm.py` — LLM orchestration: intent classification, manager-runner flow, sub-agent dispatch, texter, and media selector.
 - `memory.py` — ChromaDB-backed persistent vector memory store and helper APIs.
 - `history.py`, `history_cache.py` — Conversation history parsing, file I/O, and history caching for model inputs.

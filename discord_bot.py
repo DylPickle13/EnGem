@@ -1,16 +1,12 @@
 import asyncio
-import datetime
 import logging
 import mimetypes
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Optional
 
 from config import (
-	CRON_JOB_HOUR,
-	CRON_JOB_MINUTE,
 	DISCORD_BOT_CHANNELS,
 	DISCORD_BOT_TOKEN,
-    HEARTBEAT_INTERVAL_SECONDS,
 )
 
 import discord
@@ -19,8 +15,6 @@ import llm
 import memory as memory
 import progress_indicator
 
-CRON_JOBS_DIR = Path(__file__).parent / "agent_instructions/cron_jobs"
-HEARTBEAT_JOBS_DIR = Path(__file__).parent / "agent_instructions/heartbeat_jobs"
 DISCORD_MESSAGE_LIMIT = progress_indicator.DISCORD_MESSAGE_LIMIT
 DISCORD_MAX_ATTACHMENTS_PER_MESSAGE = 10
 DISCORD_ATTACHMENT_BATCH_MAX_BYTES = 24 * 1024 * 1024
@@ -82,10 +76,6 @@ class DiscordBotWrapper:
 		self._worker_tasks: set[asyncio.Task[None]] = set()
 		self._worker_start_lock = asyncio.Lock()
 		self._channel_processing_locks: dict[int, asyncio.Lock] = {}
-		self._cron_task: asyncio.Task[None] | None = None
-		self._cron_stop_event: asyncio.Event | None = None
-		self._heartbeat_task: asyncio.Task[None] | None = None
-		self._heartbeat_stop_event: asyncio.Event | None = None
 		self._progress_indicator = progress_indicator.ExecutionPlanProgressIndicator(
 			message_limit=DISCORD_MESSAGE_LIMIT
 		)
@@ -312,7 +302,7 @@ class DiscordBotWrapper:
 		execution_plan_tasks = self._progress_indicator.get_active_tasks()
 		tasks = [
 			task
-			for task in (self._cron_task, self._heartbeat_task, *worker_tasks, *execution_plan_tasks)
+			for task in (*worker_tasks, *execution_plan_tasks)
 			if task is not None and not task.done()
 		]
 		for task in tasks:
@@ -321,8 +311,6 @@ class DiscordBotWrapper:
 		if tasks:
 			await asyncio.gather(*tasks, return_exceptions=True)
 
-		self._cron_task = None
-		self._heartbeat_task = None
 		self._worker_tasks.clear()
 		self._progress_indicator.clear_state()
 
@@ -411,228 +399,6 @@ class DiscordBotWrapper:
 
 		return media_payloads
 
-	@staticmethod
-	def _seconds_until_next_daily_run(target_hour: int, target_minute: int) -> float:
-		now = datetime.datetime.now()
-		next_run = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-		if now >= next_run:
-			next_run += datetime.timedelta(days=1)
-		return (next_run - now).total_seconds()
-
-	def _find_channel_by_name(self, channel_name: str) -> Optional[discord.abc.Messageable]:
-		for guild in self.client.guilds:
-			for channel in guild.text_channels:
-				if channel.name == channel_name:
-					return channel
-		return None
-
-	@staticmethod
-	def _get_task_channel_name(task_file: Path) -> str:
-		return task_file.stem.replace("_", "-")
-
-	def _load_cron_tasks(self) -> list[tuple[str, str, str]]:
-		tasks: list[tuple[str, str, str]] = []
-
-		for task_file in sorted(CRON_JOBS_DIR.glob("*.md")):
-			try:
-				task_prompt = task_file.read_text(encoding="utf-8").strip()
-			except Exception as exc:
-				logging.exception("Error reading scheduled task file '%s': %s", task_file, exc)
-				continue
-
-			if task_prompt:
-				tasks.append((task_file.name, self._get_task_channel_name(task_file), task_prompt))
-
-		return tasks
-
-	def _load_heartbeat_tasks(self) -> list[tuple[str, str, str]]:
-		tasks: list[tuple[str, str, str]] = []
-
-		for task_file in sorted(HEARTBEAT_JOBS_DIR.glob("*.md")):
-			try:
-				task_prompt = task_file.read_text(encoding="utf-8").strip()
-			except Exception as exc:
-				logging.exception("Error reading heartbeat task file '%s': %s", task_file, exc)
-				continue
-
-			if task_prompt:
-				tasks.append((task_file.name, self._get_task_channel_name(task_file), task_prompt))
-
-		return tasks
-
-	def _list_cron_task_names(self) -> list[str]:
-		return [f"{task_name} -> #{channel_name}" for task_name, channel_name, _ in self._load_cron_tasks()]
-
-	def _list_heartbeat_task_names(self) -> list[str]:
-		return [f"{task_name} -> #{channel_name}" for task_name, channel_name, _ in self._load_heartbeat_tasks()]
-
-	def _start_cron_task_if_needed(self, *, run_immediately: bool = False) -> bool:
-		if self._cron_task is not None and not self._cron_task.done():
-			return False
-
-		self._cron_stop_event = asyncio.Event()
-		self._cron_task = asyncio.create_task(self._run_cron_scheduler(run_immediately=run_immediately))
-		return True
-
-	def _start_heartbeat_task_if_needed(self, *, run_immediately: bool = False) -> bool:
-		if self._heartbeat_task is not None and not self._heartbeat_task.done():
-			return False
-
-		self._heartbeat_stop_event = asyncio.Event()
-		self._heartbeat_task = asyncio.create_task(self._run_heartbeat_scheduler(run_immediately=run_immediately))
-		return True
-
-	async def _stop_cron_task_if_running(self) -> bool:
-		if self._cron_task is None or self._cron_task.done():
-			self._cron_task = None
-			self._cron_stop_event = None
-			return False
-
-		if self._cron_stop_event is not None:
-			self._cron_stop_event.set()
-
-		self._cron_task.cancel()
-		await asyncio.gather(self._cron_task, return_exceptions=True)
-		self._cron_task = None
-		self._cron_stop_event = None
-		return True
-
-	async def _stop_heartbeat_task_if_running(self) -> bool:
-		if self._heartbeat_task is None or self._heartbeat_task.done():
-			self._heartbeat_task = None
-			self._heartbeat_stop_event = None
-			return False
-
-		if self._heartbeat_stop_event is not None:
-			self._heartbeat_stop_event.set()
-
-		self._heartbeat_task.cancel()
-		await asyncio.gather(self._heartbeat_task, return_exceptions=True)
-		self._heartbeat_task = None
-		self._heartbeat_stop_event = None
-		return True
-
-	async def _run_cron_scheduler(self, run_immediately: bool = False) -> None:
-		async def send_cron_jobs() -> None:
-			tasks = self._load_cron_tasks()
-			if not tasks:
-				logging.warning("No cron job tasks found in '%s'.", CRON_JOBS_DIR)
-				return
-
-			for task_name, channel_name, task_prompt in tasks:
-				channel = self._find_channel_by_name(channel_name)
-				if channel is None:
-					logging.warning(
-						"Channel '%s' not found for scheduled task '%s'; skipping.",
-						channel_name,
-						task_name,
-					)
-					continue
-
-				try:
-					channel_lock = self._get_channel_processing_lock(channel)
-					async with channel_lock:
-						async with channel.typing():
-							execution_plan_notifier = self._progress_indicator.build_execution_plan_notifier(
-								loop=self.client.loop,
-								channel=channel,
-								history_file=channel_name,
-							)
-							response = await asyncio.to_thread(
-								llm.generate_response,
-								task_prompt,
-								True,
-								channel_name,
-								None,
-								execution_plan_notifier,
-							)
-					payload = self._normalize_response_payload(response)
-					await self._send_long_message(channel, payload.text)
-					await self._progress_indicator.clear_execution_plan_progress_message(channel, channel_name)
-					await self._send_media_attachments(channel, payload.media_paths)
-				except Exception as exc:
-					logging.exception("Error running cron job task '%s': %s", task_name, exc)
-
-		if run_immediately:
-			await send_cron_jobs()
-
-		while True:
-			try:
-				seconds_until_next_run = self._seconds_until_next_daily_run(CRON_JOB_HOUR, CRON_JOB_MINUTE)
-				if self._cron_stop_event is not None:
-					await asyncio.wait_for(
-						self._cron_stop_event.wait(),
-						timeout=seconds_until_next_run,
-					)
-					break
-				await asyncio.sleep(seconds_until_next_run)
-			except asyncio.TimeoutError:
-				pass
-			except asyncio.CancelledError:
-				break
-
-			await send_cron_jobs()
-
-	async def _run_heartbeat_scheduler(self, run_immediately: bool = False) -> None:
-		async def send_heartbeat_jobs() -> None:
-			tasks = self._load_heartbeat_tasks()
-			if not tasks:
-				logging.warning("No heartbeat tasks found in '%s'.", HEARTBEAT_JOBS_DIR)
-				return
-
-			for task_name, channel_name, task_prompt in tasks:
-				channel = self._find_channel_by_name(channel_name)
-				if channel is None:
-					logging.warning(
-						"Channel '%s' not found for heartbeat task '%s'; skipping.",
-						channel_name,
-						task_name,
-					)
-					continue
-
-				try:
-					channel_lock = self._get_channel_processing_lock(channel)
-					async with channel_lock:
-						async with channel.typing():
-							execution_plan_notifier = self._progress_indicator.build_execution_plan_notifier(
-								loop=self.client.loop,
-								channel=channel,
-								history_file=channel_name,
-							)
-							response = await asyncio.to_thread(
-								llm.generate_response,
-								task_prompt,
-								True,
-								channel_name,
-								None,
-								execution_plan_notifier,
-							)
-					payload = self._normalize_response_payload(response)
-					await self._send_long_message(channel, payload.text)
-					await self._progress_indicator.clear_execution_plan_progress_message(channel, channel_name)
-					await self._send_media_attachments(channel, payload.media_paths)
-				except Exception as exc:
-					logging.exception("Error running heartbeat task '%s': %s", task_name, exc)
-
-		if run_immediately:
-			await send_heartbeat_jobs()
-
-		while True:
-			try:
-				if self._heartbeat_stop_event is not None:
-					await asyncio.wait_for(
-						self._heartbeat_stop_event.wait(),
-						timeout=HEARTBEAT_INTERVAL_SECONDS,
-					)
-					break
-				await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-			except asyncio.TimeoutError:
-				pass
-			except asyncio.CancelledError:
-				break
-
-			await send_heartbeat_jobs()
-
 	async def _ensure_worker_pool(self) -> None:
 		async with self._worker_start_lock:
 			self._worker_tasks = {task for task in self._worker_tasks if not task.done()}
@@ -688,10 +454,6 @@ class DiscordBotWrapper:
 				f"- {self.command_prefix}clear memory\n"
 				f"- {self.command_prefix}forget memories {{topic}}\n"
 				f"- {self.command_prefix}list memories [limit]\n"
-				f"- {self.command_prefix}list cron jobs\n"
-				f"- {self.command_prefix}list heartbeat jobs\n"
-				f"- {self.command_prefix}start heartbeat\n"
-				f"- {self.command_prefix}stop heartbeat\n"
 			)
 			return True
 
@@ -743,38 +505,6 @@ class DiscordBotWrapper:
 				record_type = m.metadata.get("record_type", "semantic_memory")
 				formatted.append(f"- [{record_type}] {text}")
 			await self._send_long_message(message.channel, "Memories:\n" + "\n".join(formatted))
-			return True
-		if content == f"{self.command_prefix}list cron jobs":
-			task_names = self._list_cron_task_names()
-			if not task_names:
-				await message.channel.send(f"No .md cron job tasks found in {CRON_JOBS_DIR}.")
-				return True
-
-			formatted_tasks = "\n".join(f"- {name}" for name in task_names)
-			await message.channel.send("Cron job tasks (run in this order):\n" + formatted_tasks)
-			return True
-		if content == f"{self.command_prefix}list heartbeat jobs":
-			task_names = self._list_heartbeat_task_names()
-			if not task_names:
-				await message.channel.send(f"No .md heartbeat tasks found in {HEARTBEAT_JOBS_DIR}.")
-				return True
-
-			formatted_tasks = "\n".join(f"- {name}" for name in task_names)
-			await message.channel.send("Heartbeat tasks (run in this order):\n" + formatted_tasks)
-			return True
-		if content == f"{self.command_prefix}start heartbeat":
-			started = self._start_heartbeat_task_if_needed(run_immediately=True)
-			if started:
-				await message.channel.send("Heartbeat scheduler started and ran immediately.")
-			else:
-				await message.channel.send("Heartbeat scheduler is already running.")
-			return True
-		if content == f"{self.command_prefix}stop heartbeat":
-			stopped = await self._stop_heartbeat_task_if_running()
-			if stopped:
-				await message.channel.send("Heartbeat scheduler stopped.")
-			else:
-				await message.channel.send("Heartbeat scheduler is not running.")
 			return True
 		# Reload command removed
 		return False
@@ -837,8 +567,6 @@ class DiscordBotWrapper:
 		async def on_ready() -> None:
 			logging.info("Discord bot logged in as %s", self.client.user)
 			self._ensure_channel_history_files()
-			self._start_cron_task_if_needed()
-			logging.info("Heartbeat scheduler is idle. Use '%sstart heartbeat' to start it.", self.command_prefix)
 
 		@self.client.event
 		async def on_message(message: discord.Message) -> None:

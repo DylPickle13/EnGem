@@ -13,7 +13,7 @@ When creating the modular plan, follow these steps strictly:
   - The final Reviewer sub-agent is the only exception: it should not call a tool, and it should follow reviewer.md.
   - Do not be too specific in the instructions to the sub-agents about how to use the tool, but be clear about the goal of the sub-task, as the initial research may change what the subsequent steps need to be. 
 3. For each sub-task, set "thinking_level" using exactly one of: "MINIMAL", "LOW", "MEDIUM", "HIGH".
-  - Use "MINIMAL" only when the sub-task mainly needs to call a tool and the tool is doing the heavy lifting (for example: use_browser, run_google_search, generate_image, generate_video, access_google_workspace, or simple run_notebook calls).
+  - Use "MINIMAL" only when the sub-agent mainly needs to call a tool (for example: use_browser, run_google_search, generate_image, generate_video, access_google_workspace (Drive, Calendar, Docs, etc...), or simple run_notebook calls).
   - Use "LOW" for summarizing/verifying/checking tasks.
   - Use "MEDIUM" when the instruction requires analysis/synthesis/debugging/coding, or uses run_python.
   - Use "HIGH" for the very highest level of reasoning, for example when asked to solve a complex problem or come up with a creative solution. This should be very rare. 

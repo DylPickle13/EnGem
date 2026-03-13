@@ -108,7 +108,7 @@ def generate_response(
             intent_response = _run_model_api(
                 text="Classify the latest user request using the conversation context.",
                 system_instructions=INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text,
-                model=MINIMAL_MODEL,
+                model=LOW_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=default_temperature,
@@ -164,7 +164,7 @@ def generate_response(
             _run_model_api(
                 text="Review the conversation context and create the execution plan JSON file.",
                 system_instructions=MANAGER_FILE.read_text(encoding="utf-8") + history_file,
-                model=LOW_MODEL,
+                model=MEDIUM_MODEL,
                 tool_use_allowed=True,
                 force_tool=True,
                 temperature=temperature,
@@ -555,7 +555,7 @@ def _run_model_api(
     cache_tool_config = tool_config if force_tool else None
 
     if model == MINIMAL_MODEL and "2.5" in MINIMAL_MODEL:
-        thinking_config = types.ThinkingConfig(thinking_budget=16384)
+        thinking_config = types.ThinkingConfig(thinking_budget=24576)
     else:
         thinking_config = types.ThinkingConfig(thinking_level=_normalize_api_thinking_level(thinking_level))
 
