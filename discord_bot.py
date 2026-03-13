@@ -2,7 +2,7 @@ import asyncio
 import logging
 import mimetypes
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from config import (
 	DISCORD_BOT_CHANNELS,
@@ -10,6 +10,7 @@ from config import (
 )
 
 import discord
+import calendar_events
 import history
 import llm
 import memory as memory
@@ -21,6 +22,8 @@ DISCORD_ATTACHMENT_BATCH_MAX_BYTES = 24 * 1024 * 1024
 DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
 MESSAGE_WORKER_CONCURRENCY = 3
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
+
+
 def _sanitize_history_filename_component(value: str | None) -> str:
 	value = (value or "").strip()
 	if not value:
@@ -604,6 +607,51 @@ def _clear_sub_agents_directory() -> None:
 				logging.warning("Could not unlink sub-agent file '%s'; it may be in use. Skipping.", file)
 
 
+def _process_calendar_event(event: dict[str, Any]) -> bool:
+	event_name = str(event.get("summary") or "").strip()
+	if not event_name:
+		logging.info("Skipping calendar event without summary: %s", event.get("id"))
+		return False
+
+	description = str(event.get("description") or "").strip()
+	if not description:
+		logging.info("Skipping calendar event '%s': empty description.", event_name)
+		return False
+
+	matching_channel = next(
+		(
+			channel
+			for guild in bot.client.guilds
+			for channel in guild.text_channels
+			if channel.name == event_name
+		),
+		None,
+	)
+	if matching_channel is None:
+		logging.info("Skipping calendar event '%s': no matching Discord channel.", event_name)
+		return False
+
+	class _InjectedCalendarMessage:
+		def __init__(self, channel: discord.TextChannel, content: str) -> None:
+			self.channel = channel
+			self.content = content
+			self.attachments: list[discord.Attachment] = []
+
+	async def _dispatch_as_normal_message() -> None:
+		injected_message = _InjectedCalendarMessage(matching_channel, description)
+		channel_lock = bot._get_channel_processing_lock(matching_channel)
+		async with channel_lock:
+			await bot._process_message(injected_message)
+
+	try:
+		future = asyncio.run_coroutine_threadsafe(_dispatch_as_normal_message(), bot.client.loop)
+		future.result(timeout=900)
+		return True
+	except Exception:
+		logging.exception("Failed to process calendar event '%s' through Discord message pipeline.", event_name)
+		return False
+
+
 if __name__ == "__main__":
 	if not Path(memory.DEFAULT_DB_PATH).exists():
 		memory.get_default_store()
@@ -611,4 +659,15 @@ if __name__ == "__main__":
 	_clear_sub_agents_directory()
 
 	print("Starting EnGem...")
-	DiscordBotWrapper().run()
+	bot = DiscordBotWrapper()
+
+	calendar_thread, calendar_stop_event = calendar_events.check_active_events(
+		poll_interval_seconds=5.0,
+		daemon=False,
+		event_processor=_process_calendar_event,
+	)
+	try:
+		bot.run()
+	finally:
+		calendar_stop_event.set()
+		calendar_thread.join(5)

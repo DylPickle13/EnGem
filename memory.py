@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
-import math
 import os
 import shutil
 import threading
@@ -61,10 +60,8 @@ def _normalize_text(value: str) -> str:
 
 
 def _normalize_embedding(values: list[float]) -> list[float]:
-    magnitude = math.sqrt(sum(component * component for component in values))
-    if magnitude <= 0:
-        return values
-    return [component / magnitude for component in values]
+    # Embedding normalization removed — return raw embeddings unchanged.
+    return values
 
 
 def _batch(items: Iterable[str], batch_size: int) -> Iterable[list[str]]:

@@ -7,7 +7,7 @@ You must support both serial and parallel execution when planning.
 When creating the modular plan, follow these steps strictly:
 1. Break the task into small, manageable sub-tasks. Keep each sub-task simple so it mainly uses one tool/function. Always spawn a sub-agent for each sub-task, no matter how small. 
 2. For each non-reviewer sub-task, specify exactly one tool to use in the instruction. 
-  - Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, run_notebook, deep_research,and access_google_workspace. 
+  - Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, generate_speech, run_notebook, deep_research, and access_google_workspace. 
   - The browser tool exits after it is done, so if you need to do multiple things with the browser, create separate sub-tasks for each and specify the browser tool in each instruction, use run_google_search for search tasks. 
   - The access_google workspace only does one task at a time, so you may need to create multiple agents for each google workspace task. 
   - The final Reviewer sub-agent is the only exception: it should not call a tool, and it should follow reviewer.md.

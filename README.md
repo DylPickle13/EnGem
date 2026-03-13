@@ -1,12 +1,12 @@
 # EnGem
 
-EnGem is a local assistant and automation framework that connects a streaming LLM (Gemini) to host-side tooling and exposes a Discord bot interface. It coordinates sub-agent execution plans, browser automation, code and notebook execution, and media generation — then captures artifacts in `generated_files/`.
+EnGem is a local assistant and automation framework that connects a streaming LLM (Gemini) to host-side tooling and exposes a Discord bot interface. It coordinates intent classification, manager-planner flows, staged sub-agent execution, browser automation, notebook and code execution, media generation, attachment ingestion and archiving, and a ChromaDB-backed memory system. Generated artifacts and user-visible outputs are consolidated under `generated_files/`.
 
-This README was updated on 2026-03-12 to reflect the current repository layout and usage.
+Last updated: 2026-03-13
 
 Quick start
 
-1. Create and activate a virtual environment, then install dependencies:
+1. Create and activate a virtual environment and install dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -14,22 +14,23 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. Install Playwright browser binaries (required for browser automation):
+2. Install Playwright browsers (required for browser automation):
 
 ```bash
 python -m playwright install
 ```
 
-3. Set required environment variables (examples):
+3. Set environment variables (examples — see `config.py` for defaults):
 
 - `DISCORD_BOT_TOKEN` — Discord bot token (required to run the bot).
-- `PAID_GEMINI_API_KEY` — Gemini API key used by the LLM clients/tools.
-- `DISCORD_ALLOWED_CHANNELS` — Comma-separated allowed channel names (optional).
-- Optional: `REPO_PATH`, `MODEL` — see `config.py` for defaults and comments.
+- `PAID_GEMINI_API_KEY` — Paid Gemini API key used for model calls and embeddings.
+- `DISCORD_ALLOWED_CHANNELS` — Optional comma-separated channel names to limit bot activity.
+- `MODEL` — Default model alias; `MINIMAL_MODEL`, `LOW_MODEL`, `MEDIUM_MODEL`, and `HIGH_MODEL` are defined in `config.py`.
+- Embedding/memory settings: `GEMINI_EMBEDDING_MODEL`, `GEMINI_EMBEDDING_DIM`, `GEMINI_EMBEDDING_BATCH_SIZE`, `MEMORY_SEMANTIC_COLLECTION_NAME`, `MEMORY_FILE_COLLECTION_NAME`, `MEMORY_ARCHIVE_DIR`.
 
-Important: `config.py` currently contains default placeholders for convenience. Do not commit real secrets — set them in the environment or a secrets manager.
+Important: `config.py` ships with convenient defaults and some placeholder values. Do not commit real secrets — use environment variables or a secrets manager.
 
-Run the Discord bot
+Running the Discord bot
 
 From the repository root:
 
@@ -37,70 +38,96 @@ From the repository root:
 python discord_bot.py
 ```
 
-This starts the bot (configured via environment variables). The bot writes per-channel conversation history files to `memory/channel_history/` and uses `llm.py` to orchestrate intent classification and sub-agent execution.
+The bot creates per-channel conversation history files in `memory/channel_history/`, responds to messages via `llm.py`, and can attach generated media from `generated_files/` to replies.
+
+Bot commands
+
+- `>commands` — List available bot commands.
+- `>history length` — Show conversation history length.
+- `>clear history` — Clear the current channel history file.
+- `>clear memory` — Clear semantic and file memory stores (`memory.clear_all_memory_stores`).
+- `>forget memories {topic}` — Semantically forget memories related to a topic.
+- `>list memories [limit]` — List stored memory records.
+
+Core concepts
+
+- Manager / Execution Plan: The manager (driven by `agent_instructions/manager.md`) writes a JSON execution plan to `sub-agents/execution_order_<history>.json`. Plans are staged; each stage is `serial` or `parallel` and contains sub-agent instructions.
+- Reviewer: The final stage must be a serial `Reviewer` agent that returns `<yes>` to indicate completion.
+- Tools: Public functions in `tools/` are exposed to sub-agents via the function-calling mechanism (`llm._get_function_declarations`). To add a tool, create a top-level function (no leading underscore) in a `tools/*.py` file.
+- History caching: `history_cache.py` can create cached content for Gemini so long conversation histories are not repeatedly sent to the API.
+
+Attachments & media
+
+- `attachments.py` ingests media attachments (images, audio, video, PDFs), extracts text/metadata using Gemini where possible, and returns extracted segments for inclusion in prompts.
+- Attachments are archived content-addressed in `memory/file_archive/` and indexed into the file-memory collection via `memory.write_attachment_memory`.
+- Generated outputs (images, videos, documents, reports) are stored under `generated_files/`. Legacy directories `generated_images/` and `generated_videos/` remain recognized by helper scripts for backward compatibility.
+- `collect_generated_media.py` builds a catalog of generated media and implements `select_media_paths` used by the LLM to pick assets for attachment to replies; the selector system instruction is `agent_instructions/media_selector.md`.
+
+Memory & embeddings
+
+- Persistent memory is backed by ChromaDB in `memory/vector_db/` and managed in `memory.py`.
+- Embeddings are created with the configured Gemini embedding model (`GEMINI_EMBEDDING_MODEL`) and stored alongside metadata. File records use a separate collection (see `MEMORY_FILE_COLLECTION_NAME`).
+- `memory.run_memory_extraction_async` and `memory._parse_memory_extraction_response` implement automated memory extraction workflows used after manager runs for longer-term storage.
+
+LLM orchestration & sub-agents
+
+- `llm.py` handles intent classification, manager planning, staged execution of sub-agents (parallel/serial), invoking tools when allowed, running a final `Reviewer`, and producing a final `Texter` response.
+- Execution plan JSON shape expected by the runner:
+
+	{
+		"execution_plan": [
+			{"mode": "parallel|serial", "sub_agents": [{"task_name": "name", "instruction": "...", "thinking_level": "MINIMAL|LOW|MEDIUM|HIGH"}, ...]},
+			...
+		]
+	}
+
+- The manager must include a final serial stage with a single `Reviewer` sub-agent named `Reviewer`.
+
+Browser automation (computer use)
+
+- `computer_use.py` provides a Playwright-driven browser agent integrated with Gemini's `ComputerUse` tool type. It supports navigation, element extraction, clicks, typing, screenshots and returns function responses containing screenshots and action results.
+- Use `tools/use_browser.py` for higher-level helper scripts that invoke the browser agent.
+
+Calendar events
+
+- `calendar_events.py` polls Google Workspace (via `tools/access_google_workspace.py`) for active events and can inject event descriptions into matching Discord channels through the bot's message pipeline.
+
+Progress indicators
+
+- `progress_indicator.py` provides `ExecutionPlanProgressIndicator` which posts an ASCII preview of the execution plan and updates progress messages in Discord channels while sub-agents run.
 
 Tools and helpers
 
-The repository contains several helper tools under `tools/` (previously documented as `skills/`). Common helpers include:
-
-- `tools/run_google_search.py` — Google Search via Gemini (example `__main__` included).
-- `tools/run_python.py` — Safely run Python snippets and capture/relocate generated artifacts into `generated_files/`.
-- `tools/run_notebook.py` — Execute notebooks via Papermill; outputs are saved under `results/<timestamp>`.
-- `tools/use_browser.py` — High-level browser automation that uses the `computer_use` client and Playwright.
-- `tools/generate_image.py`, `tools/generate_video.py` — Media generation helpers.
-
-You can run most tools as small scripts or import their main functions. Example (run the built-in example in `run_google_search`):
-
-```bash
-python tools/run_google_search.py
-```
-
-Or call functions from a Python shell:
-
-```bash
-python -c "from tools.run_google_search import run_google_search; print(run_google_search('latest AI research summary'))"
-```
-
-Data, storage, and runtime artifacts
-
-- Conversation histories: `memory/channel_history/*.md` (one file per Discord channel).
-- Vector DB: `memory/vector_db/` (ChromaDB persistent client). The repository generates embeddings via the configured Gemini embedding service (`GEMINI_EMBEDDING_MODEL`) and stores semantic memories in the collection named by `MEMORY_SEMANTIC_COLLECTION_NAME` in `config.py` (default: `engem_memory_semantic_gemini2`). File-based records use the collection named by `MEMORY_FILE_COLLECTION_NAME`.
-- Legacy migration: automatic migration from older collection names (for example, `engem_memory`) has been removed. If you have older ChromaDB collections you want to preserve, migrate them manually before upgrading.
-- Generated outputs and artifacts: `generated_files/`. Several tools still reference legacy directories like `generated_images/` and `generated_videos/` for backward compatibility.
-- Sub-agent execution orders: `sub-agents/` (JSON files written at runtime, e.g. `sub-agents/execution_order_<history_name>.json`).
-- Agent instruction templates: `agent_instructions/` (contains templates such as `manager.md` and `sub_agent.md`).
-
-Key modules (what to look at)
-
-- `discord_bot.py` — Main bot entrypoint and message handling.
-- `llm.py` — LLM orchestration: intent classification, manager-runner flow, sub-agent dispatch, texter, and media selector.
-- `memory.py` — ChromaDB-backed persistent vector memory store and helper APIs.
-- `history.py`, `history_cache.py` — Conversation history parsing, file I/O, and history caching for model inputs.
-- `api_backoff.py` — Exponential backoff wrapper used for Gemini/API calls.
-- `config.py` — Environment variable defaults and helpers (change to suit your deployment).
-- `tools/` — Host-side utilities for running code, notebooks, browser automation, and media generation.
-- `agent_instructions/` — Markdown templates the manager/agents use as system instructions; edit carefully.
+- Directory: `tools/` — host-side utilities and integration scripts. Notable helpers:
+	- `tools/access_google_workspace.py`
+	- `tools/run_google_search.py`
+	- `tools/run_python.py` (snapshots execution and relocates artifacts into `generated_files/`)
+	- `tools/run_notebook.py`
+	- `tools/use_browser.py`
+	- `tools/generate_image.py`, `tools/generate_video.py`
+	- `tools/deep_research.py`
 
 Developer notes & conventions
 
-- Manager/Planner: `agent_instructions/manager.md` describes how the manager creates `sub-agents/execution_order_<history>.json` files (see `llm.py`). The manager enforces a final `Reviewer` agent that must print `<yes>` when the task is complete.
-- Tool discovery: LLM sub-agents call the `tools` helpers; if you add a tool, ensure its function signatures are discoverable by any function-calling logic in `llm.py`.
-- Artifact relocation: `tools/run_python.py` snapshots the repo root, runs code, and moves generated artifacts into `generated_files/` to keep the repo clean.
-- Playwright: required for browser automation. After `pip install -r requirements.txt`, run `python -m playwright install`.
-- ChromaDB: embeddings are generated using Gemini via the repository's embedding service (configured by `GEMINI_EMBEDDING_MODEL` and requiring `PAID_GEMINI_API_KEY`). Make sure a paid Gemini API key is available in the environment for embedding operations. Back up `memory/vector_db/` to preserve memories.
+- Add tools as top-level functions in `tools/*.py` to make them discoverable by `llm._get_function_declarations`.
+- Edit instruction templates in `agent_instructions/` carefully — they directly affect planning and agent behavior.
+- Back up `memory/vector_db/` regularly to preserve memories; automatic collection-name migration is not provided.
 
 Troubleshooting
 
-- If Playwright actions fail, ensure browsers are installed (`python -m playwright install`) and that any Playwright-related environment variables are set.
-- If Gemini/Google APIs error frequently, `api_backoff.call_with_exponential_backoff` will retry on transient errors; set proper API keys in the environment.
-- If the bot does not receive messages, verify `DISCORD_BOT_TOKEN` and `DISCORD_ALLOWED_CHANNELS`.
+- Playwright errors: ensure browsers are installed (`python -m playwright install`) and your environment supports headless/GUI runs as needed.
+- API failures: check `PAID_GEMINI_API_KEY` and network connectivity. Transient errors are retried via `api_backoff.call_with_exponential_backoff`.
+- Discord issues: verify `DISCORD_BOT_TOKEN` and `DISCORD_ALLOWED_CHANNELS` settings.
 
+Short file references
 
-File references (short)
-
-- `discord_bot.py` (main bot)
-- `llm.py` (LLM orchestration)
-- `memory.py` (ChromaDB memory store)
-- `config.py` (environment and defaults)
-- `tools/` (automation helpers: run_python, run_notebook, run_google_search, use_browser, generate_image, ...)
-- `agent_instructions/` (manager/sub-agent templates and scheduled job definitions)
+- `discord_bot.py` — main bot and message pipeline
+- `llm.py` — orchestration, planning, and sub-agent execution
+- `memory.py` — ChromaDB-backed memory store and attachment archiving
+- `attachments.py` — attachment ingestion and extraction
+- `collect_generated_media.py` — media catalog and selection helpers
+- `computer_use.py` — Playwright-backed browser agent implementation
+- `calendar_events.py` — calendar polling and event injection helper
+- `progress_indicator.py` — Discord execution-plan preview + progress indicator
+- `tools/` — host-side automation helpers
+- `agent_instructions/` — instruction templates used by manager and agents
