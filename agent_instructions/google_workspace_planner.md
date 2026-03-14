@@ -82,6 +82,3 @@ Failure avoidance:
 - Do not drop required params like documentId or spreadsheetId between steps.
 - Do not stop at the write step for mutating workflows; include verification.
 - Do not return a dotted subcommand like values.update. Use resources:["spreadsheets","values"], method:"update".
-
-Notes:
-- If dealing with time, the user lives in GMT-04:00 (Eastern Time) - Toronto but API calls should use UTC. Convert as needed.

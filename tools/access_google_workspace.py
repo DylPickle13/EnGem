@@ -6,6 +6,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import copy
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +76,32 @@ def _format_output(output: str, *, pretty: bool) -> str:
     if parsed is None:
         return output
     return json.dumps(parsed, indent=2, ensure_ascii=False)
+
+def _extract_minimal_output(output_str: str) -> str:
+    parsed = _parse_json_response(output_str)
+    if not isinstance(parsed, dict):
+        return output_str
+
+    result_val = parsed.get("result")
+    if isinstance(result_val, dict):
+        res = result_val
+    elif isinstance(result_val, list):
+        res = {"files": result_val}
+    else:
+        return _json_dumps({"ok": parsed.get("ok", False), "result": result_val})
+
+    keys = ("documentId", "title", "id", "name", "htmlLink", "webViewLink", "spreadsheetId", "presentationId")
+    minimal: dict[str, Any] = {}
+    for k in keys:
+        if k in res and res.get(k) is not None:
+            minimal[k] = res.get(k)
+
+    if not minimal and isinstance(res.get("files"), list):
+        minimal = [
+            {"id": f.get("id"), "name": f.get("name")} for f in res["files"] if isinstance(f, dict)
+        ]
+
+    return _json_dumps({"ok": parsed.get("ok", False), "result": minimal})
 
 
 def _error_payload(message: str, **extra: Any) -> str:
@@ -1198,6 +1227,78 @@ def _resolve_workflow_value(value: Any, context: dict[str, Any]) -> Any:
     return value
 
 
+def _is_likely_datetime_string(s: str) -> bool:
+    if not isinstance(s, str):
+        return False
+    s = s.strip()
+    if not s:
+        return False
+    # Only treat strings that include a time-of-day or explicit T as datetimes
+    return "T" in s or ":" in s
+
+
+def _parse_iso_like_datetime(s: str) -> datetime | None:
+    candidate = s.strip()
+    if not candidate:
+        return None
+    # Handle trailing Z
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    # If there's a space between date and time, make it ISO-like
+    if " " in candidate and "T" not in candidate and ":" in candidate:
+        candidate = candidate.replace(" ", "T", 1)
+    try:
+        return datetime.fromisoformat(candidate)
+    except Exception:
+        return None
+
+
+def _convert_datetimes_to_utc_in_value(value: Any, *, user_tz: str = "America/Toronto") -> Any:
+    if isinstance(value, str):
+        s = value.strip()
+        if not _is_likely_datetime_string(s):
+            return value
+        dt = _parse_iso_like_datetime(s)
+        if dt is None:
+            return value
+        if dt.tzinfo is None:
+            try:
+                local_tz = ZoneInfo(user_tz)
+            except Exception:
+                local_tz = ZoneInfo("UTC")
+            dt_local = dt.replace(tzinfo=local_tz)
+        else:
+            dt_local = dt
+        dt_utc = dt_local.astimezone(timezone.utc)
+        return dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if isinstance(value, dict):
+        return {k: _convert_datetimes_to_utc_in_value(v, user_tz=user_tz) for k, v in value.items()}
+    if isinstance(value, list):
+        return [
+            _convert_datetimes_to_utc_in_value(item, user_tz=user_tz) for item in value
+        ]
+    return value
+
+
+def _convert_payload_times_to_utc(payload: dict[str, Any], *, user_tz: str = "America/Toronto") -> dict[str, Any]:
+    new = copy.deepcopy(payload)
+    # Convert common places where timestamps appear (`params` and `json`),
+    # then walk other fields conservatively (only strings/dicts/lists).
+    if isinstance(new.get("params"), dict):
+        new["params"] = _convert_datetimes_to_utc_in_value(new["params"], user_tz=user_tz)
+    if "json" in new and new.get("json") is not None:
+        new["json"] = _convert_datetimes_to_utc_in_value(new["json"], user_tz=user_tz)
+
+    for key, val in list(new.items()):
+        if key in {"params", "json"}:
+            continue
+        if isinstance(val, (dict, list, str)):
+            new[key] = _convert_datetimes_to_utc_in_value(val, user_tz=user_tz)
+
+    return new
+
+
 def _inherit_runtime_settings(payload: dict[str, Any], runtime_data: dict[str, Any]) -> dict[str, Any]:
     merged = dict(payload)
     for key in RUNTIME_SETTING_KEYS:
@@ -1274,7 +1375,13 @@ def _execute_structured_payload(payload: dict[str, Any], *, runtime_data: dict[s
     if action == "workflow":
         return _run_workflow_action(payload, runtime_data=runtime_data)
 
-    built_command = _build_internal_command(payload)
+    # Convert any ISO-like local datetimes (assumed America/Toronto) to UTC
+    try:
+        exec_payload = _convert_payload_times_to_utc(payload)
+    except Exception:
+        exec_payload = payload
+
+    built_command = _build_internal_command(exec_payload)
     if isinstance(built_command, str):
         return built_command
     args, success_message = built_command
@@ -1731,7 +1838,13 @@ def access_google_workspace(query: str = "") -> str:
     - Create a Google Sheet named Drive File Count and write the total number of files into cell A1.
     - Read the content of Google Doc with ID 'DOCUMENT_ID' and print the full text.
     """
-    return _run_query_action(query, runtime_data={})
+    output = _run_query_action(query, runtime_data={})
+    # Return a minimal JSON result (ids/names/links) by default.
+    try:
+        return _extract_minimal_output(output)
+    except Exception:
+        # If extraction fails for any reason, fall back to the original output.
+        return output
 
 
 def main() -> None:
@@ -1747,6 +1860,7 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true", help="Run the built-in smoke suite")
     parser.add_argument("-t", "--timeout", type=int, help="Override timeout in seconds")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output when possible")
+    parser.add_argument("--minimal", action="store_true", help="Print only key ids/title")
     args = parser.parse_args()
 
     try:
@@ -1771,7 +1885,10 @@ def main() -> None:
             runtime_data["timeout"] = int(args.timeout)
 
         output = _run_query_action(query_text, runtime_data=runtime_data)
-        print(_format_output(output, pretty=args.pretty))
+        if args.minimal:
+            print(_format_output(_extract_minimal_output(output), pretty=args.pretty))
+        else:
+            print(_format_output(output, pretty=args.pretty))
     except SystemExit:
         raise
     except Exception as exc:

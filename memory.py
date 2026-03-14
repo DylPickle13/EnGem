@@ -729,6 +729,81 @@ def _persist_skill_candidate(skill: dict[str, Any], history_file: str) -> dict[s
         "skill_file": skill_file,
     }
 
+def _extract_section_from_markdown(text: str, header: str) -> str:
+    pattern = rf"^##\s*{re.escape(header)}\s*$\n(.*?)(?=^##\s|\Z)"
+    m = re.search(pattern, text, flags=re.M | re.S)
+    return (m.group(1).strip() if m else "")
+
+
+def _sync_skills_from_folder() -> None:
+    try:
+        store = get_skill_store()
+    except Exception:
+        logging.exception("Failed to initialize skill store; skipping skill sync.")
+        return
+
+    try:
+        # Clear existing skill records in the skill collection
+        try:
+            cleared = store.clear_memories()
+            logging.info("Cleared %d existing skill records from skill DB.", cleared)
+        except Exception:
+            logging.exception("Failed to clear existing skill records; continuing with import.")
+
+        skills_dir = SKILLS_DIR
+        if not skills_dir.exists() or not skills_dir.is_dir():
+            logging.info("Skills directory not found at %s; skipping skill import.", skills_dir)
+            return
+
+        for skill_file in sorted(skills_dir.iterdir()):
+            if not skill_file.is_file():
+                continue
+            if skill_file.suffix.lower() not in (".md", ".markdown", ".txt"):
+                continue
+            try:
+                content = skill_file.read_text(encoding="utf-8")
+                name_match = re.search(r'^\s*#\s*(.+)$', content, flags=re.M)
+                skill_name = name_match.group(1).strip() if name_match else skill_file.stem
+
+                summary = _extract_section_from_markdown(content, "Summary")
+                when_to_use = _extract_section_from_markdown(content, "When To Use")
+                planning_pattern = _extract_section_from_markdown(content, "Planning Pattern")
+
+                tags: list[str] = []
+                confidence = 1.0
+                skill = {
+                    "name": skill_name,
+                    "summary": summary or "",
+                    "when_to_use": when_to_use or "",
+                    "planning_pattern": planning_pattern or "",
+                    "tags": tags,
+                    "confidence": confidence,
+                }
+
+                document_text = _build_skill_document_text(skill)
+                metadata = {
+                    "record_type": "skill",
+                    "source_type": "skill_file_import",
+                    "history_file": "skill_files",
+                    "skill_name": skill_name,
+                    "skill_status": "loaded",
+                    "skill_confidence": confidence,
+                    "skill_tags_json": json.dumps(tags, ensure_ascii=False),
+                    "schema_version": MEMORY_SCHEMA_VERSION,
+                    "created_at": _utcnow_iso(),
+                    "skill_file": str(skill_file),
+                }
+
+                memory_id = hashlib.sha256(f"skill_files|{document_text}".encode("utf-8")).hexdigest()
+                try:
+                    store.write_memory(text=document_text, metadata=metadata, memory_id=memory_id)
+                    logging.info("Imported skill '%s' from %s", skill_name, skill_file)
+                except Exception:
+                    logging.exception("Failed writing skill '%s' to skill DB", skill_name)
+            except Exception:
+                logging.exception("Failed reading skill file '%s'", skill_file)
+    except Exception:
+        logging.exception("Unhandled error syncing skills from folder")
 
 def run_skill_extraction_async(
     history_file: str,

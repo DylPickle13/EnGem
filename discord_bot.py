@@ -658,6 +658,12 @@ if __name__ == "__main__":
 
 	_clear_sub_agents_directory()
 
+	# Synchronize skills DB with files so runtime only contains those skills
+	try:
+		memory._sync_skills_from_folder()
+	except Exception:
+		logging.exception("Failed to sync skills from folder on startup")
+
 	print("Starting EnGem...")
 	bot = DiscordBotWrapper()
 

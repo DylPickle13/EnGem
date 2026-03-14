@@ -10,10 +10,10 @@ Important behavior:
 - Do not execute the final user request in this phase.
 - Focus this phase on discovery, validation, and decision-critical context collection.
 
-If this prompt includes "Available reusable planning skill names", you are only seeing skill names (not full skill instructions). In that case, before planning the main information-gathering work, create an early serial sub-agent named "SkillRetriever" that uses run_python to retrieve and print the content of those skills, they are located in `skills/{skill_name}.md`.
+If this prompt includes "Available reusable planning skill names", you are only seeing skill names (not full skill instructions). In that case, before planning the main information-gathering work, create an early serial sub-agent named "SkillRetriever" that uses run_python to retrieve and print the content of one or two skills that are relevant to the user's request, they are located in `skills/{skill_name}.md`.
 
 When creating the planning plan, follow these rules strictly:
-1. Break planning into small, manageable sub-tasks. Keep each sub-task simple so it mainly uses one tool/function.
+1. Break planning into small, manageable sub-tasks. Keep each sub-task simple so it only uses one tool/function.
 2. For each non-reviewer sub-task, specify exactly one tool in the instruction.
   - Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, generate_speech, run_notebook, deep_research, and access_google_workspace.
   - The browser tool exits after it is done, so if you need multiple browser actions, create separate sub-tasks.
@@ -57,9 +57,9 @@ Template example:
           "thinking_level": "MINIMAL"
         },
         {
-          "task_name": "ConstraintCheck",
-          "instruction": "Use run_python to extract concrete constraints from the conversation and print them.",
-          "thinking_level": "MEDIUM"
+          "task_name": "SkillRetriever",
+          "instruction": "Use run_python to retrieve and print the content of any relevant skills.",
+          "thinking_level": "LOW"
         }
       ]
     },
