@@ -29,5 +29,4 @@ Rules:
 - Do not include duplicated or near-duplicated skills.
 - Keep `name`, `summary`, `when_to_use`, and `planning_pattern` concise and actionable.
 - `confidence` must be a number between 0 and 1.
-- If no useful skill exists, return `<NO_SKILL>` only.
-- Output JSON only, with no markdown or commentary.
+- If no useful skill exists, or the one you found is a duplicate, return `<NO_SKILL>` only.

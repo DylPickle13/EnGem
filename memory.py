@@ -972,7 +972,7 @@ def build_relevant_skills_text(query: str, limit: int = 4) -> str:
 
 
 def build_skill_names_text(limit: int = 200) -> str:
-    """Return a compact list of available skill names for planner prompts."""
+    """Return a compact list of available skill file paths for planner prompts."""
     try:
         records = get_skill_store().read_all_memories(
             limit=max(1, limit),
@@ -981,17 +981,17 @@ def build_skill_names_text(limit: int = 200) -> str:
     except Exception:
         return ""
 
-    names = sorted(
+    skill_files = sorted(
         {
-            str((item.metadata or {}).get("skill_name") or "").strip()
+            str((item.metadata or {}).get("skill_file") or "").strip()
             for item in records
-            if str((item.metadata or {}).get("skill_name") or "").strip()
+            if str((item.metadata or {}).get("skill_file") or "").strip()
         }
     )
-    if not names:
+    if not skill_files:
         return ""
 
-    return "\n".join(["Available reusable planning skill names:", *[f"- {name}" for name in names]])
+    return "\n".join(["Available reusable planning skill file paths:", *[f"- {skill_file}" for skill_file in skill_files]])
 
 
 def run_memory_extraction_async(

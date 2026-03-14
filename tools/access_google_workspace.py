@@ -17,7 +17,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from config import MINIMAL_MODEL as MINIMAL_MODEL
+from config import MINIMAL_MODEL as MINIMAL_MODEL, MEDIUM_MODEL as MEDIUM_MODEL
 
 PLANNER_INSTRUCTIONS_FILE = _REPO_ROOT / "agent_instructions" / "google_workspace_planner.md"
 RUNTIME_SETTING_KEYS = [
@@ -76,32 +76,6 @@ def _format_output(output: str, *, pretty: bool) -> str:
     if parsed is None:
         return output
     return json.dumps(parsed, indent=2, ensure_ascii=False)
-
-def _extract_minimal_output(output_str: str) -> str:
-    parsed = _parse_json_response(output_str)
-    if not isinstance(parsed, dict):
-        return output_str
-
-    result_val = parsed.get("result")
-    if isinstance(result_val, dict):
-        res = result_val
-    elif isinstance(result_val, list):
-        res = {"files": result_val}
-    else:
-        return _json_dumps({"ok": parsed.get("ok", False), "result": result_val})
-
-    keys = ("documentId", "title", "id", "name", "htmlLink", "webViewLink", "spreadsheetId", "presentationId")
-    minimal: dict[str, Any] = {}
-    for k in keys:
-        if k in res and res.get(k) is not None:
-            minimal[k] = res.get(k)
-
-    if not minimal and isinstance(res.get("files"), list):
-        minimal = [
-            {"id": f.get("id"), "name": f.get("name")} for f in res["files"] if isinstance(f, dict)
-        ]
-
-    return _json_dumps({"ok": parsed.get("ok", False), "result": minimal})
 
 
 def _error_payload(message: str, **extra: Any) -> str:
@@ -1639,7 +1613,7 @@ def _run_query_action(query: str, *, runtime_data: dict[str, Any]) -> str:
             normalized_query,
             root_help=root_help,
             feedback=planner_feedback,
-            model_name=MINIMAL_MODEL,
+            model_name=MEDIUM_MODEL,
             thinking_level="low"
         )
         last_planner_output = planner_output
@@ -1802,6 +1776,33 @@ def _run_query_action(query: str, *, runtime_data: dict[str, Any]) -> str:
     )
 
 
+def _interpret_query_response(query: str, raw_response: str) -> str:
+    import llm
+
+    system_instructions = (
+        "You are a Google Workspace API response interpreter. "
+        "Given the original user request and a raw JSON tool response, "
+        "return only the information needed to satisfy the original request. "
+        "Do not include planner metadata, payload internals, schema/help blocks, or debugging details. "
+        "If the action failed, briefly explain the failure and include the most relevant error detail."
+    )
+    prompt = (
+        f"Original user request:\n{query}\n\n"
+        f"Raw tool response JSON:\n{raw_response}\n\n"
+        "Return a concise final answer for the user."
+    )
+
+    return llm._run_model_api(
+        text=prompt,
+        system_instructions=system_instructions,
+        model=MINIMAL_MODEL,
+        tool_use_allowed=False,
+        force_tool=False,
+        temperature=0.2,
+        thinking_level="low",
+    )
+
+
 def _run_smoke_suite(*, pretty: bool, timeout: int | None = None) -> int:
     failures = 0
     for index, (label, query) in enumerate(SMOKE_TEST_QUERIES, start=1):
@@ -1839,11 +1840,9 @@ def access_google_workspace(query: str = "") -> str:
     - Read the content of Google Doc with ID 'DOCUMENT_ID' and print the full text.
     """
     output = _run_query_action(query, runtime_data={})
-    # Return a minimal JSON result (ids/names/links) by default.
     try:
-        return _extract_minimal_output(output)
+        return _interpret_query_response(query, output)
     except Exception:
-        # If extraction fails for any reason, fall back to the original output.
         return output
 
 
@@ -1860,7 +1859,6 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true", help="Run the built-in smoke suite")
     parser.add_argument("-t", "--timeout", type=int, help="Override timeout in seconds")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output when possible")
-    parser.add_argument("--minimal", action="store_true", help="Print only key ids/title")
     args = parser.parse_args()
 
     try:
@@ -1885,10 +1883,7 @@ def main() -> None:
             runtime_data["timeout"] = int(args.timeout)
 
         output = _run_query_action(query_text, runtime_data=runtime_data)
-        if args.minimal:
-            print(_format_output(_extract_minimal_output(output), pretty=args.pretty))
-        else:
-            print(_format_output(output, pretty=args.pretty))
+        print(_format_output(output, pretty=args.pretty))
     except SystemExit:
         raise
     except Exception as exc:

@@ -103,6 +103,19 @@ def get_history_before_latest_manager(history_file: str = "default") -> str:
     return get_history_before_latest_role(history_file=history_file, role="manager")
 
 
+def get_history_after_latest_role(history_file: str = "default", role: str = "user") -> str:
+    """Return history text that occurred after the latest message for `role`."""
+    messages = parse_history_file(history_file)
+    if not messages:
+        return ""
+
+    latest_role_index = _find_latest_speaker_index(messages, role)
+    if latest_role_index < 0 or latest_role_index >= len(messages) - 1:
+        return ""
+
+    return "".join(_format_message_block(msg) for msg in messages[latest_role_index + 1 :]).strip()
+
+
 def rewrite_history_with_summary_before_latest_role(
     summary_text: str,
     history_file: str = "default",
@@ -165,6 +178,42 @@ def rewrite_history_with_summary_before_latest_manager(
         pivot_role="manager",
         summary_role=summary_role,
     )
+
+
+def rewrite_history_with_summary_after_latest_role(
+    summary_text: str,
+    history_file: str = "default",
+    anchor_role: str = "user",
+    summary_role: str = "ConversationSummary",
+) -> None:
+    """Rewrite history so summary replaces content after the latest `anchor_role` message."""
+    cleaned_summary = (summary_text or "").strip()
+    if not cleaned_summary:
+        return
+
+    target_file = _resolve_history_file(history_file)
+    with _HISTORY_FILE_LOCK:
+        try:
+            raw_history = target_file.read_text(encoding="utf-8")
+        except Exception:
+            return
+
+        messages = parse_history(raw_history)
+        if not messages:
+            return
+
+        latest_anchor_index = _find_latest_speaker_index(messages, anchor_role)
+        if latest_anchor_index < 0 or latest_anchor_index >= len(messages) - 1:
+            return
+
+        summary_message: Dict[str, Optional[str]] = {
+            "speaker": summary_role,
+            "text": cleaned_summary,
+            "timestamp": datetime.now(TORONTO_TZ).isoformat(),
+        }
+        rewritten = messages[: latest_anchor_index + 1] + [summary_message]
+        payload = "".join(_format_message_block(msg) for msg in rewritten)
+        target_file.write_text(payload, encoding="utf-8")
 
 
 def parse_history(history_text: str) -> List[Dict[str, Optional[str]]]:
@@ -230,6 +279,7 @@ def run_history_summarization(
     history_file: str,
     temperature: float,
     pivot_role: str = "user",
+    summarize_after_latest_role: str | None = None,
     history_cache: object | None = None,
     current_history_text: str | None = None,
 ) -> None:
@@ -237,12 +287,23 @@ def run_history_summarization(
         llm = import_module("llm")
         run_model_api = llm._run_model_api
 
+        summarize_after_mode = isinstance(summarize_after_latest_role, str) and bool(summarize_after_latest_role.strip())
+        effective_after_role = summarize_after_latest_role.strip() if summarize_after_mode else None
+
         if history_cache is not None:
-            summary = run_model_api(
-                text=(
+            if summarize_after_mode:
+                summary_prompt = (
+                    f"Summarize only the conversation history after the latest '{effective_after_role}' message. "
+                    f"Do not include that latest '{effective_after_role}' message or anything before it."
+                )
+            else:
+                summary_prompt = (
                     f"Summarize only the conversation history before the latest '{pivot_role}' message. "
                     f"Do not include that latest '{pivot_role}' message or anything after it."
-                ),
+                )
+
+            summary = run_model_api(
+                text=summary_prompt,
                 system_instructions=HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
                 model=MINIMAL_MODEL,
                 tool_use_allowed=False,
@@ -253,12 +314,19 @@ def run_history_summarization(
                 current_history_text=current_history_text,
             )
         else:
-            prior_history = get_history_before_latest_role(history_file=history_file, role=pivot_role)
-            if not prior_history:
+            if summarize_after_mode:
+                target_history = get_history_after_latest_role(
+                    history_file=history_file,
+                    role=effective_after_role,
+                )
+            else:
+                target_history = get_history_before_latest_role(history_file=history_file, role=pivot_role)
+
+            if not target_history:
                 return
 
             summary = run_model_api(
-                prior_history,
+                target_history,
                 HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
                 MINIMAL_MODEL,
                 tool_use_allowed=False,
@@ -271,11 +339,18 @@ def run_history_summarization(
         if not cleaned_summary:
             return
 
-        rewrite_history_with_summary_before_latest_role(
-            summary_text=cleaned_summary,
-            history_file=history_file,
-            pivot_role=pivot_role,
-        )
+        if summarize_after_mode:
+            rewrite_history_with_summary_after_latest_role(
+                summary_text=cleaned_summary,
+                history_file=history_file,
+                anchor_role=effective_after_role,
+            )
+        else:
+            rewrite_history_with_summary_before_latest_role(
+                summary_text=cleaned_summary,
+                history_file=history_file,
+                pivot_role=pivot_role,
+            )
     except Exception as exc:
         print(f"Error running history summarization: {exc}")
     finally:
@@ -287,6 +362,7 @@ def run_history_summarization_async(
     history_file: str,
     temperature: float,
     pivot_role: str = "user",
+    summarize_after_latest_role: str | None = None,
     history_cache: object | None = None,
     current_history_text: str | None = None,
 ) -> None:
@@ -295,6 +371,7 @@ def run_history_summarization_async(
             history_file=history_file,
             temperature=temperature,
             pivot_role=pivot_role,
+            summarize_after_latest_role=summarize_after_latest_role,
             history_cache=history_cache,
             current_history_text=current_history_text,
         )

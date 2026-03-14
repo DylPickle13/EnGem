@@ -163,7 +163,10 @@ def generate_response(
                     post_intent_cache.release()
             return LLMResponse(text=intent_response, media_paths=[])
 
-    def _advance_attempt(pivot_role: str) -> None:
+    def _advance_attempt(
+        pivot_role: str,
+        summarize_after_latest_role: str | None = None,
+    ) -> None:
         nonlocal temperature
         nonlocal attempt_number
         nonlocal active_history_cache
@@ -174,6 +177,7 @@ def generate_response(
             history_file=history_file,
             temperature=default_temperature,
             pivot_role=pivot_role,
+            summarize_after_latest_role=summarize_after_latest_role,
             history_cache=active_history_cache.retain(),
             current_history_text=history.get_conversation_history(history_file=history_file),
         )
@@ -193,17 +197,22 @@ def generate_response(
             backoff_call=call_with_exponential_backoff,
         )
 
+    planner_phase_ready = False
+
     while True:
         exit_string = ""
         planner_exit_string = ""
         planner_order_file = Path(__file__).parent / f"sub-agents/planner_order_{history_file}.json"
         execution_order_file = Path(__file__).parent / f"sub-agents/execution_order_{history_file}.json"
 
-        cleared_plan_files = True
-        for plan_file, label in (
-            (planner_order_file, "planner order"),
+        plan_files_to_clear: list[tuple[Path, str]] = [
             (execution_order_file, "execution order"),
-        ):
+        ]
+        if not planner_phase_ready:
+            plan_files_to_clear.insert(0, (planner_order_file, "planner order"))
+
+        cleared_plan_files = True
+        for plan_file, label in plan_files_to_clear:
             if plan_file.exists():
                 try:
                     plan_file.unlink()
@@ -213,89 +222,98 @@ def generate_response(
                     break
 
         if not cleared_plan_files:
-            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+            if planner_phase_ready:
+                _advance_attempt(
+                    EXECUTION_MANAGER_TASK_NAME,
+                    summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
+                )
+            else:
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
             continue
 
-        try:
-            planner_history_text = history.get_conversation_history(history_file=history_file)
-            planner_skill_names = memory.build_skill_names_text(limit=200)
-            planner_system_instructions = PLANNER_FILE.read_text(encoding="utf-8") + history_file
-            if planner_skill_names:
-                planner_system_instructions += "\n\n" + planner_skill_names
+        if not planner_phase_ready:
+            try:
+                planner_history_text = history.get_conversation_history(history_file=history_file)
+                planner_skill_names = memory.build_skill_names_text(limit=200)
+                planner_system_instructions = PLANNER_FILE.read_text(encoding="utf-8") + history_file
+                if planner_skill_names:
+                    planner_system_instructions += "\n\n" + planner_skill_names
 
-            _run_model_api(
-                text="Review the conversation context and create the planner plan JSON file.",
-                system_instructions=planner_system_instructions,
-                model=MEDIUM_MODEL,
-                tool_use_allowed=True,
-                force_tool=True,
-                temperature=temperature,
-                thinking_level="high",
-                history_cache=active_history_cache,
-                current_history_text=planner_history_text,
-            )
-            history.append_history(
-                role=PLANNER_MANAGER_TASK_NAME,
-                text=f"{planner_order_file} created. \nRelevant skills: {planner_skill_names}",
-                history_file=history_file,
-            )
-        except Exception as e:
-            print(f"Error generating planner manager response: {e}")
+                _run_model_api(
+                    text="Review the conversation context and create the planner plan JSON file.",
+                    system_instructions=planner_system_instructions,
+                    model=MEDIUM_MODEL,
+                    tool_use_allowed=True,
+                    force_tool=True,
+                    temperature=temperature,
+                    thinking_level="high",
+                    history_cache=active_history_cache,
+                    current_history_text=planner_history_text,
+                )
+                history.append_history(
+                    role=PLANNER_MANAGER_TASK_NAME,
+                    text=f"{planner_order_file} created. \nRelevant skills: {planner_skill_names}",
+                    history_file=history_file,
+                )
+            except Exception as e:
+                print(f"Error generating planner manager response: {e}")
 
-        if not planner_order_file.exists():
-            print("No planner order file found.")
-            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
-            continue
+            if not planner_order_file.exists():
+                print("No planner order file found.")
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                continue
 
-        try:
-            with planner_order_file.open("r", encoding="utf-8") as f:
-                planner_order_dict = json.load(f)
-        except Exception as e:
-            print(f"Error reading planner order file: {e}")
-            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
-            continue
+            try:
+                with planner_order_file.open("r", encoding="utf-8") as f:
+                    planner_order_dict = json.load(f)
+            except Exception as e:
+                print(f"Error reading planner order file: {e}")
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                continue
 
-        planner_plan = _normalize_execution_plan(planner_order_dict, plan_key="planner_plan")
-        if not planner_plan:
-            print("No valid planner plan found in planner order file.")
-            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
-            continue
-        if not _has_final_named_agent(planner_plan, PLANNER_REVIEWER_TASK_NAME):
-            print("Planner plan is missing a final serial PlannerReviewer agent.")
-            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
-            continue
+            planner_plan = _normalize_execution_plan(planner_order_dict, plan_key="planner_plan")
+            if not planner_plan:
+                print("No valid planner plan found in planner order file.")
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                continue
+            if not _has_final_named_agent(planner_plan, PLANNER_REVIEWER_TASK_NAME):
+                print("Planner plan is missing a final serial PlannerReviewer agent.")
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                continue
 
-        _dispatch_execution_plan_preview_async(
-            planner_plan,
-            history_file,
-            execution_plan_notifier,
-            attempt_number,
-            attempt_number > 1,
-            plan_kind="planner",
-        )
-
-        planner_exit_string = _run_sub_agent_plan(
-            execution_plan=planner_plan,
-            history_file=history_file,
-            temperature=temperature,
-            history_cache=active_history_cache,
-            final_agent_task_name=PLANNER_REVIEWER_TASK_NAME,
-            final_agent_runner=lambda: _run_planner_reviewer(
+            _dispatch_execution_plan_preview_async(
+                planner_plan,
                 history_file,
-                user_message,
-                default_temperature,
+                execution_plan_notifier,
+                attempt_number,
+                attempt_number > 1,
+                plan_kind="planner",
+            )
+
+            planner_exit_string = _run_sub_agent_plan(
+                execution_plan=planner_plan,
+                history_file=history_file,
+                temperature=temperature,
                 history_cache=active_history_cache,
-            ),
-        )
+                final_agent_task_name=PLANNER_REVIEWER_TASK_NAME,
+                final_agent_runner=lambda: _run_planner_reviewer(
+                    history_file,
+                    user_message,
+                    default_temperature,
+                    history_cache=active_history_cache,
+                ),
+            )
 
-        if "<ready>" not in (planner_exit_string or "").lower():
-            print("Planner phase did not report readiness. Retrying after summarizing planner attempt.")
-            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
-            continue
+            if "<ready>" not in (planner_exit_string or "").lower():
+                print("Planner phase did not report readiness. Retrying after summarizing planner attempt.")
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                continue
 
-        # Planner results are now stable context; rebuild history cache so execution
-        # manager/sub-agents can reuse a static cached prefix from this point onward.
-        _refresh_active_history_cache()
+            planner_phase_ready = True
+
+            # Planner results are now stable context; rebuild history cache so execution
+            # manager/sub-agents can reuse a static cached prefix from this point onward.
+            _refresh_active_history_cache()
 
         try:
             execution_history_text = history.get_conversation_history(history_file=history_file)
@@ -322,7 +340,10 @@ def generate_response(
 
         if not execution_order_file.exists():
             print("No execution order file found.")
-            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
+            _advance_attempt(
+                EXECUTION_MANAGER_TASK_NAME,
+                summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
+            )
             continue
 
         try:
@@ -330,17 +351,26 @@ def generate_response(
                 execution_order_dict = json.load(f)
         except Exception as e:
             print(f"Error reading execution order file: {e}")
-            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
+            _advance_attempt(
+                EXECUTION_MANAGER_TASK_NAME,
+                summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
+            )
             continue
 
         execution_plan = _normalize_execution_plan(execution_order_dict, plan_key="execution_plan")
         if not execution_plan:
             print("No valid execution plan found in execution order file.")
-            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
+            _advance_attempt(
+                EXECUTION_MANAGER_TASK_NAME,
+                summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
+            )
             continue
         if not _has_final_reviewer_agent(execution_plan):
             print("Execution plan is missing a final serial Reviewer agent.")
-            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
+            _advance_attempt(
+                EXECUTION_MANAGER_TASK_NAME,
+                summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
+            )
             continue
 
         _dispatch_execution_plan_preview_async(
@@ -368,12 +398,18 @@ def generate_response(
 
         if not exit_string:
             print("Final Reviewer agent did not produce an exit string.")
-            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
+            _advance_attempt(
+                EXECUTION_MANAGER_TASK_NAME,
+                summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
+            )
             continue
         if "<yes>" in (exit_string or "").lower():
             break
 
-        _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
+        _advance_attempt(
+            EXECUTION_MANAGER_TASK_NAME,
+            summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
+        )
 
     text_response = ""
     media_paths: list[str] = []

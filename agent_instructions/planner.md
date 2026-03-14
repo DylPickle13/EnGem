@@ -10,7 +10,7 @@ Important behavior:
 - Do not execute the final user request in this phase.
 - Focus this phase on discovery, validation, and decision-critical context collection.
 
-If this prompt includes "Available reusable planning skill names", you are only seeing skill names (not full skill instructions). In that case, before planning the main information-gathering work, create an early serial sub-agent named "SkillRetriever" that uses run_python to retrieve and print the content of one or two skills that are relevant to the user's request, they are located in `skills/{skill_name}.md`.
+If this prompt includes "Available reusable planning skill file paths", you are only seeing file paths (not full skill instructions). In that case, before planning the main information-gathering work, create an early serial sub-agent named "SkillRetriever" that uses run_python to retrieve and print the content of one or two skills that are relevant to the user's request, using the provided file paths directly.
 
 When creating the planning plan, follow these rules strictly:
 1. Break planning into small, manageable sub-tasks. Keep each sub-task simple so it only uses one tool/function.
