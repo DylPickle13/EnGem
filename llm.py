@@ -23,18 +23,27 @@ MEMORY_RETRIEVER_FILE = Path(__file__).parent / "agent_instructions/memory_retri
 # Intent file located alongside this module
 INTENT_FILE = Path(__file__).parent / "agent_instructions/intent.md"
 
-# Manager file located alongside this module
-MANAGER_FILE = Path(__file__).parent / "agent_instructions/manager.md"
+# Planner file located alongside this module
+PLANNER_FILE = Path(__file__).parent / "agent_instructions/planner.md"
+
+# Execution manager file located alongside this module
+EXECUTION_MANAGER_FILE = Path(__file__).parent / "agent_instructions/execution_manager.md"
 
 # Sub-agent file located alongside this module
 SUB_AGENT_FILE = Path(__file__).parent / "agent_instructions/sub_agent.md"
 
 # Reviewer file located alongside this module
-REVIEWER_FILE = Path(__file__).parent / "agent_instructions/reviewer.md"
+REVIEWER_FILE = Path(__file__).parent / "agent_instructions/execution_reviewer.md"
+
+# Planner reviewer file located alongside this module
+PLANNER_REVIEWER_FILE = Path(__file__).parent / "agent_instructions/planner_reviewer.md"
 
 # Summarize file located alongside this module
 TEXTER_FILE = Path(__file__).parent / "agent_instructions/texter.md"
 
+PLANNER_MANAGER_TASK_NAME = "PlannerManager"
+EXECUTION_MANAGER_TASK_NAME = "ExecutionManager"
+PLANNER_REVIEWER_TASK_NAME = "PlannerReviewer"
 REVIEWER_TASK_NAME = "Reviewer"
 THINKING_LEVEL_TO_MODEL = {
     "MINIMAL": MINIMAL_MODEL,
@@ -63,14 +72,14 @@ def generate_response(
     job: bool,
     history_file: str,
     image: dict[str, bytes | str] | list[dict[str, bytes | str]] | None = None,
-    execution_plan_notifier: Callable[[str, list[dict], int, bool], None] | None = None,
+    execution_plan_notifier: Callable[..., None] | None = None,
 ) -> LLMResponse:
     """
     Main function to generate a response from the model based on the user's message,
     conversation history, and optionally multimodal attachments.
     This function handles the entire flow of generating a response, including intent classification, sub-agent execution, and final response generation.
     If execution_plan_notifier is provided, it is called asynchronously with an
-    ASCII diagram of the active execution plan whenever a new plan is detected.
+    ASCII diagram of the active planner/execution plan whenever a new plan is detected.
     """
 
     exit_string = ""
@@ -154,60 +163,184 @@ def generate_response(
                     post_intent_cache.release()
             return LLMResponse(text=intent_response, media_paths=[])
 
+    def _advance_attempt(pivot_role: str) -> None:
+        nonlocal temperature
+        nonlocal attempt_number
+        nonlocal active_history_cache
+
+        _refresh_active_history_cache()
+
+        history.run_history_summarization(
+            history_file=history_file,
+            temperature=default_temperature,
+            pivot_role=pivot_role,
+            history_cache=active_history_cache.retain(),
+            current_history_text=history.get_conversation_history(history_file=history_file),
+        )
+        _refresh_active_history_cache()
+        if temperature < 2.0:
+            temperature += 0.1
+        attempt_number += 1
+
+    def _refresh_active_history_cache() -> None:
+        nonlocal active_history_cache
+
+        active_history_cache.release()
+        active_history_cache = create_history_context_cache(
+            history_file=history_file,
+            history_text=history.get_conversation_history(history_file=history_file),
+            client=client,
+            backoff_call=call_with_exponential_backoff,
+        )
+
     while True:
         exit_string = ""
-        # Execution order file path
-        EXECUTION_ORDER_FILE = Path(__file__).parent / f"sub-agents/execution_order_{history_file}.json"
+        planner_exit_string = ""
+        planner_order_file = Path(__file__).parent / f"sub-agents/planner_order_{history_file}.json"
+        execution_order_file = Path(__file__).parent / f"sub-agents/execution_order_{history_file}.json"
 
-        # Always clear stale execution-order output so each manager run writes a fresh plan.
-        if EXECUTION_ORDER_FILE.exists():
-            try:
-                EXECUTION_ORDER_FILE.unlink()
-            except Exception as e:
-                print(f"Error clearing execution order file before manager run: {e}")
-                continue
+        cleared_plan_files = True
+        for plan_file, label in (
+            (planner_order_file, "planner order"),
+            (execution_order_file, "execution order"),
+        ):
+            if plan_file.exists():
+                try:
+                    plan_file.unlink()
+                except Exception as e:
+                    print(f"Error clearing {label} file before manager run: {e}")
+                    cleared_plan_files = False
+                    break
 
-        # Get the manager's response based on the conversation history and the new user message
+        if not cleared_plan_files:
+            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+            continue
+
         try:
-            manager_history_text = history.get_conversation_history(history_file=history_file)
-            manager_skill_names = memory.build_skill_names_text(limit=200)
-            manager_system_instructions = MANAGER_FILE.read_text(encoding="utf-8") + history_file
-            if manager_skill_names:
-                manager_system_instructions += "\n\n" + manager_skill_names
+            planner_history_text = history.get_conversation_history(history_file=history_file)
+            planner_skill_names = memory.build_skill_names_text(limit=200)
+            planner_system_instructions = PLANNER_FILE.read_text(encoding="utf-8") + history_file
+            if planner_skill_names:
+                planner_system_instructions += "\n\n" + planner_skill_names
 
             _run_model_api(
-                text="Review the conversation context and create the execution plan JSON file.",
-                system_instructions=manager_system_instructions,
+                text="Review the conversation context and create the planner plan JSON file.",
+                system_instructions=planner_system_instructions,
                 model=MEDIUM_MODEL,
                 tool_use_allowed=True,
                 force_tool=True,
                 temperature=temperature,
                 thinking_level="high",
                 history_cache=active_history_cache,
-                current_history_text=manager_history_text,
+                current_history_text=planner_history_text,
             )
-            history.append_history(role="Manager", text=f"{EXECUTION_ORDER_FILE} created. \nRelevant skills: {manager_skill_names}", history_file=history_file)
+            history.append_history(
+                role=PLANNER_MANAGER_TASK_NAME,
+                text=f"{planner_order_file} created. \nRelevant skills: {planner_skill_names}",
+                history_file=history_file,
+            )
         except Exception as e:
-            print(f"Error generating manager response: {e}")
+            print(f"Error generating planner manager response: {e}")
 
-        # read the execution order from the .json file
-        if not EXECUTION_ORDER_FILE.exists():
-            print("No execution order file found. ")
+        if not planner_order_file.exists():
+            print("No planner order file found.")
+            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
             continue
-        else:
-            try:
-                with EXECUTION_ORDER_FILE.open("r", encoding="utf-8") as f:
-                    execution_order_dict = json.load(f)
-            except Exception as e:
-                print(f"Error reading execution order file: {e}")
-                continue
 
-        execution_plan = _normalize_execution_plan(execution_order_dict)
+        try:
+            with planner_order_file.open("r", encoding="utf-8") as f:
+                planner_order_dict = json.load(f)
+        except Exception as e:
+            print(f"Error reading planner order file: {e}")
+            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+            continue
+
+        planner_plan = _normalize_execution_plan(planner_order_dict, plan_key="planner_plan")
+        if not planner_plan:
+            print("No valid planner plan found in planner order file.")
+            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+            continue
+        if not _has_final_named_agent(planner_plan, PLANNER_REVIEWER_TASK_NAME):
+            print("Planner plan is missing a final serial PlannerReviewer agent.")
+            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+            continue
+
+        _dispatch_execution_plan_preview_async(
+            planner_plan,
+            history_file,
+            execution_plan_notifier,
+            attempt_number,
+            attempt_number > 1,
+            plan_kind="planner",
+        )
+
+        planner_exit_string = _run_sub_agent_plan(
+            execution_plan=planner_plan,
+            history_file=history_file,
+            temperature=temperature,
+            history_cache=active_history_cache,
+            final_agent_task_name=PLANNER_REVIEWER_TASK_NAME,
+            final_agent_runner=lambda: _run_planner_reviewer(
+                history_file,
+                user_message,
+                default_temperature,
+                history_cache=active_history_cache,
+            ),
+        )
+
+        if "<ready>" not in (planner_exit_string or "").lower():
+            print("Planner phase did not report readiness. Retrying after summarizing planner attempt.")
+            _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+            continue
+
+        # Planner results are now stable context; rebuild history cache so execution
+        # manager/sub-agents can reuse a static cached prefix from this point onward.
+        _refresh_active_history_cache()
+
+        try:
+            execution_history_text = history.get_conversation_history(history_file=history_file)
+            execution_manager_system_instructions = EXECUTION_MANAGER_FILE.read_text(encoding="utf-8") + history_file
+
+            _run_model_api(
+                text="Use the planner findings in the conversation context to create the execution plan JSON file.",
+                system_instructions=execution_manager_system_instructions,
+                model=MEDIUM_MODEL,
+                tool_use_allowed=True,
+                force_tool=True,
+                temperature=temperature,
+                thinking_level="high",
+                history_cache=active_history_cache,
+                current_history_text=execution_history_text,
+            )
+            history.append_history(
+                role=EXECUTION_MANAGER_TASK_NAME,
+                text=f"{execution_order_file} created.",
+                history_file=history_file,
+            )
+        except Exception as e:
+            print(f"Error generating execution manager response: {e}")
+
+        if not execution_order_file.exists():
+            print("No execution order file found.")
+            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
+            continue
+
+        try:
+            with execution_order_file.open("r", encoding="utf-8") as f:
+                execution_order_dict = json.load(f)
+        except Exception as e:
+            print(f"Error reading execution order file: {e}")
+            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
+            continue
+
+        execution_plan = _normalize_execution_plan(execution_order_dict, plan_key="execution_plan")
         if not execution_plan:
             print("No valid execution plan found in execution order file.")
+            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
             continue
         if not _has_final_reviewer_agent(execution_plan):
             print("Execution plan is missing a final serial Reviewer agent.")
+            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
             continue
 
         _dispatch_execution_plan_preview_async(
@@ -216,100 +349,31 @@ def generate_response(
             execution_plan_notifier,
             attempt_number,
             attempt_number > 1,
+            plan_kind="execution",
         )
 
-        sub_agent_system_instructions = SUB_AGENT_FILE.read_text(encoding="utf-8")
-        for stage_index, stage in enumerate(execution_plan):
-            mode = stage["mode"]
-            agents = stage["sub_agents"]
-
-            if mode == "parallel" and len(agents) > 1:
-                base_history = history.get_conversation_history(history_file=history_file)
-
-                def _run_parallel_agent(agent: dict, stage_history: str) -> str:
-                    model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
-                    return _run_model_api(
-                        text=agent["instruction"],
-                        system_instructions=sub_agent_system_instructions,
-                        model=model_name,
-                        tool_use_allowed=True,
-                        force_tool=False,
-                        temperature=temperature,
-                        thinking_level=api_thinking_level,
-                        history_cache=active_history_cache,
-                        current_history_text=stage_history,
-                    )
-
-                with ThreadPoolExecutor(max_workers=min(len(agents), 8)) as executor:
-                    future_to_index = {
-                        executor.submit(_run_parallel_agent, agent, base_history): idx
-                        for idx, agent in enumerate(agents)
-                    }
-
-                    for future in as_completed(future_to_index):
-                        idx = future_to_index[future]
-                        agent = agents[idx]
-                        sub_agent_response = ""
-                        try:
-                            sub_agent_response = future.result()
-                        except Exception as e:
-                            print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
-
-                        history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
-
-            else:
-                for agent_index, agent in enumerate(agents):
-                    sub_agent_response = ""
-                    try:
-                        if _is_final_execution_agent(execution_plan, stage_index, agent_index):
-                            sub_agent_response = _run_final_reviewer(
-                                history_file,
-                                user_message,
-                                default_temperature,
-                                history_cache=active_history_cache,
-                            )
-                            exit_string = sub_agent_response
-                            history.append_history(role=REVIEWER_TASK_NAME, text=sub_agent_response, history_file=history_file)
-                        else:
-                            model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
-                            sub_agent_response = _run_model_api(
-                                text=agent["instruction"],
-                                system_instructions=sub_agent_system_instructions,
-                                model=model_name,
-                                tool_use_allowed=True,
-                                force_tool=False,
-                                temperature=temperature,
-                                thinking_level=api_thinking_level,
-                                history_cache=active_history_cache,
-                                current_history_text=history.get_conversation_history(history_file=history_file),
-                            )
-                            history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
-                    except Exception as e:
-                        print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
+        exit_string = _run_sub_agent_plan(
+            execution_plan=execution_plan,
+            history_file=history_file,
+            temperature=temperature,
+            history_cache=active_history_cache,
+            final_agent_task_name=REVIEWER_TASK_NAME,
+            final_agent_runner=lambda: _run_final_reviewer(
+                history_file,
+                user_message,
+                default_temperature,
+                history_cache=active_history_cache,
+            ),
+        )
 
         if not exit_string:
             print("Final Reviewer agent did not produce an exit string.")
+            _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
             continue
-        if exit_string == "<yes>":
+        if "<yes>" in (exit_string or "").lower():
             break
-        else:
-            history.run_history_summarization(
-                history_file=history_file,
-                temperature=default_temperature,
-                pivot_role="manager",
-                history_cache=active_history_cache.retain(),
-                current_history_text=history.get_conversation_history(history_file=history_file),
-            )
-            active_history_cache.release()
-            active_history_cache = create_history_context_cache(
-                history_file=history_file,
-                history_text=history.get_conversation_history(history_file=history_file),
-                client=client,
-                backoff_call=call_with_exponential_backoff,
-            )
-            if temperature < 2.0:
-                temperature += 0.1
-            attempt_number += 1
+
+        _advance_attempt(EXECUTION_MANAGER_TASK_NAME)
 
     text_response = ""
     media_paths: list[str] = []
@@ -333,11 +397,11 @@ def generate_response(
                 _run_model_api,
                 text="Use the conversation context to answer the user's latest request.",
                 system_instructions=TEXTER_FILE.read_text(encoding="utf-8"),
-                model=MINIMAL_MODEL,
+                model=LOW_MODEL,
                 tool_use_allowed=False,
                 force_tool=False,
                 temperature=default_temperature,
-                thinking_level="high",
+                thinking_level="low",
                 history_cache=post_review_cache,
                 current_history_text=post_review_cache.history_text,
             )
@@ -410,20 +474,26 @@ def _get_function_declarations(client: genai.Client = None) -> list[types.Functi
     return function_declarations
 
 
-def _normalize_execution_plan(execution_order_dict: dict) -> list[dict]:
+def _normalize_execution_plan(execution_order_dict: dict, plan_key: str = "execution_plan") -> list[dict]:
     """Normalize execution order payload into staged execution format.
 
     Required format:
-    - {"execution_plan": [{"mode": "parallel|serial", "sub_agents": [...]}, ...]}
+    - {"<plan_key>": [{"mode": "parallel|serial", "sub_agents": [...]}, ...]}
     - Each stage must explicitly include "mode" as "parallel" or "serial".
-    - The final stage must be serial and end with a Reviewer sub-agent.
     - Each sub-agent should include "thinking_level" (MINIMAL/LOW/MEDIUM/HIGH).
     - Missing or invalid thinking levels are normalized to MEDIUM for backward compatibility.
     """
     normalized_plan: list[dict] = []
 
-    if isinstance(execution_order_dict, dict) and isinstance(execution_order_dict.get("execution_plan"), list):
-        for stage in execution_order_dict["execution_plan"]:
+    if not isinstance(execution_order_dict, dict):
+        return []
+
+    plan_stages = execution_order_dict.get(plan_key)
+    if not isinstance(plan_stages, list) and plan_key != "execution_plan":
+        plan_stages = execution_order_dict.get("execution_plan")
+
+    if isinstance(plan_stages, list):
+        for stage in plan_stages:
             if not isinstance(stage, dict):
                 continue
 
@@ -472,7 +542,7 @@ def _get_skill(function_name: str, function_args: dict) -> str:
     return function_output
 
 
-def _has_final_reviewer_agent(execution_plan: list[dict]) -> bool:
+def _has_final_named_agent(execution_plan: list[dict], task_name: str) -> bool:
     if not execution_plan:
         return False
 
@@ -485,10 +555,19 @@ def _has_final_reviewer_agent(execution_plan: list[dict]) -> bool:
         return False
 
     final_agent = final_agents[0]
-    return isinstance(final_agent, dict) and final_agent.get("task_name") == REVIEWER_TASK_NAME
+    return isinstance(final_agent, dict) and final_agent.get("task_name") == task_name
 
 
-def _is_final_execution_agent(execution_plan: list[dict], stage_index: int, agent_index: int) -> bool:
+def _has_final_reviewer_agent(execution_plan: list[dict]) -> bool:
+    return _has_final_named_agent(execution_plan, REVIEWER_TASK_NAME)
+
+
+def _is_final_plan_agent(
+    execution_plan: list[dict],
+    stage_index: int,
+    agent_index: int,
+    final_task_name: str,
+) -> bool:
     if not execution_plan:
         return False
 
@@ -496,10 +575,120 @@ def _is_final_execution_agent(execution_plan: list[dict], stage_index: int, agen
         return False
 
     final_stage_agents = execution_plan[-1].get("sub_agents", [])
-    if not isinstance(final_stage_agents, list):
+    if not isinstance(final_stage_agents, list) or not final_stage_agents:
         return False
 
-    return agent_index == len(final_stage_agents) - 1
+    if agent_index != len(final_stage_agents) - 1:
+        return False
+
+    final_agent = final_stage_agents[agent_index]
+    return isinstance(final_agent, dict) and final_agent.get("task_name") == final_task_name
+
+
+def _run_sub_agent_plan(
+    execution_plan: list[dict[str, Any]],
+    history_file: str,
+    temperature: float,
+    history_cache: HistoryContextCache,
+    final_agent_task_name: str,
+    final_agent_runner: Callable[[], str],
+) -> str:
+    sub_agent_system_instructions = SUB_AGENT_FILE.read_text(encoding="utf-8")
+    final_agent_output = ""
+
+    for stage_index, stage in enumerate(execution_plan):
+        mode = stage["mode"]
+        agents = stage["sub_agents"]
+
+        if mode == "parallel" and len(agents) > 1:
+            base_history = history.get_conversation_history(history_file=history_file)
+
+            def _run_parallel_agent(agent: dict[str, Any], stage_history: str) -> str:
+                model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
+                return _run_model_api(
+                    text=agent["instruction"],
+                    system_instructions=sub_agent_system_instructions,
+                    model=model_name,
+                    tool_use_allowed=True,
+                    force_tool=False,
+                    temperature=temperature,
+                    thinking_level=api_thinking_level,
+                    history_cache=history_cache,
+                    current_history_text=stage_history,
+                )
+
+            with ThreadPoolExecutor(max_workers=min(len(agents), 8)) as executor:
+                future_to_index = {
+                    executor.submit(_run_parallel_agent, agent, base_history): idx
+                    for idx, agent in enumerate(agents)
+                }
+
+                for future in as_completed(future_to_index):
+                    idx = future_to_index[future]
+                    agent = agents[idx]
+                    sub_agent_response = ""
+                    try:
+                        sub_agent_response = future.result()
+                    except Exception as e:
+                        print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
+
+                    history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
+        else:
+            for agent_index, agent in enumerate(agents):
+                sub_agent_response = ""
+                try:
+                    if _is_final_plan_agent(execution_plan, stage_index, agent_index, final_agent_task_name):
+                        sub_agent_response = final_agent_runner()
+                        final_agent_output = sub_agent_response
+                    else:
+                        model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
+                        sub_agent_response = _run_model_api(
+                            text=agent["instruction"],
+                            system_instructions=sub_agent_system_instructions,
+                            model=model_name,
+                            tool_use_allowed=True,
+                            force_tool=False,
+                            temperature=temperature,
+                            thinking_level=api_thinking_level,
+                            history_cache=history_cache,
+                            current_history_text=history.get_conversation_history(history_file=history_file),
+                        )
+
+                    history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
+                except Exception as e:
+                    print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
+
+    return final_agent_output
+
+
+def _run_planner_reviewer(
+    history_file: str,
+    user_message: str,
+    temperature: float,
+    history_cache: HistoryContextCache | None = None,
+) -> str:
+    if history_cache is not None:
+        return _run_model_api(
+            text="Review whether planning has gathered enough information to proceed to execution.",
+            system_instructions=PLANNER_REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
+            model=LOW_MODEL,
+            tool_use_allowed=False,
+            force_tool=False,
+            temperature=temperature,
+            thinking_level="low",
+            history_cache=history_cache,
+            current_history_text=history.get_conversation_history(history_file=history_file),
+        )
+
+    return _run_model_api(
+        text=history.get_conversation_history(history_file=history_file),
+        system_instructions=PLANNER_REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
+        model=LOW_MODEL,
+        tool_use_allowed=False,
+        force_tool=False,
+        temperature=temperature,
+        thinking_level="low",
+    )
 
 
 def _run_final_reviewer(

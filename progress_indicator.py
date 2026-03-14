@@ -15,7 +15,16 @@ EXECUTION_PLAN_PROGRESS_UPDATE_INTERVAL_SECONDS = 1
 EXECUTION_PLAN_WAITING_EMOJI = "⏳"
 EXECUTION_PLAN_IN_PROGRESS_EMOJI = "🔄"
 EXECUTION_PLAN_COMPLETED_EMOJI = "✅"
+PLANNER_PLAN_MESSAGE_HEADER = "Sub-agent planner plan progress"
 EXECUTION_PLAN_MESSAGE_HEADER = "Sub-agent execution plan progress"
+PLAN_KIND_TO_MESSAGE_HEADER = {
+    "planner": PLANNER_PLAN_MESSAGE_HEADER,
+    "execution": EXECUTION_PLAN_MESSAGE_HEADER,
+}
+PLAN_KIND_TO_MANAGER_ROLE = {
+    "planner": "PlannerManager",
+    "execution": "ExecutionManager",
+}
 THINKING_LEVEL_TO_EMOJI = {
     "MINIMAL": "⚪",
     "LOW": "🟢",
@@ -41,9 +50,15 @@ def truncate_instruction_preview(instruction: str, limit: int = SUB_AGENT_INSTRU
     return compact[:limit] + "..."
 
 
-def build_execution_plan_ascii_diagram(execution_plan: list[dict], history_file: str) -> str:
+def build_execution_plan_ascii_diagram(
+    execution_plan: list[dict],
+    history_file: str,
+    plan_kind: str = "execution",
+) -> str:
     lines: list[str] = []
-    lines.append(f"+-- Execution Plan ({history_file})")
+    normalized_plan_kind = (plan_kind or "execution").strip().lower() or "execution"
+    title = "Planner Plan" if normalized_plan_kind == "planner" else "Execution Plan"
+    lines.append(f"+-- {title} ({history_file})")
 
     for stage_index, stage in enumerate(execution_plan, start=1):
         mode = str(stage.get("mode", "serial"))
@@ -68,19 +83,26 @@ def build_execution_plan_ascii_diagram(execution_plan: list[dict], history_file:
 def dispatch_execution_plan_preview_async(
     execution_plan: list[dict],
     history_file: str,
-    execution_plan_notifier: Callable[[str, list[dict], int, bool], None] | None,
+    execution_plan_notifier: Callable[..., None] | None,
     attempt_number: int,
     reset_previous_preview: bool,
+    plan_kind: str = "execution",
 ) -> None:
     if execution_plan_notifier is None or not execution_plan:
         return
 
     def _worker() -> None:
         try:
-            diagram = build_execution_plan_ascii_diagram(execution_plan, history_file)
+            diagram = build_execution_plan_ascii_diagram(execution_plan, history_file, plan_kind=plan_kind)
             if diagram:
                 try:
-                    execution_plan_notifier(diagram, execution_plan, attempt_number, reset_previous_preview)
+                    execution_plan_notifier(
+                        diagram,
+                        execution_plan,
+                        attempt_number,
+                        reset_previous_preview,
+                        plan_kind,
+                    )
                 except TypeError:
                     execution_plan_notifier(diagram, execution_plan)  # type: ignore[misc, call-arg]
         except Exception as e:
@@ -112,12 +134,13 @@ class ExecutionPlanProgressIndicator:
         loop: asyncio.AbstractEventLoop,
         channel: discord.abc.Messageable,
         history_file: str,
-    ) -> Callable[[str, list[dict[str, Any]], int, bool], None]:
+    ) -> Callable[..., None]:
         def _notifier(
             diagram_text: str,
             execution_plan: list[dict[str, Any]],
             attempt_number: int = 1,
             reset_previous_preview: bool = False,
+            plan_kind: str = "execution",
         ) -> None:
             if not diagram_text:
                 return
@@ -134,6 +157,7 @@ class ExecutionPlanProgressIndicator:
                         execution_plan=execution_plan,
                         attempt_number=attempt_number,
                         reset_previous_preview=reset_previous_preview,
+                        plan_kind=plan_kind,
                     ),
                     loop,
                 )
@@ -167,6 +191,7 @@ class ExecutionPlanProgressIndicator:
         execution_plan: list[dict[str, Any]],
         attempt_number: int,
         reset_previous_preview: bool,
+        plan_kind: str,
     ) -> None:
         _ = reset_previous_preview
         tracker_key = f"{id(channel)}::{history_file}"
@@ -181,6 +206,7 @@ class ExecutionPlanProgressIndicator:
                 history_file=history_file,
                 execution_plan=execution_plan,
                 attempt_number=attempt_number,
+                plan_kind=plan_kind,
             )
         )
         self._execution_plan_progress_tasks[tracker_key] = task
@@ -198,6 +224,7 @@ class ExecutionPlanProgressIndicator:
         history_file: str,
         execution_plan: list[dict[str, Any]],
         attempt_number: int,
+        plan_kind: str,
     ) -> None:
         import discord
 
@@ -210,6 +237,7 @@ class ExecutionPlanProgressIndicator:
                 history_file=history_file,
                 execution_plan=execution_plan,
                 attempt_number=attempt_number,
+                plan_kind=plan_kind,
             )
 
             try:
@@ -263,13 +291,17 @@ class ExecutionPlanProgressIndicator:
         history_file: str,
         execution_plan: list[dict[str, Any]],
         attempt_number: int,
+        plan_kind: str,
     ) -> tuple[str, bool]:
         history_entries = await asyncio.to_thread(history.parse_history_file, history_file)
+
+        normalized_plan_kind = (plan_kind or "execution").strip().lower() or "execution"
+        manager_role = PLAN_KIND_TO_MANAGER_ROLE.get(normalized_plan_kind, "manager")
 
         latest_manager_index = -1
         for index in range(len(history_entries) - 1, -1, -1):
             role = str(history_entries[index].get("speaker") or "").strip()
-            if role.casefold() == "manager":
+            if role.casefold() == manager_role.casefold():
                 latest_manager_index = index
                 break
 
@@ -351,7 +383,8 @@ class ExecutionPlanProgressIndicator:
                     in_progress_keys.add(incomplete_keys[0])
 
         lines: list[str] = []
-        title_line = f"{EXECUTION_PLAN_MESSAGE_HEADER} ({history_file})"
+        message_header = PLAN_KIND_TO_MESSAGE_HEADER.get(normalized_plan_kind, EXECUTION_PLAN_MESSAGE_HEADER)
+        title_line = f"{message_header} ({history_file})"
         attempt_label = max(1, int(attempt_number))
         lines.append(title_line)
         lines.append(f"Attempt: {attempt_label}")
