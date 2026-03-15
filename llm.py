@@ -96,16 +96,33 @@ def generate_response(
             user_message = f"{user_message}\n\nAttachment text:\n{attachment_text}"
         else:
             user_message = f"Attachment text:\n{attachment_text}"
-    history.append_history(role="user", text=user_message, history_file=history_file)
+
+    current_history_text = history.get_conversation_history(history_file=history_file)
+
+    def _append_history_and_update(role: str, text: str) -> None:
+        nonlocal current_history_text
+
+        appended_block = history.append_history(role=role, text=text, history_file=history_file)
+        if appended_block:
+            if current_history_text and current_history_text != "No history available.":
+                current_history_text += appended_block
+            else:
+                current_history_text = appended_block
+            return
+
+        # Fallback only if append helper failed to return a block.
+        current_history_text = history.get_conversation_history(history_file=history_file)
+
+    _append_history_and_update(role="user", text=user_message)
+
     active_history_cache = create_history_context_cache(
         history_file=history_file,
-        history_text=history.get_conversation_history(history_file=history_file),
+        history_text=current_history_text,
         client=client,
         backoff_call=call_with_exponential_backoff,
     )
 
     if not job:
-        current_history_text = history.get_conversation_history(history_file=history_file)
         relevant_memories_text = memory.build_relevant_memories_text(
             current_history_text,
             semantic_limit=5,
@@ -137,18 +154,18 @@ def generate_response(
             print(f"Error generating intent response: {e}")
 
         if "<complex>" not in (intent_response or ""):
-            history.append_history(role="IntentClassifier", text=intent_response, history_file=history_file)
+            _append_history_and_update(role="IntentClassifier", text=intent_response)
             if not job:
                 active_history_cache.release()
                 post_intent_cache = create_history_context_cache(
                     history_file=history_file,
-                    history_text=history.get_conversation_history(history_file=history_file),
+                    history_text=current_history_text,
                     client=client,
                     backoff_call=call_with_exponential_backoff,
                 )
                 try:
                     relevant_memories_history = memory.build_relevant_memories_text(
-                        history.get_conversation_history(history_file=history_file),
+                        current_history_text,
                         semantic_limit=10,
                         file_limit=4,
                     )
@@ -171,6 +188,7 @@ def generate_response(
         nonlocal temperature
         nonlocal attempt_number
         nonlocal active_history_cache
+        nonlocal current_history_text
 
         _refresh_active_history_cache()
 
@@ -181,8 +199,9 @@ def generate_response(
                 pivot_role=pivot_role,
                 summarize_after_latest_role=summarize_after_latest_role,
                 history_cache=active_history_cache.retain(),
-                current_history_text=history.get_conversation_history(history_file=history_file),
+                current_history_text=current_history_text,
             )
+            current_history_text = history.get_conversation_history(history_file=history_file)
         _refresh_active_history_cache()
         if temperature < 2.0:
             temperature += 0.1
@@ -194,7 +213,7 @@ def generate_response(
         active_history_cache.release()
         active_history_cache = create_history_context_cache(
             history_file=history_file,
-            history_text=history.get_conversation_history(history_file=history_file),
+            history_text=current_history_text,
             client=client,
             backoff_call=call_with_exponential_backoff,
         )
@@ -235,7 +254,7 @@ def generate_response(
 
         if not planner_phase_ready:
             try:
-                planner_history_text = history.get_conversation_history(history_file=history_file)
+                planner_history_text = current_history_text
                 planner_skill_names = memory.build_skill_names_text(limit=200)
                 planner_system_instructions = PLANNER_FILE.read_text(encoding="utf-8") + history_file
                 if planner_skill_names:
@@ -252,10 +271,9 @@ def generate_response(
                     history_cache=active_history_cache,
                     current_history_text=planner_history_text,
                 )
-                history.append_history(
+                _append_history_and_update(
                     role=PLANNER_MANAGER_TASK_NAME,
                     text=f"{planner_order_file} created. \nRelevant skills: {planner_skill_names}",
-                    history_file=history_file,
                 )
             except Exception as e:
                 print(f"Error generating planner manager response: {e}")
@@ -292,17 +310,18 @@ def generate_response(
                 plan_kind="planner",
             )
 
-            planner_exit_string = _run_sub_agent_plan(
+            planner_exit_string, current_history_text = _run_sub_agent_plan(
                 execution_plan=planner_plan,
                 history_file=history_file,
                 temperature=temperature,
                 history_cache=active_history_cache,
                 final_agent_task_name=PLANNER_REVIEWER_TASK_NAME,
-                final_agent_runner=lambda: _run_planner_reviewer(
+                final_agent_runner=lambda latest_history_text: _run_planner_reviewer(
                     history_file,
                     user_message,
                     default_temperature,
                     history_cache=active_history_cache,
+                    current_history_text=latest_history_text,
                 ),
             )
 
@@ -318,7 +337,7 @@ def generate_response(
             _refresh_active_history_cache()
 
         try:
-            execution_history_text = history.get_conversation_history(history_file=history_file)
+            execution_history_text = current_history_text
             execution_manager_system_instructions = EXECUTION_MANAGER_FILE.read_text(encoding="utf-8") + history_file
 
             _run_model_api(
@@ -332,10 +351,9 @@ def generate_response(
                 history_cache=active_history_cache,
                 current_history_text=execution_history_text,
             )
-            history.append_history(
+            _append_history_and_update(
                 role=EXECUTION_MANAGER_TASK_NAME,
                 text=f"{execution_order_file} created.",
-                history_file=history_file,
             )
         except Exception as e:
             print(f"Error generating execution manager response: {e}")
@@ -385,17 +403,18 @@ def generate_response(
             plan_kind="execution",
         )
 
-        exit_string = _run_sub_agent_plan(
+        exit_string, current_history_text = _run_sub_agent_plan(
             execution_plan=execution_plan,
             history_file=history_file,
             temperature=temperature,
             history_cache=active_history_cache,
             final_agent_task_name=REVIEWER_TASK_NAME,
-            final_agent_runner=lambda: _run_final_reviewer(
+            final_agent_runner=lambda latest_history_text: _run_final_reviewer(
                 history_file,
                 user_message,
                 default_temperature,
                 history_cache=active_history_cache,
+                current_history_text=latest_history_text,
             ),
         )
 
@@ -420,7 +439,7 @@ def generate_response(
     active_history_cache.release()
     post_review_cache = create_history_context_cache(
         history_file=history_file,
-        history_text=history.get_conversation_history(history_file=history_file),
+        history_text=current_history_text,
         client=client,
         backoff_call=call_with_exponential_backoff,
     )
@@ -428,6 +447,7 @@ def generate_response(
         history_file=history_file,
         temperature=default_temperature,
         history_cache=post_review_cache.retain(),
+        current_history_text=current_history_text,
     )
 
     try:
@@ -454,16 +474,15 @@ def generate_response(
 
             try:
                 text_response = text_future.result()
-                history.append_history(role="Texter", text=text_response, history_file=history_file)
+                _append_history_and_update(role="Texter", text=text_response)
             except Exception as e:
                 print(f"Error generating texter response: {e}")
 
             try:
                 media_paths = media_future.result()
-                history.append_history(
+                _append_history_and_update(
                     role="MediaSelector",
                     text=json.dumps({"media_paths": media_paths}, ensure_ascii=False),
-                    history_file=history_file,
                 )
             except Exception as e:
                 print(f"Error selecting media paths: {e}")
@@ -471,7 +490,7 @@ def generate_response(
 
         if not job:
             relevant_memories_history = memory.build_relevant_memories_text(
-                history.get_conversation_history(history_file=history_file),
+                current_history_text,
                 semantic_limit=10,
                 file_limit=4,
             )
@@ -630,17 +649,32 @@ def _run_sub_agent_plan(
     temperature: float,
     history_cache: HistoryContextCache,
     final_agent_task_name: str,
-    final_agent_runner: Callable[[], str],
-) -> str:
+    final_agent_runner: Callable[[str], str],
+) -> tuple[str, str]:
     sub_agent_system_instructions = SUB_AGENT_FILE.read_text(encoding="utf-8")
     final_agent_output = ""
+    current_history_text = history_cache.history_text
+
+    def _append_history_and_update(role: str, text: str) -> None:
+        nonlocal current_history_text
+
+        appended_block = history.append_history(role=role, text=text, history_file=history_file)
+        if appended_block:
+            if current_history_text and current_history_text != "No history available.":
+                current_history_text += appended_block
+            else:
+                current_history_text = appended_block
+            return
+
+        # Fallback only if append helper failed to return a block.
+        current_history_text = history.get_conversation_history(history_file=history_file)
 
     for stage_index, stage in enumerate(execution_plan):
         mode = stage["mode"]
         agents = stage["sub_agents"]
 
         if mode == "parallel" and len(agents) > 1:
-            base_history = history.get_conversation_history(history_file=history_file)
+            base_history = current_history_text
 
             def _run_parallel_agent(agent: dict[str, Any], stage_history: str) -> str:
                 model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
@@ -671,13 +705,13 @@ def _run_sub_agent_plan(
                     except Exception as e:
                         print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
 
-                    history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
+                    _append_history_and_update(role=agent["task_name"], text=sub_agent_response)
         else:
             for agent_index, agent in enumerate(agents):
                 sub_agent_response = ""
                 try:
                     if _is_final_plan_agent(execution_plan, stage_index, agent_index, final_agent_task_name):
-                        sub_agent_response = final_agent_runner()
+                        sub_agent_response = final_agent_runner(current_history_text)
                         final_agent_output = sub_agent_response
                     else:
                         model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
@@ -690,14 +724,14 @@ def _run_sub_agent_plan(
                             temperature=temperature,
                             thinking_level=api_thinking_level,
                             history_cache=history_cache,
-                            current_history_text=history.get_conversation_history(history_file=history_file),
+                            current_history_text=current_history_text,
                         )
 
-                    history.append_history(role=agent["task_name"], text=sub_agent_response, history_file=history_file)
+                    _append_history_and_update(role=agent["task_name"], text=sub_agent_response)
                 except Exception as e:
                     print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
 
-    return final_agent_output
+    return final_agent_output, current_history_text
 
 
 def _run_planner_reviewer(
@@ -705,6 +739,7 @@ def _run_planner_reviewer(
     user_message: str,
     temperature: float,
     history_cache: HistoryContextCache | None = None,
+    current_history_text: str | None = None,
 ) -> str:
     if history_cache is not None:
         return _run_model_api(
@@ -716,7 +751,7 @@ def _run_planner_reviewer(
             temperature=temperature,
             thinking_level="low",
             history_cache=history_cache,
-            current_history_text=history.get_conversation_history(history_file=history_file),
+            current_history_text=current_history_text,
         )
 
     return _run_model_api(
@@ -735,6 +770,7 @@ def _run_final_reviewer(
     user_message: str,
     temperature: float,
     history_cache: HistoryContextCache | None = None,
+    current_history_text: str | None = None,
 ) -> str:
     if history_cache is not None:
         return _run_model_api(
@@ -746,7 +782,7 @@ def _run_final_reviewer(
             temperature=temperature,
             thinking_level="low",
             history_cache=history_cache,
-            current_history_text=history.get_conversation_history(history_file=history_file),
+            current_history_text=current_history_text,
         )
 
     return _run_model_api(

@@ -45,20 +45,22 @@ def clear_history(history_file: str = "default") -> None:
         return "Failed to clear history file."
 
 
-def append_history(role: str, text: str, history_file: str = "default") -> None:
+def append_history(role: str, text: str, history_file: str = "default") -> str:
     """Append a single message to the history file synchronously.
 
-    Role should be something like 'user' or 'llm'.
+    Role should be something like 'user' or 'llm'. Returns the exact markdown
+    block written so callers can update in-memory history snapshots cheaply.
     """
     target_file = _resolve_history_file(history_file)
     try:
         ts = datetime.now(TORONTO_TZ).isoformat()
+        block = f"## {ts} - {role}\n\n{text.rstrip()}\n\n---\n\n"
         with _HISTORY_FILE_LOCK:
             with target_file.open("a", encoding="utf-8") as f:
-                f.write(f"## {ts} - {role}\n\n")
-                f.write(text.rstrip() + "\n\n---\n\n")
+                f.write(block)
+        return block
     except Exception:
-        return "Failed to append to history file."
+        return ""
 
 
 def _format_message_block(message: Dict[str, Optional[str]]) -> str:
