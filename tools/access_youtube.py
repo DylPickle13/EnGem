@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""Plain-text YouTube Data API v3 wrapper.
-
-Supports natural-language requests that are planned into YouTube API actions.
-All actions use OAuth2 credentials (client_secrets + saved token).
-
-Usage examples:
-  - Run smoke tests (default when no query is provided):
-      python tools/access_youtube.py --client-secrets /path/to/client_secret.json
-  - Run a single plain-text query:
-      python tools/access_youtube.py --client-secrets /path/to/client_secret.json "Find 5 videos about Python automation"
-  - Run from a query file:
-      python tools/access_youtube.py --client-secrets /path/to/client_secret.json --file prompts/youtube-query.txt
-"""
-
 from __future__ import annotations
 
 import argparse

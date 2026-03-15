@@ -90,8 +90,13 @@ class DiscordBotWrapper:
 		self.responder = responder or self._default_responder
 		self._register_events()
 
+	@staticmethod
+	def _is_job_message(message: object) -> bool:
+		return bool(getattr(message, "job", False))
+
 	async def _default_responder(self, text: str, message: discord.Message) -> llm.LLMResponse:
 		history_file = _get_history_file_key_for_channel(message.channel)
+		is_job = self._is_job_message(message)
 		media_payloads = await self._read_media_attachments(message)
 		execution_plan_notifier = self._progress_indicator.build_execution_plan_notifier(
 			loop=self.client.loop,
@@ -101,7 +106,7 @@ class DiscordBotWrapper:
 		return await asyncio.to_thread(
 			llm.generate_response,
 			text,
-			False,
+			is_job,
 			history_file,
 			media_payloads,
 			execution_plan_notifier,
@@ -636,6 +641,7 @@ def _process_calendar_event(event: dict[str, Any]) -> bool:
 			self.channel = channel
 			self.content = content
 			self.attachments: list[discord.Attachment] = []
+			self.job = True
 
 	async def _dispatch_as_normal_message() -> None:
 		injected_message = _InjectedCalendarMessage(matching_channel, description)
