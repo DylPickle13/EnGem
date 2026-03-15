@@ -9,3 +9,6 @@ download.html
 /generated_files
 /skills
 /prompts
+# YouTube OAuth secrets and tokens
+client_secret_*.json
+youtube_token.json

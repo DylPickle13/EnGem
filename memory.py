@@ -971,23 +971,31 @@ def build_relevant_skills_text(query: str, limit: int = 4) -> str:
     return "\n\n".join(sections)
 
 
-def build_skill_names_text(limit: int = 200) -> str:
-    """Return a compact list of available skill file paths for planner prompts."""
+def build_skill_names_text(query: str, limit: int = 10) -> str:
+    """Return top relevant skill file paths for planner prompts using semantic search."""
+    cleaned_query = (query or "").strip()
+    if not cleaned_query:
+        return ""
+
     try:
-        records = get_skill_store().read_all_memories(
+        records = get_skill_store().search_memories(
+            cleaned_query,
             limit=max(1, limit),
             where={"record_type": "skill"},
         )
     except Exception:
         return ""
 
-    skill_files = sorted(
-        {
-            str((item.metadata or {}).get("skill_file") or "").strip()
-            for item in records
-            if str((item.metadata or {}).get("skill_file") or "").strip()
-        }
-    )
+    # Preserve relevance order from vector search while deduplicating by file path.
+    seen: set[str] = set()
+    skill_files: list[str] = []
+    for item in records:
+        skill_file = str((item.metadata or {}).get("skill_file") or "").strip()
+        if not skill_file or skill_file in seen:
+            continue
+        seen.add(skill_file)
+        skill_files.append(skill_file)
+
     if not skill_files:
         return ""
 

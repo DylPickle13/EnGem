@@ -255,7 +255,7 @@ def generate_response(
         if not planner_phase_ready:
             try:
                 planner_history_text = current_history_text
-                planner_skill_names = memory.build_skill_names_text(limit=200)
+                planner_skill_names = memory.build_skill_names_text(query=user_message, limit=10)
                 planner_system_instructions = PLANNER_FILE.read_text(encoding="utf-8") + history_file
                 if planner_skill_names:
                     planner_system_instructions += "\n\n" + planner_skill_names
@@ -339,9 +339,30 @@ def generate_response(
         try:
             execution_history_text = current_history_text
             execution_manager_system_instructions = EXECUTION_MANAGER_FILE.read_text(encoding="utf-8") + history_file
+            execution_manager_prompt = "Use the planner findings in the conversation context to create the execution plan JSON file."
+
+            latest_conversation_summary = _get_latest_history_message_by_role(
+                execution_history_text,
+                "ConversationSummary",
+            )
+            if latest_conversation_summary:
+                execution_manager_prompt += (
+                    "\n\nLatest ConversationSummary feedback to apply when updating the execution plan:\n"
+                    + latest_conversation_summary
+                )
+
+            latest_reviewer_feedback = _get_latest_history_message_by_role(
+                execution_history_text,
+                REVIEWER_TASK_NAME,
+            )
+            if latest_reviewer_feedback:
+                execution_manager_prompt += (
+                    "\n\nLatest Reviewer feedback to address in this plan:\n"
+                    + latest_reviewer_feedback
+                )
 
             _run_model_api(
-                text="Use the planner findings in the conversation context to create the execution plan JSON file.",
+                text=execution_manager_prompt,
                 system_instructions=execution_manager_system_instructions,
                 model=MEDIUM_MODEL,
                 tool_use_allowed=True,
@@ -618,6 +639,27 @@ def _has_final_named_agent(execution_plan: list[dict], task_name: str) -> bool:
 
 def _has_final_reviewer_agent(execution_plan: list[dict]) -> bool:
     return _has_final_named_agent(execution_plan, REVIEWER_TASK_NAME)
+
+
+def _get_latest_history_message_by_role(history_text: str | None, role: str) -> str:
+    if not history_text:
+        return ""
+
+    target_role = (role or "").strip().lower()
+    if not target_role:
+        return ""
+
+    try:
+        messages = history.parse_history(history_text)
+    except Exception:
+        return ""
+
+    for message in reversed(messages):
+        speaker = (message.get("speaker") or "").strip().lower()
+        if speaker == target_role:
+            return (message.get("text") or "").strip()
+
+    return ""
 
 
 def _is_final_plan_agent(
