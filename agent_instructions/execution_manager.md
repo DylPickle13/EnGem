@@ -14,6 +14,7 @@ When creating the execution plan, follow these rules strictly:
 2. For each non-reviewer sub-task, specify exactly one tool in the instruction.
   - Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, generate_speech, run_notebook, deep_research, and access_google_workspace.
   - The browser tool exits after it is done, so split multiple browser actions into separate sub-tasks.
+  - Break the access_google_workspace tool into separate sub-tasks for everything it needs to do. 
   - The final Reviewer sub-agent is the only exception and should not call a tool.
 3. For each sub-task, set thinking_level to exactly one of: MINIMAL, LOW, MEDIUM, HIGH.
   - MINIMAL: direct tool calls: run_google_search, use_browser, generate_image/video/speech, deep_research, or simple run_notebook calls.

@@ -17,6 +17,7 @@ When creating the planning plan, follow these rules strictly:
 2. For each non-reviewer sub-task, specify exactly one tool in the instruction.
   - Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, generate_speech, run_notebook, deep_research, and access_google_workspace.
   - The browser tool exits after it is done, so if you need multiple browser actions, create separate sub-tasks.
+  - Break the access_google_workspace tool into separate sub-tasks for everything it needs to do. 
   - The final PlannerReviewer sub-agent is the only exception and should not call a tool.
 3. For each sub-task, set thinking_level to exactly one of: MINIMAL, LOW, MEDIUM, HIGH.
   - MINIMAL: direct tool calls: run_google_search, use_browser, generate_image/video/speech, access_google_workspace (Drive, Calendar, Docs, etc...), deep_research, or simple run_notebook calls.

@@ -166,6 +166,7 @@ def generate_response(
     def _advance_attempt(
         pivot_role: str,
         summarize_after_latest_role: str | None = None,
+        summarize_history: bool = True,
     ) -> None:
         nonlocal temperature
         nonlocal attempt_number
@@ -173,14 +174,15 @@ def generate_response(
 
         _refresh_active_history_cache()
 
-        history.run_history_summarization(
-            history_file=history_file,
-            temperature=default_temperature,
-            pivot_role=pivot_role,
-            summarize_after_latest_role=summarize_after_latest_role,
-            history_cache=active_history_cache.retain(),
-            current_history_text=history.get_conversation_history(history_file=history_file),
-        )
+        if summarize_history:
+            history.run_history_summarization(
+                history_file=history_file,
+                temperature=default_temperature,
+                pivot_role=pivot_role,
+                summarize_after_latest_role=summarize_after_latest_role,
+                history_cache=active_history_cache.retain(),
+                current_history_text=history.get_conversation_history(history_file=history_file),
+            )
         _refresh_active_history_cache()
         if temperature < 2.0:
             temperature += 0.1
@@ -228,7 +230,7 @@ def generate_response(
                     summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
                 )
             else:
-                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME, summarize_history=False)
             continue
 
         if not planner_phase_ready:
@@ -260,7 +262,7 @@ def generate_response(
 
             if not planner_order_file.exists():
                 print("No planner order file found.")
-                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME, summarize_history=False)
                 continue
 
             try:
@@ -268,17 +270,17 @@ def generate_response(
                     planner_order_dict = json.load(f)
             except Exception as e:
                 print(f"Error reading planner order file: {e}")
-                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME, summarize_history=False)
                 continue
 
             planner_plan = _normalize_execution_plan(planner_order_dict, plan_key="planner_plan")
             if not planner_plan:
                 print("No valid planner plan found in planner order file.")
-                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME, summarize_history=False)
                 continue
             if not _has_final_named_agent(planner_plan, PLANNER_REVIEWER_TASK_NAME):
                 print("Planner plan is missing a final serial PlannerReviewer agent.")
-                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME, summarize_history=False)
                 continue
 
             _dispatch_execution_plan_preview_async(
@@ -305,8 +307,8 @@ def generate_response(
             )
 
             if "<ready>" not in (planner_exit_string or "").lower():
-                print("Planner phase did not report readiness. Retrying after summarizing planner attempt.")
-                _advance_attempt(PLANNER_MANAGER_TASK_NAME)
+                print("Planner phase did not report readiness. Retrying planner attempt without summarization.")
+                _advance_attempt(PLANNER_MANAGER_TASK_NAME, summarize_history=False)
                 continue
 
             planner_phase_ready = True
@@ -370,6 +372,7 @@ def generate_response(
             _advance_attempt(
                 EXECUTION_MANAGER_TASK_NAME,
                 summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
+                summarize_history=False,
             )
             continue
 
