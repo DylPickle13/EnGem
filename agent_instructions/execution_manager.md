@@ -17,9 +17,9 @@ When creating the execution plan, follow these rules strictly:
   - Break the access_google_workspace tool and access_youtube into separate sub-tasks for everything it needs to do. 
   - The final Reviewer sub-agent is the only exception and should not call a tool.
 3. For each sub-task, set thinking_level to exactly one of: MINIMAL, LOW, MEDIUM, HIGH.
-  - MINIMAL: direct tool calls: run_google_search, use_browser, generate_image/video/speech, deep_research, or simple run_notebook calls, or access_youtube. 
+  - MINIMAL: direct tool calls: run_google_search, use_browser, generate_image/video/speech, deep_research, or simple run_notebook calls, or access_youtube, or access_google_workspace (Drive, Calendar, Docs, etc...)
   - LOW: summarize/verify/check.
-  - MEDIUM: analysis/synthesis/debugging/coding, run_python with meaningful logic, or access_google_workspace (Drive, Calendar, Docs, etc...)
+  - MEDIUM: analysis/synthesis/debugging/coding, run_python with meaningful logic
   - HIGH: rare, only when the reasoning requirement is unusually complex.
 4. Always end with exactly one final serial sub-agent named Reviewer.
   - Reviewer must follow execution_reviewer.md behavior and print <yes> only when complete.

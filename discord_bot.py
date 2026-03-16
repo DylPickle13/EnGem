@@ -22,6 +22,7 @@ DISCORD_ATTACHMENT_BATCH_MAX_BYTES = 24 * 1024 * 1024
 DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
 MESSAGE_WORKER_CONCURRENCY = 3
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
+PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
 def _sanitize_history_filename_component(value: str | None) -> str:
@@ -618,9 +619,19 @@ def _process_calendar_event(event: dict[str, Any]) -> bool:
 		logging.info("Skipping calendar event without summary: %s", event.get("id"))
 		return False
 
-	description = str(event.get("description") or "").strip()
-	if not description:
-		logging.info("Skipping calendar event '%s': empty description.", event_name)
+	prompt_path = PROMPTS_DIR / f"{event_name}.md"
+	if not prompt_path.is_file():
+		logging.info("Skipping calendar event '%s': missing prompt file %s.", event_name, prompt_path)
+		return False
+
+	try:
+		prompt_content = prompt_path.read_text(encoding="utf-8").strip()
+	except OSError as exc:
+		logging.exception("Skipping calendar event '%s': failed reading prompt file: %s", event_name, exc)
+		return False
+
+	if not prompt_content:
+		logging.info("Skipping calendar event '%s': prompt file is empty.", event_name)
 		return False
 
 	matching_channel = next(
@@ -644,7 +655,7 @@ def _process_calendar_event(event: dict[str, Any]) -> bool:
 			self.job = True
 
 	async def _dispatch_as_normal_message() -> None:
-		injected_message = _InjectedCalendarMessage(matching_channel, description)
+		injected_message = _InjectedCalendarMessage(matching_channel, prompt_content)
 		channel_lock = bot._get_channel_processing_lock(matching_channel)
 		async with channel_lock:
 			await bot._process_message(injected_message)

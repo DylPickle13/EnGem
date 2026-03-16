@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -194,7 +195,7 @@ def _error_payload(message: str, **extra: Any) -> str:
     return _json_dumps(payload)
 
 
-def _plan_query_payload(query: str) -> tuple[dict | None, str]:
+def _plan_query_payload(query: str, *, feedback: list[dict[str, Any]] | None = None) -> tuple[dict | None, str]:
     import llm
 
     system_instructions = (
@@ -207,8 +208,15 @@ def _plan_query_payload(query: str) -> tuple[dict | None, str]:
         "{\"action\":\"upload\",\"file\":\"/path/to/file.mp4\",\"title\":\"Title\"}\n"
     )
 
+    prompt_parts = [f"User request:\n{query}"]
+    if feedback:
+        prompt_parts.append(
+            "Previous planner feedback JSON. Repair your next payload based on these validation/execution issues:\n"
+            f"{_json_dumps(feedback)}"
+        )
+
     planner_output = llm._run_model_api(
-        text=f"User request:\n{query}",
+        text="\n\n".join(prompt_parts),
         system_instructions=system_instructions,
         model=MINIMAL_MODEL,
         tool_use_allowed=False,
@@ -217,6 +225,76 @@ def _plan_query_payload(query: str) -> tuple[dict | None, str]:
         thinking_level="low",
     )
     return _extract_first_json_object(planner_output), planner_output
+
+
+def _validate_planned_payload(payload: dict) -> str | None:
+    action = str(payload.get("action", "")).strip().lower()
+    if action not in {"search", "get", "upload"}:
+        return "Unsupported or missing action. Use one of: search, get, upload."
+
+    if action == "search":
+        query = payload.get("query") or payload.get("q")
+        if not str(query or "").strip():
+            return "search action requires `query`."
+        return None
+
+    if action == "get":
+        video_id = payload.get("video_id") or payload.get("id")
+        if not str(video_id or "").strip():
+            return "get action requires `video_id`."
+        return None
+
+    if action == "upload":
+        file_path = payload.get("file")
+        if not str(file_path or "").strip():
+            return "upload action requires `file`."
+        title = payload.get("title") or payload.get("name")
+        if not str(title or "").strip():
+            return "upload action requires `title` (or `name`)."
+        return None
+
+    return None
+
+
+def _payload_to_cli_query(payload: dict[str, Any]) -> str | None:
+    action = str(payload.get("action", "")).strip().lower()
+    if action == "search":
+        query = payload.get("query") or payload.get("q")
+        if not str(query or "").strip():
+            return None
+        max_results = payload.get("max_results", 5)
+        parts = ["youtube.search", "--query", str(query), "--max-results", str(max_results)]
+        return shlex.join(parts)
+
+    if action == "get":
+        video_id = payload.get("video_id") or payload.get("id")
+        if not str(video_id or "").strip():
+            return None
+        return shlex.join(["youtube.get", "--video-id", str(video_id)])
+
+    if action == "upload":
+        file_path = payload.get("file")
+        title = payload.get("title") or payload.get("name")
+        if not str(file_path or "").strip() or not str(title or "").strip():
+            return None
+        parts = ["youtube.upload", "--file", str(file_path), "--title", str(title)]
+        description = payload.get("description")
+        if str(description or "").strip():
+            parts.extend(["--description", str(description)])
+        privacy = payload.get("privacyStatus")
+        if str(privacy or "").strip():
+            parts.extend(["--privacy", str(privacy)])
+        tags = payload.get("tags")
+        if isinstance(tags, list) and tags:
+            parts.extend(["--tags", ",".join(str(tag) for tag in tags)])
+        return shlex.join(parts)
+
+    return None
+
+
+def _extract_cli_queries_from_response(raw_response: dict[str, Any]) -> list[str]:
+    query = _payload_to_cli_query(raw_response.get("planned_payload", {})) if isinstance(raw_response.get("planned_payload"), dict) else None
+    return [query] if query else []
 
 
 def _execute_structured_payload(payload: dict, *, runtime_data: dict[str, Any]) -> str:
@@ -297,26 +375,80 @@ def _run_query_action(query: str, *, runtime_data: dict[str, Any]) -> str:
     if not normalized_query:
         return _error_payload("access_youtube requires a plain-text query.", executed=False)
 
-    planned_payload, planner_output = _plan_query_payload(normalized_query)
-    if not isinstance(planned_payload, dict):
-        return _error_payload(
-            "Planner failed to produce a valid JSON payload.",
-            executed=False,
-            planner_output=planner_output,
-        )
+    max_attempts = runtime_data.get("max_planner_attempts", runtime_data.get("planner_attempts", 4))
+    try:
+        max_attempts = max(1, min(int(max_attempts), 5))
+    except Exception:
+        max_attempts = 4
 
-    execution_text = _execute_structured_payload(planned_payload, runtime_data=runtime_data)
-    parsed_result = _parse_json_response(execution_text)
-    execution_result: Any = parsed_result if parsed_result is not None else execution_text
-    ok = bool(not (isinstance(execution_result, dict) and execution_result.get("ok") is False))
+    planner_feedback: list[dict[str, Any]] = []
+    last_payload: dict[str, Any] | None = None
+    last_planner_output = ""
+
+    for attempt in range(1, max_attempts + 1):
+        planned_payload, planner_output = _plan_query_payload(normalized_query, feedback=planner_feedback)
+        last_planner_output = planner_output
+
+        if not isinstance(planned_payload, dict):
+            planner_feedback.append(
+                {
+                    "attempt": attempt,
+                    "error": "Planner failed to produce a valid JSON payload.",
+                    "planner_output": planner_output,
+                }
+            )
+            continue
+
+        last_payload = planned_payload
+        validation_error = _validate_planned_payload(planned_payload)
+        if validation_error:
+            planner_feedback.append(
+                {
+                    "attempt": attempt,
+                    "error": validation_error,
+                    "planned_payload": planned_payload,
+                }
+            )
+            continue
+
+        execution_text = _execute_structured_payload(planned_payload, runtime_data=runtime_data)
+        parsed_result = _parse_json_response(execution_text)
+        execution_result: Any = parsed_result if parsed_result is not None else execution_text
+        ok = bool(not (isinstance(execution_result, dict) and execution_result.get("ok") is False))
+
+        if not ok and attempt < max_attempts:
+            planner_feedback.append(
+                {
+                    "attempt": attempt,
+                    "error": "Execution failed. Repair the payload using this feedback.",
+                    "planned_payload": planned_payload,
+                    "execution_result": execution_result,
+                }
+            )
+            continue
+
+        return _json_dumps(
+            {
+                "ok": ok,
+                "executed": True,
+                "query": normalized_query,
+                "planner_attempts": attempt,
+                "planned_payload": planned_payload,
+                "planned_cli_query": _payload_to_cli_query(planned_payload),
+                "result": execution_result,
+            }
+        )
 
     return _json_dumps(
         {
-            "ok": ok,
-            "executed": True,
+            "ok": False,
+            "executed": False,
             "query": normalized_query,
-            "planned_payload": planned_payload,
-            "result": execution_result,
+            "planner_attempts": max_attempts,
+            "planned_payload": last_payload,
+            "planned_cli_query": _payload_to_cli_query(last_payload) if isinstance(last_payload, dict) else None,
+            "planner_output": last_planner_output,
+            "feedback": planner_feedback,
         }
     )
 
@@ -331,10 +463,29 @@ def access_youtube(query: str = "") -> str:
     - Upload a local file /path/to/video.mp4 with title "My Video".
     """
     output = _run_query_action(query, runtime_data={})
+    parsed_output = _parse_json_response(output)
+
+    prefix_lines: list[str] = []
+    if isinstance(parsed_output, dict):
+        attempts = parsed_output.get("planner_attempts")
+        if attempts is not None:
+            prefix_lines.append(f"Planner attempts: {attempts}")
+
+        cli_queries = _extract_cli_queries_from_response(parsed_output)
+        if len(cli_queries) == 1:
+            prefix_lines.append(f"CLI query: {cli_queries[0]}")
+        elif len(cli_queries) > 1:
+            prefix_lines.append("CLI queries:")
+            prefix_lines.extend(f"{index}. {cli_query}" for index, cli_query in enumerate(cli_queries, start=1))
+
     try:
-        return _interpret_query_response(query, output)
+        interpreted = _interpret_query_response(query, output)
     except Exception:
-        return output
+        interpreted = output
+
+    if prefix_lines:
+        return "\n".join([*prefix_lines, "", interpreted])
+    return interpreted
 
 
 def _build_runtime_data(args: argparse.Namespace) -> dict[str, Any]:

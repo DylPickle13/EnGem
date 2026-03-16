@@ -1803,6 +1803,66 @@ def _interpret_query_response(query: str, raw_response: str) -> str:
     )
 
 
+def _payload_to_cli_query(payload: dict[str, Any]) -> str | None:
+    try:
+        prepared_payload = _inherit_runtime_settings(payload, {})
+        try:
+            prepared_payload = _convert_payload_times_to_utc(prepared_payload)
+        except Exception:
+            pass
+
+        built = _build_internal_command(prepared_payload)
+        if isinstance(built, str):
+            return None
+
+        args, _ = built
+        stripped_args = _strip_gws_prefix(args)
+        return f"gws {shlex.join(stripped_args)}" if stripped_args else "gws"
+    except Exception:
+        return None
+
+
+def _extract_cli_queries_from_response(raw_response: dict[str, Any]) -> list[str]:
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    def add_query(value: str | None) -> None:
+        if not value:
+            return
+        if value in seen:
+            return
+        seen.add(value)
+        queries.append(value)
+
+    planned_payload = raw_response.get("planned_payload")
+    if isinstance(planned_payload, dict):
+        if _resolve_action(planned_payload) == "workflow":
+            steps = planned_payload.get("steps")
+            if isinstance(steps, list):
+                for step in steps:
+                    if not isinstance(step, dict):
+                        continue
+                    add_query(_payload_to_cli_query(_extract_step_payload(step)))
+        else:
+            add_query(_payload_to_cli_query(planned_payload))
+
+    if queries:
+        return queries
+
+    result = raw_response.get("result")
+    if isinstance(result, dict):
+        steps = result.get("steps")
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                payload = step.get("payload")
+                if isinstance(payload, dict):
+                    add_query(_payload_to_cli_query(payload))
+
+    return queries
+
+
 def _run_smoke_suite(*, pretty: bool, timeout: int | None = None) -> int:
     failures = 0
     for index, (label, query) in enumerate(SMOKE_TEST_QUERIES, start=1):
@@ -1840,10 +1900,29 @@ def access_google_workspace(query: str = "") -> str:
     - Read the content of Google Doc with ID 'DOCUMENT_ID' and print the full text.
     """
     output = _run_query_action(query, runtime_data={})
+    parsed_output = _parse_json_response(output)
+
+    prefix_lines: list[str] = []
+    if isinstance(parsed_output, dict):
+        attempts = parsed_output.get("planner_attempts")
+        if attempts is not None:
+            prefix_lines.append(f"Planner attempts: {attempts}")
+
+        cli_queries = _extract_cli_queries_from_response(parsed_output)
+        if len(cli_queries) == 1:
+            prefix_lines.append(f"CLI query: {cli_queries[0]}")
+        elif len(cli_queries) > 1:
+            prefix_lines.append("CLI queries:")
+            prefix_lines.extend(f"{index}. {cli_query}" for index, cli_query in enumerate(cli_queries, start=1))
+
     try:
-        return _interpret_query_response(query, output)
+        interpreted = _interpret_query_response(query, output)
     except Exception:
-        return output
+        interpreted = output
+
+    if prefix_lines:
+        return "\n".join([*prefix_lines, "", interpreted])
+    return interpreted
 
 
 def main() -> None:
