@@ -41,6 +41,9 @@ PLANNER_REVIEWER_FILE = Path(__file__).parent / "agent_instructions/planner_revi
 # Summarize file located alongside this module
 TEXTER_FILE = Path(__file__).parent / "agent_instructions/texter.md"
 
+# Tool-specific guidance files used when a tool is explicitly forced
+TOOL_INSTRUCTIONS_DIR = Path(__file__).parent / "agent_instructions/tools"
+
 PLANNER_MANAGER_TASK_NAME = "PlannerManager"
 EXECUTION_MANAGER_TASK_NAME = "ExecutionManager"
 PLANNER_REVIEWER_TASK_NAME = "PlannerReviewer"
@@ -899,6 +902,31 @@ def _normalize_force_tool_name(raw_force_tool: object) -> str:
     return normalized if normalized else ""
 
 
+def _get_forced_tool_instructions(forced_tool_name: str) -> str:
+    normalized_tool_name = _normalize_force_tool_name(forced_tool_name)
+    if not normalized_tool_name:
+        return ""
+
+    guidance_file = TOOL_INSTRUCTIONS_DIR / f"{normalized_tool_name}.md"
+    if not guidance_file.exists():
+        return ""
+
+    try:
+        guidance_text = guidance_file.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        print(f"Error reading tool guidance file '{guidance_file}': {e}")
+        return ""
+
+    if not guidance_text:
+        return ""
+
+    return (
+        "\n\n"
+        f"Tool-specific instructions for forced tool '{normalized_tool_name}':\n"
+        f"{guidance_text}"
+    )
+
+
 def _resolve_sub_agent_model_config(agent: dict) -> tuple[str, str, str]:
     plan_thinking_level = _normalize_plan_thinking_level(agent.get("thinking_level"))
     model_name = THINKING_LEVEL_TO_MODEL.get(plan_thinking_level, MEDIUM_MODEL)
@@ -927,6 +955,10 @@ def _run_model_api(
     """
 
     forced_tool_name = _normalize_force_tool_name(force_tool) if tool_use_allowed else ""
+    effective_system_instructions = system_instructions
+    if forced_tool_name:
+        effective_system_instructions += _get_forced_tool_instructions(forced_tool_name)
+
     agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
     tool_config = None
     if forced_tool_name:
@@ -949,7 +981,7 @@ def _run_model_api(
     if history_cache is not None:
         cache_profile = create_cached_content_profile(
             model=model,
-            system_instruction=system_instructions,
+            system_instruction=effective_system_instructions,
             tools=cache_tools,
             tool_config=cache_tool_config,
         )
@@ -972,7 +1004,7 @@ def _run_model_api(
         )
     else:
         config = types.GenerateContentConfig(
-            system_instruction=system_instructions,
+            system_instruction=effective_system_instructions,
             tool_config=cache_tool_config,
             tools=cache_tools or [],
             temperature=temperature,
