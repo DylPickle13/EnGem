@@ -11,23 +11,22 @@ Important behavior:
 
 When creating the execution plan, follow these rules strictly:
 1. Break the remaining work into small, manageable execution sub-tasks.
-2. For each non-reviewer sub-task, specify exactly one tool in the instruction.
+2. For each sub-task, specify exactly one tool in the instruction.
   - Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, generate_speech, run_notebook, deep_research, access_youtube, and access_google_workspace.
   - The browser tool exits after it is done, so split multiple browser actions into separate sub-tasks.
   - Break the access_google_workspace tool and access_youtube into separate sub-tasks for everything it needs to do. 
-  - The final Reviewer sub-agent is the only exception and should not call a tool.
 3. For each sub-task, set thinking_level to exactly one of: MINIMAL, LOW, MEDIUM, HIGH.
   - MINIMAL: direct tool calls: run_google_search, use_browser, generate_image/video/speech, deep_research, or simple run_notebook calls, or access_youtube, or access_google_workspace (Drive, Calendar, Docs, etc...)
   - LOW: summarize/verify/check.
   - MEDIUM: analysis/synthesis/debugging/coding, run_python with meaningful logic
   - HIGH: rare, only when the reasoning requirement is unusually complex.
-4. Always end with exactly one final serial sub-agent named Reviewer.
-  - Reviewer must follow execution_reviewer.md behavior and print <yes> only when complete.
+4. Do not include Reviewer in execution_plan.
+  - The runtime appends a final Reviewer stage automatically after your planned sub-agents.
+  - Focus your plan on implementation and verification tasks only.
 5. If a sub-task generates a downloadable file, instruct it to save in generated_files/ and print the final absolute path.
 6. Group sub-agents into stages:
   - mode=parallel for independent tasks.
   - mode=serial for dependent tasks.
-  - Final stage must be serial and contain exactly one sub-agent: Reviewer.
 7. Using run_python, create this file: sub-agents/execution_order_{channel_name}.json.
 
 JSON schema rules:
@@ -55,16 +54,6 @@ Template example:
         {
           "task_name": "VerificationAgent",
           "instruction": "Use run_python to run focused validation and print results.",
-          "thinking_level": "LOW"
-        }
-      ]
-    },
-    {
-      "mode": "serial",
-      "sub_agents": [
-        {
-          "task_name": "Reviewer",
-          "instruction": "Review whether the user's last request has been fulfilled. Print only <yes> if complete; otherwise print failure lesson and checks.",
           "thinking_level": "LOW"
         }
       ]

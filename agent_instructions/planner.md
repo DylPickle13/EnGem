@@ -14,25 +14,22 @@ If this prompt includes "Available reusable planning skill file paths", you are 
 
 When creating the planning plan, follow these rules strictly:
 1. Break planning into small, manageable sub-tasks. Keep each sub-task simple so it only uses one tool/function.
-2. For each non-reviewer sub-task, specify exactly one tool in the instruction.
+2. For each sub-task, specify exactly one tool in the instruction.
   - Available tools: run_python, run_google_search, use_browser, generate_image, generate_video, generate_speech, run_notebook, deep_research, access_youtube, and access_google_workspace.
   - The browser tool exits after it is done, so if you need multiple browser actions, create separate sub-tasks.
   - Break the access_google_workspace tool and access_youtube into separate sub-tasks for everything they need to do.
-  - The final PlannerReviewer sub-agent is the only exception and should not call a tool.
 3. For each sub-task, set thinking_level to exactly one of: MINIMAL, LOW, MEDIUM, HIGH.
   - MINIMAL: direct tool calls: run_google_search, use_browser, generate_image/video/speech, access_google_workspace (Drive, Calendar, Docs, etc...), deep_research, or simple run_notebook calls, or access_youtube.
   - LOW: summarize/verify/check.
   - MEDIUM: analysis/synthesis/debugging/coding, or run_python with meaningful logic.
   - HIGH: rare, only for the most complex reasoning.
-4. Always end the planner plan with exactly one final serial sub-agent named PlannerReviewer.
-  - PlannerReviewer must decide if planning is complete.
-  - PlannerReviewer should return only <ready> when enough information has been gathered to proceed to execution planning.
-  - Otherwise PlannerReviewer should print concise missing-information checks.
+4. Do not include PlannerReviewer in planner_plan.
+  - The runtime appends a final PlannerReviewer stage automatically after your planned sub-agents.
+  - Focus your plan on discovery, validation, and prerequisite information gathering only.
 5. If a planning sub-task creates a downloadable file, explicitly instruct it to save in generated_files/ and print the final absolute path.
 6. Group sub-agents into stages:
   - mode=parallel for independent tasks.
   - mode=serial for dependencies.
-  - Final stage must be serial and contain exactly one sub-agent: PlannerReviewer.
 7. Using run_python, create this file: sub-agents/planner_order_{channel_name}.json.
 
 JSON schema rules:
@@ -60,16 +57,6 @@ Template example:
         {
           "task_name": "SkillRetriever",
           "instruction": "Use run_python to retrieve and print the content of any relevant skills.",
-          "thinking_level": "LOW"
-        }
-      ]
-    },
-    {
-      "mode": "serial",
-      "sub_agents": [
-        {
-          "task_name": "PlannerReviewer",
-          "instruction": "Review whether planning has enough information. Print only <ready> if complete; otherwise print missing checks.",
           "thinking_level": "LOW"
         }
       ]

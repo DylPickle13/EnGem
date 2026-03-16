@@ -45,6 +45,8 @@ PLANNER_MANAGER_TASK_NAME = "PlannerManager"
 EXECUTION_MANAGER_TASK_NAME = "ExecutionManager"
 PLANNER_REVIEWER_TASK_NAME = "PlannerReviewer"
 REVIEWER_TASK_NAME = "Reviewer"
+PLANNER_REVIEWER_STAGE_INSTRUCTION = "Review whether planning has enough information. Print only <ready> if complete; otherwise print missing checks."
+REVIEWER_STAGE_INSTRUCTION = "Review whether the user's latest request is complete. Print only <yes> if complete; otherwise print what is missing."
 THINKING_LEVEL_TO_MODEL = {
     "MINIMAL": MINIMAL_MODEL,
     "LOW": LOW_MODEL,
@@ -296,10 +298,12 @@ def generate_response(
                 print("No valid planner plan found in planner order file.")
                 _advance_attempt(PLANNER_MANAGER_TASK_NAME, summarize_history=False)
                 continue
-            if not _has_final_named_agent(planner_plan, PLANNER_REVIEWER_TASK_NAME):
-                print("Planner plan is missing a final serial PlannerReviewer agent.")
-                _advance_attempt(PLANNER_MANAGER_TASK_NAME, summarize_history=False)
-                continue
+
+            planner_plan = _ensure_final_named_agent(
+                planner_plan,
+                PLANNER_REVIEWER_TASK_NAME,
+                PLANNER_REVIEWER_STAGE_INSTRUCTION,
+            )
 
             _dispatch_execution_plan_preview_async(
                 planner_plan,
@@ -406,14 +410,12 @@ def generate_response(
                 summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
             )
             continue
-        if not _has_final_reviewer_agent(execution_plan):
-            print("Execution plan is missing a final serial Reviewer agent.")
-            _advance_attempt(
-                EXECUTION_MANAGER_TASK_NAME,
-                summarize_after_latest_role=PLANNER_REVIEWER_TASK_NAME,
-                summarize_history=False,
-            )
-            continue
+
+        execution_plan = _ensure_final_named_agent(
+            execution_plan,
+            REVIEWER_TASK_NAME,
+            REVIEWER_STAGE_INSTRUCTION,
+        )
 
         _dispatch_execution_plan_preview_async(
             execution_plan,
@@ -639,6 +641,46 @@ def _has_final_named_agent(execution_plan: list[dict], task_name: str) -> bool:
 
 def _has_final_reviewer_agent(execution_plan: list[dict]) -> bool:
     return _has_final_named_agent(execution_plan, REVIEWER_TASK_NAME)
+
+
+def _ensure_final_named_agent(execution_plan: list[dict], task_name: str, instruction: str) -> list[dict]:
+    if not execution_plan:
+        return execution_plan
+
+    plan_without_named_agent: list[dict] = []
+    for stage in execution_plan:
+        sub_agents = stage.get("sub_agents")
+        if not isinstance(sub_agents, list):
+            continue
+
+        filtered_sub_agents = [
+            agent
+            for agent in sub_agents
+            if isinstance(agent, dict) and agent.get("task_name") != task_name
+        ]
+        if not filtered_sub_agents:
+            continue
+
+        plan_without_named_agent.append(
+            {
+                "mode": stage.get("mode"),
+                "sub_agents": filtered_sub_agents,
+            }
+        )
+
+    plan_without_named_agent.append(
+        {
+            "mode": "serial",
+            "sub_agents": [
+                {
+                    "task_name": task_name,
+                    "instruction": instruction,
+                    "thinking_level": "LOW",
+                }
+            ],
+        }
+    )
+    return plan_without_named_agent
 
 
 def _get_latest_history_message_by_role(history_text: str | None, role: str) -> str:
