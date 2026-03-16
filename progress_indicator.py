@@ -72,10 +72,12 @@ def build_execution_plan_ascii_diagram(
             task_name = str(agent.get("task_name", "unnamed_task"))
             instruction = str(agent.get("instruction", ""))
             plan_thinking_level = normalize_plan_thinking_level(agent.get("thinking_level"))
+            force_tool = str(agent.get("force_tool", "")).strip() or "none"
             preview = truncate_instruction_preview(instruction)
             lines.append(f"|   |-- Agent {agent_index}: {task_name}")
             lines.append(f"|   |   instruction: {preview}")
             lines.append(f"|   |   thinking_level: {plan_thinking_level}")
+            lines.append(f"|   |   force_tool: {force_tool}")
 
     return "\n".join(lines)
 

@@ -146,7 +146,7 @@ def generate_response(
                 system_instructions=intent_system_instructions,
                 model=LOW_MODEL,
                 tool_use_allowed=False,
-                force_tool=False,
+                force_tool="",
                 temperature=default_temperature,
                 thinking_level="low",
                 history_cache=active_history_cache,
@@ -267,7 +267,7 @@ def generate_response(
                     system_instructions=planner_system_instructions,
                     model=MEDIUM_MODEL,
                     tool_use_allowed=True,
-                    force_tool=True,
+                    force_tool="run_python",
                     temperature=temperature,
                     thinking_level="high",
                     history_cache=active_history_cache,
@@ -370,7 +370,7 @@ def generate_response(
                 system_instructions=execution_manager_system_instructions,
                 model=MEDIUM_MODEL,
                 tool_use_allowed=True,
-                force_tool=True,
+                force_tool="run_python",
                 temperature=temperature,
                 thinking_level="high",
                 history_cache=active_history_cache,
@@ -481,7 +481,7 @@ def generate_response(
                 system_instructions=TEXTER_FILE.read_text(encoding="utf-8"),
                 model=LOW_MODEL,
                 tool_use_allowed=False,
-                force_tool=False,
+                force_tool="",
                 temperature=default_temperature,
                 thinking_level="low",
                 history_cache=post_review_cache,
@@ -562,6 +562,7 @@ def _normalize_execution_plan(execution_order_dict: dict, plan_key: str = "execu
     - {"<plan_key>": [{"mode": "parallel|serial", "sub_agents": [...]}, ...]}
     - Each stage must explicitly include "mode" as "parallel" or "serial".
     - Each sub-agent should include "thinking_level" (MINIMAL/LOW/MEDIUM/HIGH).
+    - Each sub-agent should include "force_tool" as a string tool name; empty string means not forced.
     - Missing or invalid thinking levels are normalized to MEDIUM for backward compatibility.
     """
     normalized_plan: list[dict] = []
@@ -594,11 +595,13 @@ def _normalize_execution_plan(execution_order_dict: dict, plan_key: str = "execu
                 if not isinstance(task_name, str) or not isinstance(instruction, str):
                     continue
                 thinking_level = _normalize_plan_thinking_level(agent.get("thinking_level"))
+                force_tool = _normalize_force_tool_name(agent.get("force_tool", ""))
                 cleaned_agents.append(
                     {
                         "task_name": task_name,
                         "instruction": instruction,
                         "thinking_level": thinking_level,
+                        "force_tool": force_tool,
                     }
                 )
 
@@ -676,6 +679,7 @@ def _ensure_final_named_agent(execution_plan: list[dict], task_name: str, instru
                     "task_name": task_name,
                     "instruction": instruction,
                     "thinking_level": "LOW",
+                    "force_tool": "",
                 }
             ],
         }
@@ -761,13 +765,13 @@ def _run_sub_agent_plan(
             base_history = current_history_text
 
             def _run_parallel_agent(agent: dict[str, Any], stage_history: str) -> str:
-                model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
+                model_name, api_thinking_level, force_tool_name = _resolve_sub_agent_model_config(agent)
                 return _run_model_api(
                     text=agent["instruction"],
                     system_instructions=sub_agent_system_instructions,
                     model=model_name,
                     tool_use_allowed=True,
-                    force_tool=False,
+                    force_tool=force_tool_name,
                     temperature=temperature,
                     thinking_level=api_thinking_level,
                     history_cache=history_cache,
@@ -798,13 +802,13 @@ def _run_sub_agent_plan(
                         sub_agent_response = final_agent_runner(current_history_text)
                         final_agent_output = sub_agent_response
                     else:
-                        model_name, api_thinking_level = _resolve_sub_agent_model_config(agent)
+                        model_name, api_thinking_level, force_tool_name = _resolve_sub_agent_model_config(agent)
                         sub_agent_response = _run_model_api(
                             text=agent["instruction"],
                             system_instructions=sub_agent_system_instructions,
                             model=model_name,
                             tool_use_allowed=True,
-                            force_tool=False,
+                            force_tool=force_tool_name,
                             temperature=temperature,
                             thinking_level=api_thinking_level,
                             history_cache=history_cache,
@@ -831,7 +835,7 @@ def _run_planner_reviewer(
             system_instructions=PLANNER_REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
             model=LOW_MODEL,
             tool_use_allowed=False,
-            force_tool=False,
+            force_tool="",
             temperature=temperature,
             thinking_level="low",
             history_cache=history_cache,
@@ -843,7 +847,7 @@ def _run_planner_reviewer(
         system_instructions=PLANNER_REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
         model=LOW_MODEL,
         tool_use_allowed=False,
-        force_tool=False,
+        force_tool="",
         temperature=temperature,
         thinking_level="low",
     )
@@ -862,7 +866,7 @@ def _run_final_reviewer(
             system_instructions=REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
             model=LOW_MODEL,
             tool_use_allowed=False,
-            force_tool=False,
+            force_tool="",
             temperature=temperature,
             thinking_level="low",
             history_cache=history_cache,
@@ -874,7 +878,7 @@ def _run_final_reviewer(
         system_instructions=REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
         model=LOW_MODEL,
         tool_use_allowed=False,
-        force_tool=False,
+        force_tool="",
         temperature=temperature,
         thinking_level="low",
     )
@@ -888,11 +892,19 @@ def _normalize_api_thinking_level(raw_level: object) -> str:
     return "high"
 
 
-def _resolve_sub_agent_model_config(agent: dict) -> tuple[str, str]:
+def _normalize_force_tool_name(raw_force_tool: object) -> str:
+    if not isinstance(raw_force_tool, str):
+        return ""
+    normalized = raw_force_tool.strip()
+    return normalized if normalized else ""
+
+
+def _resolve_sub_agent_model_config(agent: dict) -> tuple[str, str, str]:
     plan_thinking_level = _normalize_plan_thinking_level(agent.get("thinking_level"))
     model_name = THINKING_LEVEL_TO_MODEL.get(plan_thinking_level, MEDIUM_MODEL)
     api_thinking_level = THINKING_LEVEL_TO_API_LEVEL.get(plan_thinking_level, "medium")
-    return model_name, api_thinking_level
+    force_tool = _normalize_force_tool_name(agent.get("force_tool"))
+    return model_name, api_thinking_level, force_tool
 
 
 def _run_model_api(
@@ -900,7 +912,7 @@ def _run_model_api(
     system_instructions: str,
     model: str,
     tool_use_allowed: bool = True,
-    force_tool: bool = False,
+    force_tool: str = "",
     temperature: float = 1,
     thinking_level: str = "high",
     history_cache: HistoryContextCache | None = None,
@@ -914,14 +926,17 @@ def _run_model_api(
     temperature: the temperature to use for this generation (default: 1)
     """
 
+    forced_tool_name = _normalize_force_tool_name(force_tool) if tool_use_allowed else ""
     agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
-    tool_config = types.ToolConfig(
-        function_calling_config=types.FunctionCallingConfig(
-            mode="ANY", allowed_function_names=["run_python"]
+    tool_config = None
+    if forced_tool_name:
+        tool_config = types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(
+                mode="ANY", allowed_function_names=[forced_tool_name]
+            )
         )
-    )
     cache_tools = [agent_tools] if tool_use_allowed else None
-    cache_tool_config = tool_config if force_tool else None
+    cache_tool_config = tool_config if forced_tool_name else None
 
     if model == MINIMAL_MODEL and "2.5" in MINIMAL_MODEL:
         thinking_config = types.ThinkingConfig(thinking_budget=24576)
@@ -951,7 +966,7 @@ def _run_model_api(
     if cached_content_name:
         config = types.GenerateContentConfig(
             temperature=temperature,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=force_tool),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=bool(forced_tool_name)),
             thinking_config=thinking_config,
             cached_content=cached_content_name,
         )
@@ -961,7 +976,7 @@ def _run_model_api(
             tool_config=cache_tool_config,
             tools=cache_tools or [],
             temperature=temperature,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=force_tool),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=bool(forced_tool_name)),
             thinking_config=thinking_config,
             cached_content=None,
         )

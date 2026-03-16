@@ -23,14 +23,17 @@ When creating the planning plan, follow these rules strictly:
   - LOW: summarize/verify/check.
   - MEDIUM: analysis/synthesis/debugging/coding, or run_python with meaningful logic.
   - HIGH: rare, only for the most complex reasoning.
-4. Do not include PlannerReviewer in planner_plan.
+4. For each sub-task, set force_tool as a string.
+  - Use the exact tool name to force that tool (for example, run_python).
+  - Use an empty string "" when tool forcing is not required.
+5. Do not include PlannerReviewer in planner_plan.
   - The runtime appends a final PlannerReviewer stage automatically after your planned sub-agents.
   - Focus your plan on discovery, validation, and prerequisite information gathering only.
-5. If a planning sub-task creates a downloadable file, explicitly instruct it to save in generated_files/ and print the final absolute path.
-6. Group sub-agents into stages:
+6. If a planning sub-task creates a downloadable file, explicitly instruct it to save in generated_files/ and print the final absolute path.
+7. Group sub-agents into stages:
   - mode=parallel for independent tasks.
   - mode=serial for dependencies.
-7. Using run_python, create this file: sub-agents/planner_order_{channel_name}.json.
+8. Using run_python, create this file: sub-agents/planner_order_{channel_name}.json.
 
 JSON schema rules:
 - Top-level key must be exactly: planner_plan
@@ -42,6 +45,7 @@ JSON schema rules:
   - task_name
   - instruction
   - thinking_level
+  - force_tool
 
 Template example:
 {
@@ -52,12 +56,14 @@ Template example:
         {
           "task_name": "SourceDiscovery",
           "instruction": "Use run_google_search to find candidate sources and print concise findings.",
-          "thinking_level": "MINIMAL"
+          "thinking_level": "MINIMAL",
+          "force_tool": "run_google_search"
         },
         {
           "task_name": "SkillRetriever",
           "instruction": "Use run_python to retrieve and print the content of any relevant skills.",
-          "thinking_level": "LOW"
+          "thinking_level": "LOW",
+          "force_tool": "run_python"
         }
       ]
     }

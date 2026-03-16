@@ -309,7 +309,7 @@ def run_history_summarization(
                 system_instructions=HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
                 model=MINIMAL_MODEL,
                 tool_use_allowed=False,
-                force_tool=False,
+                force_tool="",
                 temperature=temperature,
                 thinking_level="low",
                 history_cache=history_cache,
@@ -332,7 +332,7 @@ def run_history_summarization(
                 HISTORY_SUMMARIZER_SYSTEM.read_text(encoding="utf-8"),
                 MINIMAL_MODEL,
                 tool_use_allowed=False,
-                force_tool=False,
+                force_tool="",
                 temperature=temperature,
                 thinking_level="low",
             )

@@ -1580,7 +1580,7 @@ def _plan_query_payload(
         system_instructions=_load_planner_system_instructions(),
         model=model_name,
         tool_use_allowed=False,
-        force_tool=False,
+        force_tool="",
         temperature=0.2,
         thinking_level=thinking_level,
     )
@@ -1797,7 +1797,7 @@ def _interpret_query_response(query: str, raw_response: str) -> str:
         system_instructions=system_instructions,
         model=MINIMAL_MODEL,
         tool_use_allowed=False,
-        force_tool=False,
+        force_tool="",
         temperature=0.2,
         thinking_level="low",
     )

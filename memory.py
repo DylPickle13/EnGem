@@ -829,7 +829,7 @@ def run_skill_extraction_async(
                     system_instructions=SKILL_EXTRACTOR_FILE.read_text(encoding="utf-8"),
                     model=MINIMAL_MODEL,
                     tool_use_allowed=False,
-                    force_tool=False,
+                    force_tool="",
                     temperature=temperature,
                     thinking_level="low",
                     history_cache=history_cache,
@@ -847,7 +847,7 @@ def run_skill_extraction_async(
                     system_instructions=SKILL_EXTRACTOR_FILE.read_text(encoding="utf-8"),
                     model=MINIMAL_MODEL,
                     tool_use_allowed=False,
-                    force_tool=False,
+                    force_tool="",
                     temperature=temperature,
                     thinking_level="low",
                 )
@@ -1026,7 +1026,7 @@ def run_memory_extraction_async(
                     system_instructions=MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
                     model=MINIMAL_MODEL,
                     tool_use_allowed=False,
-                    force_tool=False,
+                    force_tool="",
                     temperature=temperature,
                     thinking_level="low",
                     history_cache=history_cache,
@@ -1044,7 +1044,7 @@ def run_memory_extraction_async(
                     system_instructions=MEMORY_EXTRACTOR_FILE.read_text(encoding="utf-8"),
                     model=MINIMAL_MODEL,
                     tool_use_allowed=False,
-                    force_tool=False,
+                    force_tool="",
                     temperature=temperature,
                     thinking_level="low",
                 )
@@ -1249,7 +1249,7 @@ def _select_related_memory_ids(topic: str, candidates: list[MemoryItem]) -> set[
         system_instructions=MEMORY_RELATED.read_text(encoding="utf-8"),
         model=MINIMAL_MODEL,
         tool_use_allowed=False,
-        force_tool=False,
+        force_tool="",
         temperature=0,
         thinking_level="low",
     )
@@ -1282,7 +1282,7 @@ def _select_related_memory_ids(topic: str, candidates: list[MemoryItem]) -> set[
                 system_instructions=retry_system,
                 model=MINIMAL_MODEL,
                 tool_use_allowed=False,
-                force_tool=False,
+                force_tool="",
                 temperature=0,
                 thinking_level="low",
             )

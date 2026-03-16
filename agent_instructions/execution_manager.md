@@ -20,14 +20,17 @@ When creating the execution plan, follow these rules strictly:
   - LOW: summarize/verify/check.
   - MEDIUM: analysis/synthesis/debugging/coding, run_python with meaningful logic
   - HIGH: rare, only when the reasoning requirement is unusually complex.
-4. Do not include Reviewer in execution_plan.
+4. For each sub-task, set force_tool as a string.
+  - Use the exact tool name to force that tool (for example, run_python).
+  - Use an empty string "" when tool forcing is not required.
+5. Do not include Reviewer in execution_plan.
   - The runtime appends a final Reviewer stage automatically after your planned sub-agents.
   - Focus your plan on implementation and verification tasks only.
-5. If a sub-task generates a downloadable file, instruct it to save in generated_files/ and print the final absolute path.
-6. Group sub-agents into stages:
+6. If a sub-task generates a downloadable file, instruct it to save in generated_files/ and print the final absolute path.
+7. Group sub-agents into stages:
   - mode=parallel for independent tasks.
   - mode=serial for dependent tasks.
-7. Using run_python, create this file: sub-agents/execution_order_{channel_name}.json.
+8. Using run_python, create this file: sub-agents/execution_order_{channel_name}.json.
 
 JSON schema rules:
 - Top-level key must be exactly: execution_plan
@@ -39,6 +42,7 @@ JSON schema rules:
   - task_name
   - instruction
   - thinking_level
+  - force_tool
 
 Template example:
 {
@@ -49,12 +53,14 @@ Template example:
         {
           "task_name": "ImplementationAgent",
           "instruction": "Use run_python to implement the required changes and print what was updated.",
-          "thinking_level": "MEDIUM"
+          "thinking_level": "MEDIUM",
+          "force_tool": "run_python"
         },
         {
           "task_name": "VerificationAgent",
           "instruction": "Use run_python to run focused validation and print results.",
-          "thinking_level": "LOW"
+          "thinking_level": "LOW",
+          "force_tool": "run_python"
         }
       ]
     }

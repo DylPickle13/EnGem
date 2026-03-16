@@ -220,7 +220,7 @@ def _plan_query_payload(query: str, *, feedback: list[dict[str, Any]] | None = N
         system_instructions=system_instructions,
         model=MINIMAL_MODEL,
         tool_use_allowed=False,
-        force_tool=False,
+        force_tool="",
         temperature=0.2,
         thinking_level="low",
     )
@@ -364,7 +364,7 @@ def _interpret_query_response(query: str, raw_response: str) -> str:
         system_instructions=system_instructions,
         model=MINIMAL_MODEL,
         tool_use_allowed=False,
-        force_tool=False,
+        force_tool="",
         temperature=0.2,
         thinking_level="low",
     )
