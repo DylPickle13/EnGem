@@ -23,7 +23,6 @@ _DEFAULT_ASPECT_RATIO = "16:9"
 _ALLOWED_ASPECT_RATIOS = {"16:9", "9:16"}
 _ALLOWED_RESOLUTIONS = {"720p", "1080p", "4k"}
 _ALLOWED_DURATIONS = {4, 6, 8}
-_ALLOWED_PERSON_GENERATION = {"allow_all", "allow_adult", "dont_allow"}
 _ALLOWED_REFERENCE_TYPES = {"asset": "ASSET", "style": "STYLE"}
 
 
@@ -144,32 +143,9 @@ def _video_from_spec(video_spec: object) -> types.Video | None:
   if video_uri:
     return types.Video(uri=video_uri)
 
-  video_b64 = video_spec.get("video_base64")
-  if isinstance(video_b64, str) and video_b64.strip():
-    try:
-      video_bytes = base64.b64decode(video_b64)
-      mime_type = _normalize_value(video_spec.get("mime_type")) or "video/mp4"
-      return types.Video(video_bytes=video_bytes, mime_type=mime_type)
-    except Exception:
-      return None
-
-  video_path = _normalize_value(video_spec.get("path"))
-  if not video_path:
-    return None
-
-  video_file = Path(video_path).expanduser()
-  if not video_file.is_absolute():
-    video_file = (_REPO_ROOT / video_file).resolve()
-  if not video_file.exists() or not video_file.is_file():
-    return None
-
-  try:
-    video_bytes = video_file.read_bytes()
-  except Exception:
-    return None
-
-  mime_type = _normalize_value(video_spec.get("mime_type")) or _guess_mime_type(str(video_file), "video/mp4")
-  return types.Video(video_bytes=video_bytes, mime_type=mime_type)
+  # SDK currently rejects encodedVideo for Gemini API video generation in this setup.
+  # To avoid INVALID_ARGUMENT errors, only URI-based extension inputs are allowed.
+  return None
 
 
 def _build_video_request(raw_prompt: str) -> dict:
@@ -209,20 +185,8 @@ def _build_video_request(raw_prompt: str) -> dict:
     config_kwargs["duration_seconds"] = duration_seconds
 
   number_of_videos = _coerce_int(request_payload.get("number_of_videos"))
-  if isinstance(number_of_videos, int) and number_of_videos > 0:
-    config_kwargs["number_of_videos"] = number_of_videos
-
-  fps = _coerce_int(request_payload.get("fps"))
-  if isinstance(fps, int) and fps > 0:
-    config_kwargs["fps"] = fps
-
-  seed = _coerce_int(request_payload.get("seed"))
-  if isinstance(seed, int):
-    config_kwargs["seed"] = seed
-
-  person_generation = _normalize_value(request_payload.get("person_generation")).lower()
-  if person_generation in _ALLOWED_PERSON_GENERATION:
-    config_kwargs["person_generation"] = person_generation
+  if number_of_videos == 1:
+    config_kwargs["number_of_videos"] = 1
 
   negative_prompt = _normalize_value(request_payload.get("negative_prompt"))
   if negative_prompt:
@@ -231,10 +195,6 @@ def _build_video_request(raw_prompt: str) -> dict:
   enhance_prompt = _coerce_bool(request_payload.get("enhance_prompt"))
   if isinstance(enhance_prompt, bool):
     config_kwargs["enhance_prompt"] = enhance_prompt
-
-  generate_audio = _coerce_bool(request_payload.get("generate_audio"))
-  if isinstance(generate_audio, bool):
-    config_kwargs["generate_audio"] = generate_audio
 
   last_frame = _image_from_spec(request_payload.get("last_frame"))
   if last_frame is not None:
@@ -265,6 +225,25 @@ def _build_video_request(raw_prompt: str) -> dict:
   first_image = _image_from_spec(request_payload.get("first_image") or request_payload.get("image"))
   input_video = _video_from_spec(request_payload.get("video"))
 
+  # Enforce Veo request constraints to avoid invalid parameter combinations.
+  if input_video is not None:
+    # Extension requests support 720p only.
+    config_kwargs["resolution"] = "720p"
+    # Image and video inputs are different generation modes; prefer extension input.
+    first_image = None
+
+  if "reference_images" in config_kwargs or input_video is not None:
+    # Reference-image generation and extension require 8 seconds.
+    config_kwargs["duration_seconds"] = 8
+
+  if config_kwargs.get("resolution") in {"1080p", "4k"}:
+    # 1080p and 4k are supported for 8-second generations only.
+    config_kwargs["duration_seconds"] = 8
+
+  if first_image is None:
+    # last_frame is only valid when using an initial image input.
+    config_kwargs.pop("last_frame", None)
+
   return {
     "model": model_name,
     "prompt": prompt_text,
@@ -285,8 +264,8 @@ def generate_video(prompt: str) -> str:
   Advanced mode:
   - Input can be a JSON object encoded as a string with fields such as:
     prompt, model, aspect_ratio, resolution, duration_seconds, number_of_videos,
-    fps, seed, person_generation, negative_prompt, enhance_prompt,
-    generate_audio, first_image/image, last_frame, reference_images, and video.
+    negative_prompt, enhance_prompt,
+    first_image/image, last_frame, reference_images, and video.
 
   Returns an absolute video path on success, or an `error: ...` message on failure.
   """

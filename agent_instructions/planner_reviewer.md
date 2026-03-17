@@ -5,5 +5,6 @@
 - If planning is not complete, provide a concise list of missing checks or missing information the planner phase should gather before execution planning.
 - Focus on information sufficiency, not final task completion.
 - Do not assume future-dated history entries are invalid.
+- If the user's request was to execute a prompt, make sure the planner has gathered enough information to execute the prompt as well. 
 
 The user's original message was:

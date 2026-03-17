@@ -16,12 +16,8 @@ Required JSON shape:
 	"resolution": "720p",
 	"duration_seconds": 8,
 	"number_of_videos": 1,
-	"fps": 24,
-	"seed": 123,
-	"person_generation": "allow_all",
 	"negative_prompt": "undesired elements",
 	"enhance_prompt": true,
-	"generate_audio": true,
 	"first_image": {
 		"path": "generated_files/frame_start.png"
 	},
@@ -39,7 +35,7 @@ Required JSON shape:
 		}
 	],
 	"video": {
-		"path": "generated_files/previous_video.mp4"
+		"uri": "<video-uri-from-previous-generation>"
 	}
 }
 
@@ -47,10 +43,16 @@ Supported values and limits:
 - aspect_ratio: 16:9 or 9:16.
 - resolution: 720p, 1080p, or 4k.
 - duration_seconds: 4, 6, or 8.
-- person_generation: allow_all, allow_adult, dont_allow.
+- duration_seconds must be 8 when using reference_images, video extension, 1080p, or 4k.
+- number_of_videos: 1.
+- person_generation is currently not supported in this environment; omit it.
 - reference_images: up to 3 images.
 - reference_type: asset or style.
 - first_image and last_frame can be local file path, gcs uri, or base64 image payload.
+- video extension input should use uri only in this environment (local path/base64 video maps to encodedVideo and can fail).
+- fps is not a request parameter for Veo 3.1 (output is fixed at 24fps).
+- for extension requests with video input, use resolution 720p.
+- do not combine video with first_image/image; these are different generation modes.
 
 When to include image/video controls:
 - Use first_image (or image) for image-to-video start frame.

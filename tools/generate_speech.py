@@ -258,12 +258,15 @@ def _extract_audio_bytes(response: object) -> bytes:
 	return b""
 
 
-def _write_wave_file(output_path: Path, pcm_data: bytes, sample_rate_hz: int = 24000) -> None:
+def _write_wave_file(output_path: Path, pcm_data: bytes, sample_rate_hz: int = 24000) -> float:
 	with wave.open(str(output_path), "wb") as wf:
 		wf.setnchannels(1)
 		wf.setsampwidth(2)  # 16-bit PCM
 		wf.setframerate(sample_rate_hz)
 		wf.writeframes(pcm_data)
+
+	sample_count = len(pcm_data) // 2
+	return sample_count / float(sample_rate_hz)
 
 
 def generate_speech(
@@ -320,17 +323,18 @@ def generate_speech(
 
 	try:
 		sample_rate_hz = _coerce_int(request.get("sample_rate_hz")) or _DEFAULT_SAMPLE_RATE_HZ
-		_write_wave_file(out_path, audio_bytes, sample_rate_hz=sample_rate_hz)
+		duration_sec = _write_wave_file(out_path, audio_bytes, sample_rate_hz=sample_rate_hz)
 		out_path_str = str(out_path)
+		duration_line = f"DURATION_SEC:{duration_sec:.6f}"
 
 		original_payload = request.get("request_payload") if isinstance(request, dict) else None
 		if isinstance(original_payload, dict) and original_payload:
 			try:
 				json_input = json.dumps(original_payload, ensure_ascii=False)
-				return f"{out_path_str}\n\nJSON_INPUT:{json_input}"
+				return f"{out_path_str}\n{duration_line}\n\nJSON_INPUT:{json_input}"
 			except Exception:
-				return out_path_str
+				return f"{out_path_str}\n{duration_line}"
 
-		return out_path_str
+		return f"{out_path_str}\n{duration_line}"
 	except Exception as exc:
 		return f"error: failed writing wav file: {exc}"
