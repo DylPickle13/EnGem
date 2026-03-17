@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -32,8 +33,18 @@ logger = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
 SMOKE_TEST_QUERIES: list[tuple[str, str]] = [
-    ("search", "Find 3 recent videos about Python automation."),
-    ("video details", "Get details for video id dQw4w9WgXcQ."),
+    (
+        "search via api",
+        "Call search.list with params part=snippet, q='Python automation', type=video, maxResults=3.",
+    ),
+    (
+        "video details via api",
+        "Call videos.list with params part=snippet,contentDetails,statistics and id=dQw4w9WgXcQ.",
+    ),
+    (
+        "my channels via api",
+        "Call channels.list with params part=snippet,contentDetails,statistics, mine=true, maxResults=10.",
+    ),
 ]
 
 
@@ -76,61 +87,27 @@ def _build_service(client_secrets_file: Optional[str] = None, credentials_file: 
     return build("youtube", "v3", credentials=creds)
 
 
-def _search_videos(service, query: str, max_results: int = 5, order: str = "relevance", published_after: Optional[str] = None) -> List[Dict[str, Any]]:
-    params = {
-        "part": "snippet",
-        "q": query,
-        "type": "video",
-        "order": order,
-        "maxResults": max_results,
-    }
-    if published_after:
-        params["publishedAfter"] = published_after
-    resp = service.search().list(**params).execute()
-    items: List[Dict[str, Any]] = []
-    for it in resp.get("items", []):
-        vid = it.get("id", {}).get("videoId")
-        snip = it.get("snippet", {})
-        items.append(
-            {
-                "videoId": vid,
-                "title": snip.get("title"),
-                "description": snip.get("description"),
-                "channelTitle": snip.get("channelTitle"),
-                "publishedAt": snip.get("publishedAt"),
-            }
-        )
-    return items
-
-
-def _get_video_details(service, video_id: str) -> Dict[str, Any]:
-    resp = service.videos().list(part="snippet,contentDetails,statistics", id=video_id).execute()
-    items = resp.get("items", [])
-    return items[0] if items else {}
-
-
-def _upload_video(service, file_path: str, title: str, description: str = "", tags: Optional[List[str]] = None, categoryId: str = "22", privacyStatus: str = "private") -> Dict[str, Any]:
-    if not hasattr(service, "videos"):
-        raise ValueError("Uploads require an authenticated `service` built with OAuth2 credentials (client_secrets_file).")
-    body = {
-        "snippet": {"title": title, "description": description, "tags": tags or [], "categoryId": categoryId},
-        "status": {"privacyStatus": privacyStatus},
-    }
-    media = MediaFileUpload(file_path, chunksize=256 * 1024, resumable=True)
-    request = service.videos().insert(part="snippet,status", body=body, media_body=media)
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-        if status:
-            logger.info("Upload progress: %s%%", int(status.progress() * 100))
-    return response
+def _coerce_max_results(value: Any, default: int = 5, minimum: int = 1, maximum: int = 50) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(parsed, maximum))
 
 
 # --- Plain-text query helpers ------------------------------------
 
 
 def _json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    def _json_default(obj: Any):
+        if isinstance(obj, bytes):
+            return {
+                "type": "bytes_base64",
+                "value": base64.b64encode(obj).decode("ascii"),
+            }
+        return str(obj)
+
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=_json_default)
 
 
 def _parse_json_response(text: str) -> Any:
@@ -200,12 +177,14 @@ def _plan_query_payload(query: str, *, feedback: list[dict[str, Any]] | None = N
 
     system_instructions = (
         "You are a YouTube API planner. Given a user request, return a single JSON object describing the action to take. "
-        "Allowed actions: 'search' (returns matching videos), 'get' (return details for a video id), 'upload' (upload a local file). "
-        "Return only one JSON object using these fields: action, query, max_results, video_id, file, title, description, tags, privacyStatus. "
+        "Allowed actions: 'api' only. "
+        "Return only one JSON object using these fields: action, "
+        "resource, method, params, body, media_file, media_mime, page_all, max_pages. "
         "The JSON object MUST be the first and only JSON object in your response. Examples:\n"
-        "{\"action\":\"search\",\"query\":\"funny cats\",\"max_results\":5}\n"
-        "{\"action\":\"get\",\"video_id\":\"VIDEO_ID\"}\n"
-        "{\"action\":\"upload\",\"file\":\"/path/to/file.mp4\",\"title\":\"Title\"}\n"
+        "{\"action\":\"api\",\"resource\":\"search\",\"method\":\"list\",\"params\":{\"part\":\"snippet\",\"q\":\"funny cats\",\"type\":\"video\",\"maxResults\":5}}\n"
+        "{\"action\":\"api\",\"resource\":\"channels\",\"method\":\"list\",\"params\":{\"part\":\"snippet,contentDetails,statistics\",\"mine\":true,\"maxResults\":10}}\n"
+        "{\"action\":\"api\",\"resource\":\"playlists\",\"method\":\"list\",\"params\":{\"part\":\"snippet,contentDetails\",\"mine\":true,\"maxResults\":10}}\n"
+        "Map every request to the correct YouTube Data API resource and method."
     )
 
     prompt_parts = [f"User request:\n{query}"]
@@ -229,64 +208,44 @@ def _plan_query_payload(query: str, *, feedback: list[dict[str, Any]] | None = N
 
 def _validate_planned_payload(payload: dict) -> str | None:
     action = str(payload.get("action", "")).strip().lower()
-    if action not in {"search", "get", "upload"}:
-        return "Unsupported or missing action. Use one of: search, get, upload."
+    if action != "api":
+        return "Unsupported or missing action. Use: api."
 
-    if action == "search":
-        query = payload.get("query") or payload.get("q")
-        if not str(query or "").strip():
-            return "search action requires `query`."
-        return None
-
-    if action == "get":
-        video_id = payload.get("video_id") or payload.get("id")
-        if not str(video_id or "").strip():
-            return "get action requires `video_id`."
-        return None
-
-    if action == "upload":
-        file_path = payload.get("file")
-        if not str(file_path or "").strip():
-            return "upload action requires `file`."
-        title = payload.get("title") or payload.get("name")
-        if not str(title or "").strip():
-            return "upload action requires `title` (or `name`)."
-        return None
-
+    resource = payload.get("resource")
+    method = payload.get("method")
+    if not str(resource or "").strip():
+        return "api action requires `resource` (for example: videos, playlists, channels)."
+    if not str(method or "").strip():
+        return "api action requires `method` (for example: list, insert, update, delete)."
+    params = payload.get("params")
+    if params is not None and not isinstance(params, dict):
+        return "api action `params` must be an object when provided."
+    body = payload.get("body")
+    if body is not None and not isinstance(body, dict):
+        return "api action `body` must be an object when provided."
+    media_file = payload.get("media_file")
+    if media_file is not None and not str(media_file).strip():
+        return "api action `media_file` must be a non-empty string when provided."
     return None
 
 
 def _payload_to_cli_query(payload: dict[str, Any]) -> str | None:
     action = str(payload.get("action", "")).strip().lower()
-    if action == "search":
-        query = payload.get("query") or payload.get("q")
-        if not str(query or "").strip():
+    if action == "api":
+        resource = str(payload.get("resource", "")).strip()
+        method = str(payload.get("method", "")).strip()
+        if not resource or not method:
             return None
-        max_results = payload.get("max_results", 5)
-        parts = ["youtube.search", "--query", str(query), "--max-results", str(max_results)]
-        return shlex.join(parts)
-
-    if action == "get":
-        video_id = payload.get("video_id") or payload.get("id")
-        if not str(video_id or "").strip():
-            return None
-        return shlex.join(["youtube.get", "--video-id", str(video_id)])
-
-    if action == "upload":
-        file_path = payload.get("file")
-        title = payload.get("title") or payload.get("name")
-        if not str(file_path or "").strip() or not str(title or "").strip():
-            return None
-        parts = ["youtube.upload", "--file", str(file_path), "--title", str(title)]
-        description = payload.get("description")
-        if str(description or "").strip():
-            parts.extend(["--description", str(description)])
-        privacy = payload.get("privacyStatus")
-        if str(privacy or "").strip():
-            parts.extend(["--privacy", str(privacy)])
-        tags = payload.get("tags")
-        if isinstance(tags, list) and tags:
-            parts.extend(["--tags", ",".join(str(tag) for tag in tags)])
+        parts = [f"youtube.{resource}.{method}"]
+        params = payload.get("params")
+        if isinstance(params, dict) and params:
+            parts.extend(["--params", _json_dumps(params)])
+        body = payload.get("body")
+        if isinstance(body, dict) and body:
+            parts.extend(["--json", _json_dumps(body)])
+        media_file = payload.get("media_file")
+        if str(media_file or "").strip():
+            parts.extend(["--media-file", str(media_file)])
         return shlex.join(parts)
 
     return None
@@ -297,56 +256,112 @@ def _extract_cli_queries_from_response(raw_response: dict[str, Any]) -> list[str
     return [query] if query else []
 
 
+def _execute_generic_api_action(service, payload: dict) -> dict[str, Any]:
+    resource = str(payload.get("resource", "")).strip()
+    method = str(payload.get("method", "")).strip()
+    if not resource or not method:
+        raise ValueError("api action requires non-empty `resource` and `method`.")
+
+    if not resource.replace("_", "").isalnum() or not method.replace("_", "").isalnum():
+        raise ValueError("api action resource/method must be alphanumeric identifiers.")
+
+    params = payload.get("params")
+    if params is None:
+        request_kwargs: dict[str, Any] = {}
+    elif isinstance(params, dict):
+        request_kwargs = dict(params)
+    else:
+        raise ValueError("api action `params` must be an object.")
+
+    body = payload.get("body")
+    if body is not None:
+        if not isinstance(body, dict):
+            raise ValueError("api action `body` must be an object.")
+        request_kwargs["body"] = body
+
+    media_file = payload.get("media_file")
+    if str(media_file or "").strip():
+        media_path = Path(str(media_file)).expanduser()
+        if not media_path.exists():
+            raise FileNotFoundError(f"media file not found: {media_path}")
+        media_mime = str(payload.get("media_mime") or "").strip() or None
+        request_kwargs["media_body"] = MediaFileUpload(str(media_path.resolve()), mimetype=media_mime, resumable=True)
+
+    resource_factory = getattr(service, resource, None)
+    if not callable(resource_factory):
+        raise ValueError(f"Unknown YouTube resource: {resource}")
+    resource_handle = resource_factory()
+
+    method_callable = getattr(resource_handle, method, None)
+    if not callable(method_callable):
+        raise ValueError(f"Unsupported method '{method}' for resource '{resource}'")
+
+    page_all = bool(payload.get("page_all", False))
+    max_pages = _coerce_max_results(payload.get("max_pages", 3), default=3, minimum=1, maximum=20)
+
+    if page_all:
+        responses: list[Any] = []
+        all_items: list[Any] = []
+        current_kwargs = dict(request_kwargs)
+        for _ in range(max_pages):
+            response = method_callable(**current_kwargs).execute()
+            responses.append(response)
+            if isinstance(response, dict):
+                items = response.get("items")
+                if isinstance(items, list):
+                    all_items.extend(items)
+                next_token = response.get("nextPageToken")
+                if not next_token:
+                    break
+                current_kwargs["pageToken"] = next_token
+                continue
+            break
+        return {
+            "resource": resource,
+            "method": method,
+            "page_all": True,
+            "pages": len(responses),
+            "items": all_items,
+            "responses": responses,
+        }
+
+    request = method_callable(**request_kwargs)
+    # HttpRequest always exposes next_chunk(), but it is only valid for resumable uploads/downloads.
+    resumable = getattr(request, "resumable", None)
+    if resumable is not None and hasattr(request, "next_chunk"):
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                logger.info("Request progress: %s%%", int(status.progress() * 100))
+        return {
+            "resource": resource,
+            "method": method,
+            "response": response,
+        }
+
+    response = request.execute()
+    return {
+        "resource": resource,
+        "method": method,
+        "response": response,
+    }
+
+
 def _execute_structured_payload(payload: dict, *, runtime_data: dict[str, Any]) -> str:
     action = str(payload.get("action", "")).strip().lower()
-    if action == "search":
-        q = payload.get("query") or payload.get("q")
-        if not q:
-            return _error_payload("search action requires `query`.")
+    if action == "api":
         client_secrets = runtime_data.get("client_secrets") or payload.get("client_secrets")
         creds_file = runtime_data.get("credentials_file") or payload.get("credentials_file") or "youtube_token.json"
         try:
             service = _build_service(client_secrets_file=client_secrets, credentials_file=creds_file)
         except Exception as exc:
-            return _error_payload("search action requires OAuth client secrets via `--client-secrets` or a valid credentials file.", error=str(exc))
-        max_results = int(payload.get("max_results", 5))
-        items = _search_videos(service, str(q), max_results=max_results)
-        return _json_dumps({"ok": True, "items": items})
-
-    if action == "get":
-        video_id = payload.get("video_id") or payload.get("id")
-        if not video_id:
-            return _error_payload("get action requires `video_id`.")
-        client_secrets = runtime_data.get("client_secrets") or payload.get("client_secrets")
-        creds_file = runtime_data.get("credentials_file") or payload.get("credentials_file") or "youtube_token.json"
+            return _error_payload("api action requires OAuth client secrets via `--client-secrets` or a valid credentials file.", error=str(exc))
         try:
-            service = _build_service(client_secrets_file=client_secrets, credentials_file=creds_file)
+            result = _execute_generic_api_action(service, payload)
         except Exception as exc:
-            return _error_payload("get action requires OAuth client secrets via `--client-secrets` or a valid credentials file.", error=str(exc))
-        details = _get_video_details(service, str(video_id))
-        return _json_dumps({"ok": True, "video": details})
-
-    if action == "upload":
-        file_path = payload.get("file")
-        if not file_path:
-            return _error_payload("upload action requires a local `file` path.")
-        client_secrets = runtime_data.get("client_secrets") or payload.get("client_secrets")
-        if not client_secrets:
-            return _error_payload("upload action requires OAuth client secrets via `--client-secrets`.")
-        creds_file = runtime_data.get("credentials_file") or payload.get("credentials_file") or "youtube_token.json"
-        service = _build_service(client_secrets_file=client_secrets, credentials_file=creds_file)
-        title = payload.get("title") or payload.get("name") or Path(str(file_path)).stem
-        description = payload.get("description", "")
-        tags = payload.get("tags") or []
-        privacy = payload.get("privacyStatus", "private")
-        try:
-            file_path_resolved = Path(str(file_path)).expanduser()
-            if not file_path_resolved.exists():
-                return _error_payload("upload failed", error=f"file not found: {file_path_resolved}")
-            resp = _upload_video(service, str(file_path_resolved.resolve()), title, description=description, tags=tags, privacyStatus=privacy)
-        except Exception as exc:
-            return _error_payload("upload failed", error=str(exc))
-        return _json_dumps({"ok": True, "result": resp})
+            return _error_payload("api action failed", error=str(exc))
+        return _json_dumps({"ok": True, "result": result})
 
     return _error_payload(f"Unsupported action: {action}")
 
@@ -458,9 +473,10 @@ def access_youtube(query: str = "") -> str:
     Plain-text YouTube entry point backed by the YouTube Data API v3.
 
     Examples:
-    - Find 3 recent videos about Python automation.
-    - Get details for video id dQw4w9WgXcQ.
-    - Upload a local file /path/to/video.mp4 with title "My Video".
+    - Call search.list with params part=snippet, q="python automation", type=video, maxResults=5.
+    - Call videos.list with params part=snippet,contentDetails,statistics and id=dQw4w9WgXcQ.
+    - Call channels.list with params part=snippet,contentDetails,statistics, mine=true, maxResults=10.
+    - Call playlists.list with params part=snippet,contentDetails, mine=true, maxResults=15.
     """
     output = _run_query_action(query, runtime_data={})
     parsed_output = _parse_json_response(output)
