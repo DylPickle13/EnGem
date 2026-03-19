@@ -11,6 +11,59 @@ from typing import Any, Callable
 from tools.access_google_workspace import _run_gws_command
 
 
+_AUTH_FAILURE_LOG_COOLDOWN_SECONDS = 300.0
+_last_auth_failure_log_time = 0.0
+
+
+def _log_auth_failure_once(details: str) -> None:
+	global _last_auth_failure_log_time
+	now = time.time()
+	if now - _last_auth_failure_log_time < _AUTH_FAILURE_LOG_COOLDOWN_SECONDS:
+		return
+	_last_auth_failure_log_time = now
+	logging.error(
+		"Google Workspace authentication failed while polling calendar. "
+		"Run `gws auth login` in a terminal, then restart the bot. Details: %s",
+		details or "No output",
+	)
+
+
+def _extract_gws_failure_details(result: dict[str, Any]) -> str:
+	stderr = str(result.get("stderr") or "").strip()
+	stdout = str(result.get("stdout") or "").strip()
+
+	if stdout:
+		try:
+			parsed = json.loads(stdout)
+			if isinstance(parsed, dict):
+				error = parsed.get("error")
+				if isinstance(error, dict):
+					message = str(error.get("message") or "").strip()
+					reason = str(error.get("reason") or "").strip()
+					if message and reason:
+						stdout = f"{message} ({reason})"
+					elif message:
+						stdout = message
+					elif reason:
+						stdout = reason
+		except Exception:
+			pass
+
+	if stderr and stdout:
+		return f"{stderr} | {stdout}"
+	return stderr or stdout
+
+
+def _is_gws_auth_error(details: str) -> bool:
+	text = (details or "").lower()
+	return (
+		"autherror" in text
+		or "invalid authentication credentials" in text
+		or "authentication failed" in text
+		or "unauthorized" in text
+	)
+
+
 def _sync_check_active_events(
 	calendar_id: str = "primary",
 	*,
@@ -81,8 +134,13 @@ def _sync_check_active_events(
 		if result.get("ok"):
 			break
 
-		details = (result.get("stderr") or result.get("stdout") or "").strip()
+		details = _extract_gws_failure_details(result)
 		last_details = details
+
+		if _is_gws_auth_error(details):
+			_log_auth_failure_once(details)
+			return []
+
 		logging.warning(
 			"gws command failed (attempt %d/%d): %s; command: %s",
 			attempt + 1,

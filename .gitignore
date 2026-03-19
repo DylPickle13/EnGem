@@ -10,6 +10,6 @@ download.html
 /skills
 /prompts
 /scripts
-# YouTube OAuth secrets and tokens
+/image_references
 client_secret_*.json
 youtube_token.json

@@ -15,11 +15,6 @@ def _find_repo_root() -> Path:
 
 _REPO_ROOT = _find_repo_root()
 _OUTPUTS_DIR = _REPO_ROOT / "generated_files"
-_LEGACY_OUTPUT_DIRS = (
-    _REPO_ROOT / "generated_images",
-    _REPO_ROOT / "generated_videos",
-    _REPO_ROOT / "generated_documents",
-)
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
 _DOCUMENT_EXTENSIONS = {
@@ -32,19 +27,10 @@ MEDIA_SELECTOR_FILE = Path(__file__).parent / "agent_instructions" / "media_sele
 
 
 # Directories and allowed/restricted outputs (match llm.py expectations)
-GENERATED_IMAGES_DIR = (_REPO_ROOT / "generated_images").resolve()
-GENERATED_VIDEOS_DIR = (_REPO_ROOT / "generated_videos").resolve()
 GENERATED_FILES_DIR = (_REPO_ROOT / "generated_files").resolve()
-GENERATED_DOCUMENTS_DIR = (_REPO_ROOT / "generated_documents").resolve()
-RESTRICTED_OUTPUT_DIRECTORIES = (
-    GENERATED_IMAGES_DIR,
-    GENERATED_VIDEOS_DIR,
-)
+RESTRICTED_OUTPUT_DIRECTORIES = ()
 ALLOWED_OUTPUT_DIRECTORIES = (
-    GENERATED_IMAGES_DIR,
-    GENERATED_VIDEOS_DIR,
     GENERATED_FILES_DIR,
-    GENERATED_DOCUMENTS_DIR,
 )
 SUPPORTED_OUTPUT_FILE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
@@ -214,7 +200,7 @@ def _collect_media_catalog(limit: int = 80) -> list[dict]:
 def _iter_files():
     seen_paths: set[Path] = set()
 
-    for folder in (_OUTPUTS_DIR, *_LEGACY_OUTPUT_DIRS):
+    for folder in (_OUTPUTS_DIR,):
         if not folder.exists() or not folder.is_dir():
             continue
 

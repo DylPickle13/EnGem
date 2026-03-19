@@ -4,6 +4,7 @@ import sys
 import re
 import base64
 import mimetypes
+import shutil
 from pathlib import Path
 
 # Ensure repository root is on sys.path so top-level modules (like config)
@@ -24,6 +25,42 @@ _ALLOWED_ASPECT_RATIOS = {"16:9", "9:16"}
 _ALLOWED_RESOLUTIONS = {"720p", "1080p", "4k"}
 _ALLOWED_DURATIONS = {4, 6, 8}
 _ALLOWED_REFERENCE_TYPES = {"asset": "ASSET", "style": "STYLE"}
+
+
+def _extract_generated_videos(operation: object) -> list:
+  response = getattr(operation, "response", None)
+  if response is None:
+    return []
+
+  # Common SDK response shape.
+  by_attr = getattr(response, "generated_videos", None)
+  if isinstance(by_attr, list):
+    return by_attr
+
+  # Dict-like response shape fallback.
+  if isinstance(response, dict):
+    by_key = response.get("generated_videos")
+    if isinstance(by_key, list):
+      return by_key
+    nested = response.get("response")
+    if isinstance(nested, dict):
+      nested_videos = nested.get("generated_videos")
+      if isinstance(nested_videos, list):
+        return nested_videos
+
+  # Protobuf-like payloads can sometimes expose to_dict().
+  to_dict = getattr(response, "to_dict", None)
+  if callable(to_dict):
+    try:
+      response_dict = to_dict()
+      if isinstance(response_dict, dict):
+        by_key = response_dict.get("generated_videos")
+        if isinstance(by_key, list):
+          return by_key
+    except Exception:
+      pass
+
+  return []
 
 
 def _extract_json_payload(raw_prompt: str) -> dict:
@@ -316,21 +353,14 @@ def generate_video(prompt: str) -> str:
     print(traceback.format_exc())
     return f"error: {exc}"
 
-  # Extract generated video metadata
-  generated_videos = getattr(operation.response or {}, "generated_videos", None) or getattr(operation.response, "generated_videos", None) if operation.response else None
+  # Extract generated video metadata.
+  generated_videos = _extract_generated_videos(operation)
   if not generated_videos:
-    # Try alternative access path and dump operation for debugging
+    print("No generated_videos found on operation response. Operation:", operation)
     try:
-      generated_videos = operation.response.generated_videos
+      print("Operation response:", operation.response)
     except Exception:
-      print("No generated_videos found on operation.response. Operation:", operation)
-      try:
-        print("Operation response:", operation.response)
-      except Exception:
-        pass
-      return "error: no generated_videos in operation response"
-
-  if not generated_videos:
+      pass
     return "error: empty generated_videos"
 
   generated_video = generated_videos[0]
@@ -344,8 +374,9 @@ def generate_video(prompt: str) -> str:
     return ""
 
   # Download and save the video file
+  downloaded_file = None
   try:
-    call_with_exponential_backoff(
+    downloaded_file = call_with_exponential_backoff(
       lambda: client.files.download(file=generated_video.video),
       description="Gemini video download",
     )
@@ -366,9 +397,27 @@ def generate_video(prompt: str) -> str:
   filename = f"{safe}_{int(time.time())}.mp4"
   out_path = out_dir / filename
   try:
-    # generated_video.video is expected to have a .save(path) method
-    generated_video.video.save(str(out_path))
-    out_path_str = str(out_path)
+    # Prefer saving the downloaded file handle if available.
+    save_target = downloaded_file if downloaded_file is not None else generated_video.video
+    save_fn = getattr(save_target, "save", None)
+    if not callable(save_fn):
+      save_fn = getattr(generated_video.video, "save", None)
+    if not callable(save_fn):
+      return "error: generated video object has no save(path) method"
+
+    save_fn(str(out_path))
+
+    # Enforce final location under generated_files even if SDK saved elsewhere.
+    if not out_path.exists():
+      cwd_candidate = Path.cwd() / filename
+      if cwd_candidate.exists() and cwd_candidate.is_file():
+        out_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(cwd_candidate), str(out_path))
+
+    if not out_path.exists() or not out_path.is_file():
+      return "error: failed to save downloaded video file to generated_files"
+
+    out_path_str = str(out_path.resolve())
 
     # If the request used a JSON payload, include it in the returned text
     original_payload = request.get("request_payload") if isinstance(request, dict) else None
