@@ -19,12 +19,19 @@ from google import genai
 from google.genai import types
 
 
-_DEFAULT_VIDEO_MODEL = "veo-3.1-generate-preview"
+_DEFAULT_VIDEO_MODEL = "veo-3.1-fast-generate-preview"
 _DEFAULT_ASPECT_RATIO = "16:9"
 _ALLOWED_ASPECT_RATIOS = {"16:9", "9:16"}
 _ALLOWED_RESOLUTIONS = {"720p", "1080p", "4k"}
 _ALLOWED_DURATIONS = {4, 6, 8}
 _ALLOWED_REFERENCE_TYPES = {"asset": "ASSET", "style": "STYLE"}
+
+
+def _first_present(payload: dict, *keys: str) -> object:
+  for key in keys:
+    if key in payload:
+      return payload.get(key)
+  return None
 
 
 def _extract_generated_videos(operation: object) -> list:
@@ -137,20 +144,22 @@ def _image_from_spec(image_spec: object) -> types.Image | None:
   if not isinstance(image_spec, dict):
     return None
 
-  gcs_uri = _normalize_value(image_spec.get("gcs_uri") or image_spec.get("uri"))
+  gcs_uri = _normalize_value(
+    _first_present(image_spec, "gcs_uri", "gcsUri", "uri")
+  )
   if gcs_uri:
     return types.Image(gcs_uri=gcs_uri)
 
-  image_b64 = image_spec.get("image_base64")
+  image_b64 = _first_present(image_spec, "image_base64", "imageBase64")
   if isinstance(image_b64, str) and image_b64.strip():
     try:
       image_bytes = base64.b64decode(image_b64)
-      mime_type = _normalize_value(image_spec.get("mime_type")) or "image/png"
+      mime_type = _normalize_value(_first_present(image_spec, "mime_type", "mimeType")) or "image/png"
       return types.Image(image_bytes=image_bytes, mime_type=mime_type)
     except Exception:
       return None
 
-  image_path = _normalize_value(image_spec.get("path"))
+  image_path = _normalize_value(_first_present(image_spec, "path"))
   if not image_path:
     return None
 
@@ -165,7 +174,7 @@ def _image_from_spec(image_spec: object) -> types.Image | None:
   except Exception:
     return None
 
-  mime_type = _normalize_value(image_spec.get("mime_type")) or _guess_mime_type(str(image_file), "image/png")
+  mime_type = _normalize_value(_first_present(image_spec, "mime_type", "mimeType")) or _guess_mime_type(str(image_file), "image/png")
   return types.Image(image_bytes=image_bytes, mime_type=mime_type)
 
 
@@ -176,7 +185,7 @@ def _video_from_spec(video_spec: object) -> types.Video | None:
   if not isinstance(video_spec, dict):
     return None
 
-  video_uri = _normalize_value(video_spec.get("uri"))
+  video_uri = _normalize_value(_first_present(video_spec, "uri"))
   if video_uri:
     return types.Video(uri=video_uri)
 
@@ -207,7 +216,7 @@ def _build_video_request(raw_prompt: str) -> dict:
 
   config_kwargs: dict = {}
 
-  aspect_ratio = _normalize_value(request_payload.get("aspect_ratio"))
+  aspect_ratio = _normalize_value(_first_present(request_payload, "aspect_ratio", "aspectRatio"))
   if aspect_ratio in _ALLOWED_ASPECT_RATIOS:
     config_kwargs["aspect_ratio"] = aspect_ratio
   elif not aspect_ratio:
@@ -217,27 +226,27 @@ def _build_video_request(raw_prompt: str) -> dict:
   if resolution in _ALLOWED_RESOLUTIONS:
     config_kwargs["resolution"] = resolution
 
-  duration_seconds = _coerce_int(request_payload.get("duration_seconds"))
+  duration_seconds = _coerce_int(_first_present(request_payload, "duration_seconds", "durationSeconds"))
   if duration_seconds in _ALLOWED_DURATIONS:
     config_kwargs["duration_seconds"] = duration_seconds
 
-  number_of_videos = _coerce_int(request_payload.get("number_of_videos"))
+  number_of_videos = _coerce_int(_first_present(request_payload, "number_of_videos", "numberOfVideos"))
   if number_of_videos == 1:
     config_kwargs["number_of_videos"] = 1
 
-  negative_prompt = _normalize_value(request_payload.get("negative_prompt"))
+  negative_prompt = _normalize_value(_first_present(request_payload, "negative_prompt", "negativePrompt"))
   if negative_prompt:
     config_kwargs["negative_prompt"] = negative_prompt
 
-  enhance_prompt = _coerce_bool(request_payload.get("enhance_prompt"))
+  enhance_prompt = _coerce_bool(_first_present(request_payload, "enhance_prompt", "enhancePrompt"))
   if isinstance(enhance_prompt, bool):
     config_kwargs["enhance_prompt"] = enhance_prompt
 
-  last_frame = _image_from_spec(request_payload.get("last_frame"))
+  last_frame = _image_from_spec(_first_present(request_payload, "last_frame", "lastFrame"))
   if last_frame is not None:
     config_kwargs["last_frame"] = last_frame
 
-  reference_images_raw = request_payload.get("reference_images")
+  reference_images_raw = _first_present(request_payload, "reference_images", "referenceImages")
   if isinstance(reference_images_raw, list):
     reference_images: list[types.VideoGenerationReferenceImage] = []
     for reference in reference_images_raw[:3]:
@@ -245,10 +254,10 @@ def _build_video_request(raw_prompt: str) -> dict:
         reference = {"path": reference}
       if not isinstance(reference, dict):
         continue
-      image_obj = _image_from_spec(reference.get("image") or reference)
+      image_obj = _image_from_spec(_first_present(reference, "image") or reference)
       if image_obj is None:
         continue
-      ref_type = _normalize_value(reference.get("reference_type")).lower()
+      ref_type = _normalize_value(_first_present(reference, "reference_type", "referenceType")).lower()
       ref_type = _ALLOWED_REFERENCE_TYPES.get(ref_type, "ASSET")
       reference_images.append(
         types.VideoGenerationReferenceImage(
@@ -259,8 +268,10 @@ def _build_video_request(raw_prompt: str) -> dict:
     if reference_images:
       config_kwargs["reference_images"] = reference_images
 
-  first_image = _image_from_spec(request_payload.get("first_image") or request_payload.get("image"))
-  input_video = _video_from_spec(request_payload.get("video"))
+  first_image = _image_from_spec(
+    _first_present(request_payload, "first_image", "firstImage", "image")
+  )
+  input_video = _video_from_spec(_first_present(request_payload, "video"))
 
   # Enforce Veo request constraints to avoid invalid parameter combinations.
   if input_video is not None:
@@ -300,9 +311,11 @@ def generate_video(prompt: str) -> str:
 
   Advanced mode:
   - Input can be a JSON object encoded as a string with fields such as:
-    prompt, model, aspect_ratio, resolution, duration_seconds, number_of_videos,
-    negative_prompt, enhance_prompt,
-    first_image/image, last_frame, reference_images, and video.
+    prompt, model, aspectRatio/aspect_ratio, resolution,
+    durationSeconds/duration_seconds, numberOfVideos/number_of_videos,
+    negativePrompt/negative_prompt, enhancePrompt/enhance_prompt,
+    firstImage/first_image/image, lastFrame/last_frame,
+    referenceImages/reference_images, and video.
 
   Returns an absolute video path on success, or an `error: ...` message on failure.
   """
@@ -364,6 +377,17 @@ def generate_video(prompt: str) -> str:
     return "error: empty generated_videos"
 
   generated_video = generated_videos[0]
+  video_uri = ""
+  try:
+    video_obj = getattr(generated_video, "video", None)
+    if video_obj is not None:
+      video_uri = _normalize_value(getattr(video_obj, "uri", None))
+    if not video_uri and isinstance(generated_video, dict):
+      nested = generated_video.get("video")
+      if isinstance(nested, dict):
+        video_uri = _normalize_value(nested.get("uri"))
+  except Exception:
+    video_uri = ""
 
   # Ensure output directory exists
   repo_root = Path(__file__).resolve().parent.parent
@@ -418,16 +442,25 @@ def generate_video(prompt: str) -> str:
       return "error: failed to save downloaded video file to generated_files"
 
     out_path_str = str(out_path.resolve())
+    uri_line = f"VIDEO_URI:{video_uri}" if video_uri else ""
 
     # If the request used a JSON payload, include it in the returned text
     original_payload = request.get("request_payload") if isinstance(request, dict) else None
     if isinstance(original_payload, dict) and original_payload:
       try:
         json_input = json.dumps(original_payload, ensure_ascii=False)
-        return f"{out_path_str}\n\nJSON_INPUT:{json_input}"
+        extras = []
+        if uri_line:
+          extras.append(uri_line)
+        extras.append(f"JSON_INPUT:{json_input}")
+        return f"{out_path_str}\n\n" + "\n".join(extras)
       except Exception:
+        if uri_line:
+          return f"{out_path_str}\n\n{uri_line}"
         return out_path_str
 
+    if uri_line:
+      return f"{out_path_str}\n\n{uri_line}"
     return out_path_str
   except Exception as exc:
     import traceback
