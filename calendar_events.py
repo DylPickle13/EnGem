@@ -11,20 +11,16 @@ from typing import Any, Callable
 from tools.access_google_workspace import _run_gws_command
 
 
-_AUTH_FAILURE_LOG_COOLDOWN_SECONDS = 300.0
-_last_auth_failure_log_time = 0.0
+
+class GoogleWorkspaceAuthError(RuntimeError):
+	pass
 
 
-def _log_auth_failure_once(details: str) -> None:
-	global _last_auth_failure_log_time
-	now = time.time()
-	if now - _last_auth_failure_log_time < _AUTH_FAILURE_LOG_COOLDOWN_SECONDS:
-		return
-	_last_auth_failure_log_time = now
-	logging.error(
+def _auth_failure_message(details: str) -> str:
+	return (
 		"Google Workspace authentication failed while polling calendar. "
-		"Run `gws auth login` in a terminal, then restart the bot. Details: %s",
-		details or "No output",
+		"Run `gws auth logout` and then `gws auth login` in a terminal, then restart the bot. "
+		f"Details: {details or 'No output'}"
 	)
 
 
@@ -138,8 +134,7 @@ def _sync_check_active_events(
 		last_details = details
 
 		if _is_gws_auth_error(details):
-			_log_auth_failure_once(details)
-			return []
+			raise GoogleWorkspaceAuthError(_auth_failure_message(details))
 
 		logging.warning(
 			"gws command failed (attempt %d/%d): %s; command: %s",
@@ -240,13 +235,20 @@ def check_active_events(
 							["calendar", "events", "delete", "--params", json.dumps(params)], runtime_data={}, timeout=timeout_seconds
 						)
 						if not delete_result.get("ok"):
+							details = (delete_result.get("stderr") or delete_result.get("stdout") or "").strip()
+							if _is_gws_auth_error(details):
+								raise GoogleWorkspaceAuthError(_auth_failure_message(details))
 							logging.warning(
 								"Failed to delete event %s: %s",
 								event_id,
-								(delete_result.get("stderr") or delete_result.get("stdout") or "").strip(),
+								details,
 							)
 					except Exception:
 						logging.exception("Error processing/deleting event: %s", ev)
+			except GoogleWorkspaceAuthError as exc:
+				logging.error("%s", exc)
+				stop_signal.set()
+				break
 			except Exception as exc:
 				logging.exception("Error checking calendar: %s", exc)
 			stop_signal.wait(poll_interval_seconds)

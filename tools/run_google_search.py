@@ -18,7 +18,6 @@ from google.genai import types
 def run_google_search(query: str) -> str:
     """
     Run a Google Search using the Gemini API's Google Search tool.
-    Only returns summarized search results, not urls or article titles.
     """
     client = genai.Client(api_key=get_paid_gemini_api_key())
     grounding_tool = types.Tool(
@@ -38,8 +37,3 @@ def run_google_search(query: str) -> str:
     )
     
     return str(response.candidates[0]) or ""
-
-
-if __name__ == "__main__":
-    query = "What are the latest advancements in AI research as of June 2024?"
-    results = run_google_search(query)

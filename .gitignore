@@ -11,5 +11,6 @@ download.html
 /prompts
 /scripts
 /image_references
+/logs
 client_secret_*.json
 youtube_token.json
