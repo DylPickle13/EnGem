@@ -735,6 +735,108 @@ def _extract_section_from_markdown(text: str, header: str) -> str:
     return (m.group(1).strip() if m else "")
 
 
+def _is_supported_skill_file(skill_file: Path) -> bool:
+    return skill_file.is_file() and skill_file.suffix.lower() in (".md", ".markdown", ".txt")
+
+
+def _normalize_skill_file_path(skill_file: str | Path) -> str:
+    try:
+        return str(Path(skill_file).resolve())
+    except Exception:
+        return str(Path(skill_file))
+
+
+def _build_skill_import_entry_from_file(skill_file: Path) -> dict[str, Any]:
+    content = skill_file.read_text(encoding="utf-8")
+    name_match = re.search(r'^\s*#\s*(.+)$', content, flags=re.M)
+    skill_name = name_match.group(1).strip() if name_match else skill_file.stem
+
+    summary = _extract_section_from_markdown(content, "Summary")
+    when_to_use = _extract_section_from_markdown(content, "When To Use")
+    planning_pattern = _extract_section_from_markdown(content, "Planning Pattern")
+
+    tags: list[str] = []
+    confidence = 1.0
+    skill = {
+        "name": skill_name,
+        "summary": summary or "",
+        "when_to_use": when_to_use or "",
+        "planning_pattern": planning_pattern or "",
+        "tags": tags,
+        "confidence": confidence,
+    }
+
+    document_text = _build_skill_document_text(skill)
+    normalized_skill_file = _normalize_skill_file_path(skill_file)
+    metadata = {
+        "record_type": "skill",
+        "source_type": "skill_file_import",
+        "history_file": "skill_files",
+        "skill_name": skill_name,
+        "skill_status": "loaded",
+        "skill_confidence": confidence,
+        "skill_tags_json": json.dumps(tags, ensure_ascii=False),
+        "schema_version": MEMORY_SCHEMA_VERSION,
+        "skill_file": normalized_skill_file,
+    }
+    # Include file path in the id so file-level changes can be diffed precisely.
+    memory_id = hashlib.sha256(f"skill_files|{normalized_skill_file}|{document_text}".encode("utf-8")).hexdigest()
+    return {
+        "memory_id": memory_id,
+        "document_text": document_text,
+        "metadata": metadata,
+    }
+
+
+def _skill_store_matches_expected_entries(
+    store: VectorMemoryStore,
+    expected_entries: list[dict[str, Any]],
+) -> bool:
+    expected_by_file: dict[str, str] = {}
+    for entry in expected_entries:
+        metadata = dict(entry.get("metadata") or {})
+        skill_file = str(metadata.get("skill_file") or "").strip()
+        memory_id = str(entry.get("memory_id") or "").strip()
+        if not skill_file or not memory_id:
+            return False
+        if skill_file in expected_by_file and expected_by_file[skill_file] != memory_id:
+            return False
+        expected_by_file[skill_file] = memory_id
+
+    try:
+        total_count = store.count()
+        existing_result = store.collection.get(include=["metadatas"], where={"record_type": "skill"})
+    except Exception:
+        logging.exception("Failed reading existing skill metadata for sync comparison.")
+        return False
+
+    existing_ids = existing_result.get("ids") or []
+    existing_metadatas = existing_result.get("metadatas") or []
+
+    # If the collection contains any non-skill records, force a clean rebuild.
+    if total_count != len(existing_ids):
+        return False
+
+    if len(existing_ids) != len(expected_by_file):
+        return False
+
+    existing_by_file: dict[str, str] = {}
+    for index, memory_id in enumerate(existing_ids):
+        metadata = existing_metadatas[index] if index < len(existing_metadatas) and isinstance(existing_metadatas[index], dict) else {}
+        if metadata.get("source_type") != "skill_file_import":
+            return False
+        raw_skill_file = str(metadata.get("skill_file") or "").strip()
+        if not raw_skill_file:
+            return False
+
+        normalized_skill_file = _normalize_skill_file_path(raw_skill_file)
+        if normalized_skill_file in existing_by_file:
+            return False
+        existing_by_file[normalized_skill_file] = str(memory_id)
+
+    return existing_by_file == expected_by_file
+
+
 def _sync_skills_from_folder() -> None:
     try:
         store = get_skill_store()
@@ -742,68 +844,72 @@ def _sync_skills_from_folder() -> None:
         logging.exception("Failed to initialize skill store; skipping skill sync.")
         return
 
-    try:
-        # Clear existing skill records in the skill collection
+    skills_dir = SKILLS_DIR
+    if not skills_dir.exists() or not skills_dir.is_dir():
+        logging.info("Skills directory not found at %s; skipping skill import.", skills_dir)
+        return
+
+    expected_entries: list[dict[str, Any]] = []
+    failed_files: list[str] = []
+
+    for skill_file in sorted(skills_dir.iterdir()):
+        if not _is_supported_skill_file(skill_file):
+            continue
         try:
-            cleared = store.clear_memories()
-            logging.info("Cleared %d existing skill records from skill DB.", cleared)
+            expected_entries.append(_build_skill_import_entry_from_file(skill_file))
         except Exception:
-            logging.exception("Failed to clear existing skill records; continuing with import.")
+            failed_files.append(str(skill_file))
+            logging.exception("Failed reading skill file '%s'", skill_file)
 
-        skills_dir = SKILLS_DIR
-        if not skills_dir.exists() or not skills_dir.is_dir():
-            logging.info("Skills directory not found at %s; skipping skill import.", skills_dir)
-            return
+    # Avoid destructive sync if any files could not be parsed on this run.
+    if failed_files:
+        logging.warning(
+            "Skill sync skipped because %d skill file(s) failed to load.",
+            len(failed_files),
+        )
+        return
 
-        for skill_file in sorted(skills_dir.iterdir()):
-            if not skill_file.is_file():
-                continue
-            if skill_file.suffix.lower() not in (".md", ".markdown", ".txt"):
-                continue
-            try:
-                content = skill_file.read_text(encoding="utf-8")
-                name_match = re.search(r'^\s*#\s*(.+)$', content, flags=re.M)
-                skill_name = name_match.group(1).strip() if name_match else skill_file.stem
+    if _skill_store_matches_expected_entries(store, expected_entries):
+        logging.info(
+            "Skill DB already in sync with %d skill file(s); skipping reload.",
+            len(expected_entries),
+        )
+        return
 
-                summary = _extract_section_from_markdown(content, "Summary")
-                when_to_use = _extract_section_from_markdown(content, "When To Use")
-                planning_pattern = _extract_section_from_markdown(content, "Planning Pattern")
+    logging.info(
+        "Skill DB out of sync with %d skill file(s); rebuilding skill DB.",
+        len(expected_entries),
+    )
 
-                tags: list[str] = []
-                confidence = 1.0
-                skill = {
-                    "name": skill_name,
-                    "summary": summary or "",
-                    "when_to_use": when_to_use or "",
-                    "planning_pattern": planning_pattern or "",
-                    "tags": tags,
-                    "confidence": confidence,
-                }
-
-                document_text = _build_skill_document_text(skill)
-                metadata = {
-                    "record_type": "skill",
-                    "source_type": "skill_file_import",
-                    "history_file": "skill_files",
-                    "skill_name": skill_name,
-                    "skill_status": "loaded",
-                    "skill_confidence": confidence,
-                    "skill_tags_json": json.dumps(tags, ensure_ascii=False),
-                    "schema_version": MEMORY_SCHEMA_VERSION,
-                    "created_at": _utcnow_iso(),
-                    "skill_file": str(skill_file),
-                }
-
-                memory_id = hashlib.sha256(f"skill_files|{document_text}".encode("utf-8")).hexdigest()
-                try:
-                    store.write_memory(text=document_text, metadata=metadata, memory_id=memory_id)
-                    logging.info("Imported skill '%s' from %s", skill_name, skill_file)
-                except Exception:
-                    logging.exception("Failed writing skill '%s' to skill DB", skill_name)
-            except Exception:
-                logging.exception("Failed reading skill file '%s'", skill_file)
+    try:
+        cleared = store.clear_memories()
+        logging.info("Cleared %d existing skill records from skill DB.", cleared)
     except Exception:
-        logging.exception("Unhandled error syncing skills from folder")
+        logging.exception("Failed to clear existing skill records; aborting skill sync.")
+        return
+
+    imported_count = 0
+    for entry in expected_entries:
+        metadata = dict(entry["metadata"])
+        metadata["created_at"] = _utcnow_iso()
+        skill_name = str(metadata.get("skill_name") or "unknown skill")
+
+        try:
+            store.write_memory(
+                text=str(entry["document_text"]),
+                metadata=metadata,
+                memory_id=str(entry["memory_id"]),
+            )
+            imported_count += 1
+            logging.info("Imported skill '%s' from %s", skill_name, metadata.get("skill_file", ""))
+        except Exception:
+            logging.exception("Failed writing skill '%s' to skill DB", skill_name)
+
+    logging.info(
+        "Skill DB sync complete: imported %d/%d skill file(s).",
+        imported_count,
+        len(expected_entries),
+    )
 
 def run_skill_extraction_async(
     history_file: str,

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import mimetypes
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
@@ -16,11 +17,14 @@ import llm
 import memory as memory
 import progress_indicator
 
+from scripts.gaming_dogs import gaming_dogs_helper_bot
+
 DISCORD_MESSAGE_LIMIT = progress_indicator.DISCORD_MESSAGE_LIMIT
 DISCORD_MAX_ATTACHMENTS_PER_MESSAGE = 10
 DISCORD_ATTACHMENT_BATCH_MAX_BYTES = 24 * 1024 * 1024
 DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
 MESSAGE_WORKER_CONCURRENCY = 3
+CALENDAR_EVENT_ENQUEUE_TIMEOUT_SECONDS = 30
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -83,6 +87,7 @@ class DiscordBotWrapper:
 		self._progress_indicator = progress_indicator.ExecutionPlanProgressIndicator(
 			message_limit=DISCORD_MESSAGE_LIMIT
 		)
+		self._gaming_dogs_helper = gaming_dogs_helper_bot.GamingDogsChannelHelper()
 
 		intents = discord.Intents.default()
 		intents.message_content = True
@@ -582,6 +587,10 @@ class DiscordBotWrapper:
 			if message.author.bot:
 				return
 
+			if getattr(message.channel, "name", None) == gaming_dogs_helper_bot.DOGS_CHANNEL_NAME:
+				await self._gaming_dogs_helper.handle_message(message)
+				return
+
 			# If allowed_channels are set, ignore messages not in those channels
 			if self.allowed_channels and getattr(message.channel, "name", None) not in self.allowed_channels:
 				return
@@ -654,16 +663,29 @@ def _process_calendar_event(event: dict[str, Any]) -> bool:
 			self.attachments: list[discord.Attachment] = []
 			self.job = True
 
-	async def _dispatch_as_normal_message() -> None:
+	async def _enqueue_as_normal_message() -> None:
 		injected_message = _InjectedCalendarMessage(matching_channel, prompt_content)
-		channel_lock = bot._get_channel_processing_lock(matching_channel)
-		async with channel_lock:
-			await bot._process_message(injected_message)
+		await bot._enqueue_message(injected_message)
 
+	future = None
 	try:
-		future = asyncio.run_coroutine_threadsafe(_dispatch_as_normal_message(), bot.client.loop)
-		future.result(timeout=900)
+		loop = bot.client.loop
+		if not loop.is_running():
+			logging.info("Deferring calendar event '%s': Discord loop is not running yet.", event_name)
+			return False
+
+		future = asyncio.run_coroutine_threadsafe(_enqueue_as_normal_message(), loop)
+		future.result(timeout=CALENDAR_EVENT_ENQUEUE_TIMEOUT_SECONDS)
 		return True
+	except FutureTimeoutError:
+		if future is not None:
+			future.cancel()
+		logging.warning(
+			"Timed out enqueueing calendar event '%s' after %d seconds.",
+			event_name,
+			CALENDAR_EVENT_ENQUEUE_TIMEOUT_SECONDS,
+		)
+		return False
 	except Exception:
 		logging.exception("Failed to process calendar event '%s' through Discord message pipeline.", event_name)
 		return False
@@ -675,14 +697,13 @@ if __name__ == "__main__":
 
 	_clear_sub_agents_directory()
 
+	bot = DiscordBotWrapper()
+
 	# Synchronize skills DB with files so runtime only contains those skills
 	try:
 		memory._sync_skills_from_folder()
 	except Exception:
 		logging.exception("Failed to sync skills from folder on startup")
-
-	print("Starting EnGem...")
-	bot = DiscordBotWrapper()
 
 	calendar_thread, calendar_stop_event = calendar_events.check_active_events(
 		poll_interval_seconds=5.0,
@@ -690,6 +711,7 @@ if __name__ == "__main__":
 		event_processor=_process_calendar_event,
 	)
 	try:
+		print("Starting EnGem...")
 		bot.run()
 	finally:
 		calendar_stop_event.set()

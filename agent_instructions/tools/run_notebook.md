@@ -20,6 +20,7 @@ Important constraints:
 - Tool returns JSON text, not rendered notebook output.
 - Missing notebook path returns success=false with an error message.
 - Execution may take time depending on notebook workload.
+- Notebook execution is capped at 1 hour of wall-clock time; if it exceeds that limit, the tool returns success=false with a timeout error.
 
 High quality prompting pattern:
 - Specify notebook path.
