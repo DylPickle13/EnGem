@@ -13,7 +13,7 @@ import collect_generated_media
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
 from config import MINIMAL_MODEL as MINIMAL_MODEL, LOW_MODEL as LOW_MODEL, MEDIUM_MODEL as MEDIUM_MODEL, HIGH_MODEL as HIGH_MODEL
 from api_backoff import call_with_exponential_backoff
-from history_cache import CachedContentProfile, HistoryContextCache, compose_uncached_history_prompt, create_cached_content_profile, create_history_context_cache, resolve_history_cached_prompt
+from history_cache import CachedContentProfile, HistoryContextCache, compose_uncached_history_prompt, create_cached_content_profile, create_history_context_cache, emit_cache_metric, resolve_history_cached_prompt
 import history
 import memory as memory
 
@@ -766,6 +766,12 @@ def _run_sub_agent_plan(
 
         if mode == "parallel" and len(agents) > 1:
             base_history = current_history_text
+            _prewarm_parallel_stage_cache_profiles(
+                agents=agents,
+                stage_history=base_history,
+                sub_agent_system_instructions=sub_agent_system_instructions,
+                history_cache=history_cache,
+            )
 
             def _run_parallel_agent(agent: dict[str, Any], stage_history: str) -> str:
                 model_name, api_thinking_level, force_tool_name = _resolve_sub_agent_model_config(agent)
@@ -934,6 +940,118 @@ def _resolve_sub_agent_model_config(agent: dict) -> tuple[str, str, str]:
     force_tool = _normalize_force_tool_name(agent.get("force_tool"))
     return model_name, api_thinking_level, force_tool
 
+def _build_cache_profile_settings(
+    system_instructions: str,
+    tool_use_allowed: bool,
+    force_tool: str,
+) -> tuple[str, list[types.Tool] | None, types.ToolConfig | None, str]:
+    forced_tool_name = _normalize_force_tool_name(force_tool) if tool_use_allowed else ""
+    effective_system_instructions = system_instructions
+    if forced_tool_name:
+        effective_system_instructions += _get_forced_tool_instructions(forced_tool_name)
+
+    cache_tools = None
+    cache_tool_config = None
+    if tool_use_allowed:
+        agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
+        cache_tools = [agent_tools]
+        if forced_tool_name:
+            cache_tool_config = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode="ANY",
+                    allowed_function_names=[forced_tool_name],
+                )
+            )
+
+    return effective_system_instructions, cache_tools, cache_tool_config, forced_tool_name
+
+
+def _prewarm_parallel_stage_cache_profiles(
+    agents: list[dict[str, Any]],
+    stage_history: str,
+    sub_agent_system_instructions: str,
+    history_cache: HistoryContextCache,
+) -> None:
+    unique_profiles: dict[str, tuple[str, CachedContentProfile]] = {}
+
+    for agent in agents:
+        try:
+            model_name, _, force_tool_name = _resolve_sub_agent_model_config(agent)
+            effective_system_instructions, cache_tools, cache_tool_config, _ = _build_cache_profile_settings(
+                system_instructions=sub_agent_system_instructions,
+                tool_use_allowed=True,
+                force_tool=force_tool_name,
+            )
+            profile = create_cached_content_profile(
+                model=model_name,
+                system_instruction=effective_system_instructions,
+                tools=cache_tools,
+                tool_config=cache_tool_config,
+            )
+            unique_profiles.setdefault(profile.profile_key, (model_name, profile))
+        except Exception as e:
+            print(f"Error preparing cache prewarm profile for parallel agent '{agent.get('task_name', 'unknown')}': {e}")
+
+    if not unique_profiles:
+        return
+
+    emit_cache_metric(
+        "parallel_stage_cache_prewarm_start",
+        profile_count=len(unique_profiles),
+        stage_history_chars=len(stage_history or ""),
+    )
+
+    for model_name, profile in unique_profiles.values():
+        try:
+            history_cache.get_cached_content_entry(
+                model=model_name,
+                profile=profile,
+                current_history_text=stage_history,
+            )
+        except Exception as e:
+            print(f"Error prewarming parallel cache profile '{profile.profile_label}' for model '{model_name}': {e}")
+
+    emit_cache_metric(
+        "parallel_stage_cache_prewarm_end",
+        profile_count=len(unique_profiles),
+    )
+
+
+def _extract_usage_metadata(response: object) -> dict[str, Any]:
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if usage_metadata is None:
+        return {}
+
+    if isinstance(usage_metadata, dict):
+        return usage_metadata
+
+    snapshot: dict[str, Any] = {}
+    for field_name in (
+        "cached_content_token_count",
+        "prompt_token_count",
+        "total_token_count",
+        "candidates_token_count",
+        "input_token_count",
+        "output_token_count",
+    ):
+        field_value = getattr(usage_metadata, field_name, None)
+        if field_value is not None:
+            snapshot[field_name] = field_value
+
+    if snapshot:
+        return snapshot
+
+    to_dict = getattr(usage_metadata, "to_dict", None)
+    if callable(to_dict):
+        try:
+            dict_value = to_dict()
+            if isinstance(dict_value, dict):
+                return dict_value
+        except Exception:
+            pass
+
+    return {"raw": str(usage_metadata)}
+
 
 def _run_model_api(
     text: str,
@@ -954,21 +1072,11 @@ def _run_model_api(
     temperature: the temperature to use for this generation (default: 1)
     """
 
-    forced_tool_name = _normalize_force_tool_name(force_tool) if tool_use_allowed else ""
-    effective_system_instructions = system_instructions
-    if forced_tool_name:
-        effective_system_instructions += _get_forced_tool_instructions(forced_tool_name)
-
-    agent_tools = types.Tool(function_declarations=_get_function_declarations(client=client))
-    tool_config = None
-    if forced_tool_name:
-        tool_config = types.ToolConfig(
-            function_calling_config=types.FunctionCallingConfig(
-                mode="ANY", allowed_function_names=[forced_tool_name]
-            )
-        )
-    cache_tools = [agent_tools] if tool_use_allowed else None
-    cache_tool_config = tool_config if forced_tool_name else None
+    effective_system_instructions, cache_tools, cache_tool_config, forced_tool_name = _build_cache_profile_settings(
+        system_instructions=system_instructions,
+        tool_use_allowed=tool_use_allowed,
+        force_tool=force_tool,
+    )
 
     if model == MINIMAL_MODEL and "2.5" in MINIMAL_MODEL:
         thinking_config = types.ThinkingConfig(thinking_budget=24576)
@@ -1015,6 +1123,16 @@ def _run_model_api(
 
     function_output = ""
 
+    emit_cache_metric(
+        "generate_content_request",
+        model=model,
+        cached_content_used=bool(cached_content_name),
+        cached_content_name=cached_content_name or "",
+        tool_use_allowed=tool_use_allowed,
+        forced_tool_name=forced_tool_name,
+        prompt_chars=len(prompt_text or ""),
+    )
+
     response = call_with_exponential_backoff(
         lambda: client.models.generate_content(
             model=model,
@@ -1022,6 +1140,13 @@ def _run_model_api(
             contents=prompt_text,
         ),
         description=f"Gemini generate_content ({model})",
+    )
+
+    emit_cache_metric(
+        "generate_content_response",
+        model=model,
+        cached_content_used=bool(cached_content_name),
+        usage_metadata=_extract_usage_metadata(response),
     )
 
     # The API may return a candidate whose `content` is None (no function-calling parts).
