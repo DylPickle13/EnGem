@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -20,6 +21,9 @@ from google.genai import types
 
 from api_backoff import call_with_exponential_backoff
 from config import (
+    ATTACHMENT_EMBEDDING_MAX_BYTES,
+    ATTACHMENT_EMBEDDING_MODE,
+    ATTACHMENT_MULTIMODAL_MAX_BYTES,
     GEMINI_EMBEDDING_BATCH_SIZE,
     GEMINI_EMBEDDING_DIM,
     GEMINI_EMBEDDING_MODEL,
@@ -31,6 +35,7 @@ from config import (
     SKILL_DB_DIR,
     get_paid_gemini_api_key,
 )
+from history_cache import emit_cache_metric
 import history
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -52,6 +57,8 @@ SKILLS_DIR = Path(__file__).parent / "skills"
 MEMORY_SCHEMA_VERSION = "2026-03-11-gemini2"
 _SUPPORTED_ATTACHMENT_EMBEDDING_PREFIXES = ("image/", "video/", "audio/")
 _SUPPORTED_ATTACHMENT_EMBEDDING_TYPES = {"application/pdf"}
+_QUERY_EMBEDDING_CACHE_SIZE = 512
+_SUPPORTED_ATTACHMENT_EMBEDDING_MODES = {"multimodal_fallback_text", "text_only", "off"}
 
 _embedding_service: GeminiEmbeddingService | None = None
 _default_store: VectorMemoryStore | None = None
@@ -67,6 +74,21 @@ def _utcnow_iso() -> str:
 
 def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip()).strip().lower()
+
+
+def _normalize_attachment_embedding_mode(raw_mode: str) -> str:
+    normalized_mode = (raw_mode or "").strip().lower()
+    if normalized_mode in _SUPPORTED_ATTACHMENT_EMBEDDING_MODES:
+        return normalized_mode
+    return "multimodal_fallback_text"
+
+
+def _emit_embedding_metric(event: str, **payload: Any) -> None:
+    try:
+        emit_cache_metric(event, **payload)
+    except Exception:
+        # Metrics must never impact runtime behavior.
+        return
 
 
 def _normalize_embedding(values: list[float]) -> list[float]:
@@ -112,6 +134,18 @@ class MemoryItem:
 
 
 @dataclass(slots=True)
+class MemoryRetrievalContext:
+    """Request-scoped cache for memory/skill retrieval and shared query embeddings."""
+
+    query_embedding_cache: dict[str, list[float]] = field(default_factory=dict)
+    search_all_memories_cache: dict[tuple[str, int, int], list[MemoryItem]] = field(default_factory=dict)
+    relevant_memories_text_cache: dict[tuple[str, int, int], str] = field(default_factory=dict)
+    relevant_skills_text_cache: dict[tuple[str, int], str] = field(default_factory=dict)
+    skill_names_text_cache: dict[tuple[str, int], str] = field(default_factory=dict)
+    skill_search_cache: dict[tuple[str, int], list[MemoryItem]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class ArchivedAttachment:
     """Metadata describing an archived attachment."""
 
@@ -136,8 +170,17 @@ class GeminiEmbeddingService:
         self.output_dimensionality = output_dimensionality
         self.batch_size = max(1, batch_size)
         self.client = genai.Client(api_key=get_paid_gemini_api_key())
+        self._query_embedding_cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._query_embedding_cache_lock = threading.RLock()
 
     def _embed_contents(self, contents: list[Any], task_type: str, description: str) -> list[list[float]]:
+        _emit_embedding_metric(
+            "embedding_request",
+            model=self.model_name,
+            task_type=task_type,
+            description=description,
+            content_count=len(contents),
+        )
         response = call_with_exponential_backoff(
             lambda: self.client.models.embed_content(
                 model=self.model_name,
@@ -150,7 +193,42 @@ class GeminiEmbeddingService:
             description=description,
         )
         raw_embeddings = getattr(response, "embeddings", None) or []
+        _emit_embedding_metric(
+            "embedding_response",
+            model=self.model_name,
+            task_type=task_type,
+            description=description,
+            content_count=len(contents),
+            embedding_count=len(raw_embeddings),
+        )
         return [_normalize_embedding(list(getattr(embedding, "values", []) or [])) for embedding in raw_embeddings]
+
+    def _build_query_cache_key(self, query_text: str) -> str:
+        return "|".join(
+            [
+                self.model_name,
+                str(self.output_dimensionality),
+                query_text,
+            ]
+        )
+
+    def _get_cached_query_embedding(self, cache_key: str) -> list[float] | None:
+        with self._query_embedding_cache_lock:
+            cached_embedding = self._query_embedding_cache.get(cache_key)
+            if cached_embedding is None:
+                return None
+            self._query_embedding_cache.move_to_end(cache_key)
+            return list(cached_embedding)
+
+    def _store_cached_query_embedding(self, cache_key: str, embedding: list[float]) -> None:
+        if not embedding:
+            return
+
+        with self._query_embedding_cache_lock:
+            self._query_embedding_cache[cache_key] = list(embedding)
+            self._query_embedding_cache.move_to_end(cache_key)
+            while len(self._query_embedding_cache) > _QUERY_EMBEDDING_CACHE_SIZE:
+                self._query_embedding_cache.popitem(last=False)
 
     def embed_texts(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
         cleaned_texts = [(text or "").strip() for text in texts]
@@ -178,7 +256,24 @@ class GeminiEmbeddingService:
         cleaned_text = (text or "").strip()
         if not cleaned_text:
             raise ValueError("Query text cannot be empty")
-        return self.embed_texts([cleaned_text], task_type="RETRIEVAL_QUERY")[0]
+        cache_key = self._build_query_cache_key(cleaned_text)
+        cached_embedding = self._get_cached_query_embedding(cache_key)
+        if cached_embedding is not None:
+            _emit_embedding_metric(
+                "embedding_query_cache_hit",
+                model=self.model_name,
+                query_chars=len(cleaned_text),
+            )
+            return cached_embedding
+
+        _emit_embedding_metric(
+            "embedding_query_cache_miss",
+            model=self.model_name,
+            query_chars=len(cleaned_text),
+        )
+        query_embedding = self.embed_texts([cleaned_text], task_type="RETRIEVAL_QUERY")[0]
+        self._store_cached_query_embedding(cache_key, query_embedding)
+        return list(query_embedding)
 
     def supports_attachment_embedding(self, mime_type: str) -> bool:
         normalized_mime = (mime_type or "").strip().lower()
@@ -194,6 +289,15 @@ class GeminiEmbeddingService:
                 types.Part.from_bytes(data=attachment_bytes, mime_type=mime_type),
             ],
         )
+        _emit_embedding_metric(
+            "embedding_request",
+            model=self.model_name,
+            task_type="ATTACHMENT",
+            description="Gemini attachment embedding",
+            content_count=1,
+            attachment_bytes=len(attachment_bytes),
+            mime_type=mime_type,
+        )
         response = call_with_exponential_backoff(
             lambda: self.client.models.embed_content(
                 model=self.model_name,
@@ -205,6 +309,16 @@ class GeminiEmbeddingService:
             description="Gemini attachment embedding",
         )
         raw_embeddings = getattr(response, "embeddings", None) or []
+        _emit_embedding_metric(
+            "embedding_response",
+            model=self.model_name,
+            task_type="ATTACHMENT",
+            description="Gemini attachment embedding",
+            content_count=1,
+            embedding_count=len(raw_embeddings),
+            attachment_bytes=len(attachment_bytes),
+            mime_type=mime_type,
+        )
         embeddings = [_normalize_embedding(list(getattr(embedding, "values", []) or [])) for embedding in raw_embeddings]
         if not embeddings:
             raise ValueError("Gemini returned no attachment embeddings")
@@ -353,8 +467,27 @@ class VectorMemoryStore:
         if self.count() <= limit:
             return self.read_all_memories(limit=limit, where=where)
 
+        return self.search_memories_by_embedding(
+            query_embedding=self.embedding_service.embed_query(cleaned_query),
+            limit=limit,
+            where=where,
+        )
+
+    def search_memories_by_embedding(
+        self,
+        query_embedding: list[float],
+        limit: int = 5,
+        where: dict[str, Any] | None = None,
+    ) -> list[MemoryItem]:
+        """Semantic search memories using a precomputed query embedding."""
+        if not query_embedding:
+            return []
+
+        if self.count() <= limit:
+            return self.read_all_memories(limit=limit, where=where)
+
         result = self.collection.query(
-            query_embeddings=[self.embedding_service.embed_query(cleaned_query)],
+            query_embeddings=[query_embedding],
             n_results=max(1, limit),
             include=["documents", "metadatas"],
             where=where,
@@ -392,6 +525,52 @@ def get_embedding_service() -> GeminiEmbeddingService:
     if _embedding_service is None:
         _embedding_service = GeminiEmbeddingService()
     return _embedding_service
+
+
+def create_retrieval_context() -> MemoryRetrievalContext:
+    """Create a request-scoped retrieval context for memory/skill lookups."""
+    return MemoryRetrievalContext()
+
+
+def _build_retrieval_query_embedding_cache_key(
+    query: str,
+    embedding_service: GeminiEmbeddingService,
+) -> str:
+    return "|".join(
+        [
+            embedding_service.model_name,
+            str(embedding_service.output_dimensionality),
+            query,
+        ]
+    )
+
+
+def _resolve_query_embedding(
+    query: str,
+    embedding_service: GeminiEmbeddingService,
+    retrieval_context: MemoryRetrievalContext | None,
+) -> list[float]:
+    if retrieval_context is None:
+        return embedding_service.embed_query(query)
+
+    cache_key = _build_retrieval_query_embedding_cache_key(query, embedding_service)
+    cached_embedding = retrieval_context.query_embedding_cache.get(cache_key)
+    if cached_embedding is not None:
+        _emit_embedding_metric(
+            "embedding_query_request_cache_hit",
+            model=embedding_service.model_name,
+            query_chars=len(query),
+        )
+        return list(cached_embedding)
+
+    query_embedding = embedding_service.embed_query(query)
+    retrieval_context.query_embedding_cache[cache_key] = list(query_embedding)
+    _emit_embedding_metric(
+        "embedding_query_request_cache_store",
+        model=embedding_service.model_name,
+        query_chars=len(query),
+    )
+    return list(query_embedding)
 
 
 def get_default_store() -> VectorMemoryStore:
@@ -543,6 +722,43 @@ def write_attachment_memory(
         mime_type=mime_type,
         file_name=file_name,
     )
+    attachment_store = get_attachment_store()
+    existing_file_records = attachment_store.read_all_memories(
+        limit=1,
+        where={"file_id": archived_attachment.file_id},
+    )
+    if existing_file_records:
+        _emit_embedding_metric(
+            "attachment_embedding_skipped",
+            reason="dedup_existing_file_id",
+            file_id=archived_attachment.file_id,
+            mime_type=archived_attachment.mime_type,
+            file_size_bytes=archived_attachment.file_size_bytes,
+        )
+        return existing_file_records[0]
+
+    embedding_mode = _normalize_attachment_embedding_mode(ATTACHMENT_EMBEDDING_MODE)
+    if embedding_mode == "off":
+        _emit_embedding_metric(
+            "attachment_embedding_skipped",
+            reason="embedding_mode_off",
+            file_id=archived_attachment.file_id,
+            mime_type=archived_attachment.mime_type,
+            file_size_bytes=archived_attachment.file_size_bytes,
+        )
+        return None
+
+    if archived_attachment.file_size_bytes > ATTACHMENT_EMBEDDING_MAX_BYTES:
+        _emit_embedding_metric(
+            "attachment_embedding_skipped",
+            reason="file_too_large",
+            file_id=archived_attachment.file_id,
+            mime_type=archived_attachment.mime_type,
+            file_size_bytes=archived_attachment.file_size_bytes,
+            max_bytes=ATTACHMENT_EMBEDDING_MAX_BYTES,
+        )
+        return None
+
     document_text = _build_attachment_memory_text(
         archived_attachment=archived_attachment,
         history_file=history_file,
@@ -551,7 +767,14 @@ def write_attachment_memory(
     )
     embedding_service = get_embedding_service()
     embedding_error_message = ""
-    if embedding_service.supports_attachment_embedding(archived_attachment.mime_type):
+    supports_multimodal_embedding = embedding_service.supports_attachment_embedding(archived_attachment.mime_type)
+    allow_multimodal_embedding = (
+        embedding_mode == "multimodal_fallback_text"
+        and supports_multimodal_embedding
+        and archived_attachment.file_size_bytes <= ATTACHMENT_MULTIMODAL_MAX_BYTES
+    )
+
+    if allow_multimodal_embedding:
         try:
             embedding = embedding_service.embed_attachment(
                 attachment_bytes=attachment_bytes,
@@ -565,7 +788,12 @@ def write_attachment_memory(
             extraction_status = "embedded_text_fallback_after_multimodal_error"
     else:
         embedding = embedding_service.embed_document(document_text)
-        extraction_status = "embedded_text_fallback"
+        if embedding_mode == "text_only":
+            extraction_status = "embedded_text_only"
+        elif supports_multimodal_embedding and archived_attachment.file_size_bytes > ATTACHMENT_MULTIMODAL_MAX_BYTES:
+            extraction_status = "embedded_text_due_to_multimodal_size_limit"
+        else:
+            extraction_status = "embedded_text_fallback"
 
     metadata = {
         "record_type": "file_record",
@@ -585,7 +813,7 @@ def write_attachment_memory(
     }
     if embedding_error_message:
         metadata["embedding_error"] = embedding_error_message[:500]
-    get_attachment_store().write_memory(
+    attachment_store.write_memory(
         text=document_text,
         metadata=metadata,
         memory_id=archived_attachment.file_id,
@@ -594,13 +822,32 @@ def write_attachment_memory(
     return MemoryItem(memory_id=archived_attachment.file_id, text=document_text, metadata=metadata)
 
 
-def build_relevant_memories_text(query: str, semantic_limit: int, file_limit: int) -> str:
+def build_relevant_memories_text(
+    query: str,
+    semantic_limit: int,
+    file_limit: int,
+    retrieval_context: MemoryRetrievalContext | None = None,
+) -> str:
+    cleaned_query = (query or "").strip()
+    if not cleaned_query:
+        return ""
+
+    cache_key = (cleaned_query, semantic_limit, file_limit)
+    if retrieval_context is not None:
+        cached_text = retrieval_context.relevant_memories_text_cache.get(cache_key)
+        if cached_text is not None:
+            return cached_text
+
     relevant_memories = search_all_memories(
-        query,
+        cleaned_query,
         semantic_limit=semantic_limit,
         file_limit=file_limit,
+        retrieval_context=retrieval_context,
     )
-    return "\n\n".join(render_memory_for_prompt(item) for item in relevant_memories)
+    rendered_text = "\n\n".join(render_memory_for_prompt(item) for item in relevant_memories)
+    if retrieval_context is not None:
+        retrieval_context.relevant_memories_text_cache[cache_key] = rendered_text
+    return rendered_text
 
 
 def _slugify_skill_name(name: str) -> str:
@@ -678,55 +925,120 @@ def _write_skill_markdown_file(
     return candidate_path
 
 
-def _persist_skill_candidate(skill: dict[str, Any], history_file: str) -> dict[str, Any]:
-    normalized_name = _normalize_text(skill["name"])
-    existing_skill_records = get_skill_store().read_all_memories(where={"record_type": "skill"})
+def _persist_skill_candidates(skills: list[dict[str, Any]], history_file: str) -> list[dict[str, Any]]:
+    skill_store = get_skill_store()
+    existing_skill_records = skill_store.read_all_memories(where={"record_type": "skill"})
+    existing_names: dict[str, MemoryItem] = {}
     for item in existing_skill_records:
         existing_name = _normalize_text(str((item.metadata or {}).get("skill_name") or ""))
-        if existing_name and existing_name == normalized_name:
-            return {
-                "status": "duplicate",
-                "skill_name": skill["name"],
-                "memory_id": item.memory_id,
-                "skill_file": str((item.metadata or {}).get("skill_file") or ""),
-            }
+        if existing_name:
+            existing_names[existing_name] = item
 
-    created_at = _utcnow_iso()
-    document_text = _build_skill_document_text(skill)
-    skill_id = hashlib.sha256(f"{history_file}|{document_text}".encode("utf-8")).hexdigest()
+    outcomes: list[dict[str, Any]] = []
+    pending_writes: list[tuple[dict[str, Any], str, dict[str, Any], str, str]] = []
+    pending_names: set[str] = set()
 
-    metadata = {
-        "record_type": "skill",
-        "source_type": "skill_extractor",
-        "history_file": history_file,
-        "skill_name": skill["name"],
-        "skill_status": "draft",
-        "skill_confidence": skill["confidence"],
-        "skill_tags_json": json.dumps(skill["tags"], ensure_ascii=False),
-        "schema_version": MEMORY_SCHEMA_VERSION,
-        "created_at": created_at,
-    }
+    for skill in skills:
+        normalized_name = _normalize_text(skill["name"])
+        existing_item = existing_names.get(normalized_name)
+        if existing_item is not None:
+            outcomes.append(
+                {
+                    "status": "duplicate",
+                    "skill_name": skill["name"],
+                    "memory_id": existing_item.memory_id,
+                    "skill_file": str((existing_item.metadata or {}).get("skill_file") or ""),
+                }
+            )
+            continue
 
-    skill_path = _write_skill_markdown_file(
-        skill_id=skill_id,
-        skill=skill,
-        history_file=history_file,
-        created_at=created_at,
-    )
+        if normalized_name in pending_names:
+            outcomes.append(
+                {
+                    "status": "duplicate",
+                    "skill_name": skill["name"],
+                    "memory_id": "",
+                    "skill_file": "",
+                }
+            )
+            continue
 
-    skill_file = str(skill_path)
-    metadata["skill_file"] = skill_file
-    memory_id = get_skill_store().write_memory(
-        text=document_text,
-        metadata=metadata,
-        memory_id=skill_id,
-    )
+        pending_names.add(normalized_name)
+        created_at = _utcnow_iso()
+        document_text = _build_skill_document_text(skill)
+        skill_id = hashlib.sha256(f"{history_file}|{document_text}".encode("utf-8")).hexdigest()
 
+        metadata = {
+            "record_type": "skill",
+            "source_type": "skill_extractor",
+            "history_file": history_file,
+            "skill_name": skill["name"],
+            "skill_status": "draft",
+            "skill_confidence": skill["confidence"],
+            "skill_tags_json": json.dumps(skill["tags"], ensure_ascii=False),
+            "schema_version": MEMORY_SCHEMA_VERSION,
+            "created_at": created_at,
+        }
+
+        skill_path = _write_skill_markdown_file(
+            skill_id=skill_id,
+            skill=skill,
+            history_file=history_file,
+            created_at=created_at,
+        )
+        skill_file = str(skill_path)
+        metadata["skill_file"] = skill_file
+        pending_writes.append((skill, document_text, metadata, skill_id, skill_file))
+
+    if pending_writes:
+        _emit_embedding_metric(
+            "skill_embedding_batch_prepare",
+            candidate_count=len(pending_writes),
+        )
+        embeddings = skill_store.embedding_service.embed_texts(
+            [document_text for _, document_text, _, _, _ in pending_writes],
+            task_type="RETRIEVAL_DOCUMENT",
+        )
+
+        for index, (skill, document_text, metadata, skill_id, skill_file) in enumerate(pending_writes):
+            try:
+                embedding = embeddings[index] if index < len(embeddings) else None
+                memory_id = skill_store.write_memory(
+                    text=document_text,
+                    metadata=metadata,
+                    memory_id=skill_id,
+                    embedding=embedding,
+                )
+                outcomes.append(
+                    {
+                        "status": "created",
+                        "skill_name": skill["name"],
+                        "memory_id": memory_id,
+                        "skill_file": skill_file,
+                    }
+                )
+            except Exception:
+                outcomes.append(
+                    {
+                        "status": "error",
+                        "skill_name": skill["name"],
+                        "memory_id": "",
+                        "skill_file": skill_file,
+                    }
+                )
+
+    return outcomes
+
+
+def _persist_skill_candidate(skill: dict[str, Any], history_file: str) -> dict[str, Any]:
+    outcomes = _persist_skill_candidates([skill], history_file)
+    if outcomes:
+        return outcomes[0]
     return {
-        "status": "created",
-        "skill_name": skill["name"],
-        "memory_id": memory_id,
-        "skill_file": skill_file,
+        "status": "error",
+        "skill_name": skill.get("name", ""),
+        "memory_id": "",
+        "skill_file": "",
     }
 
 def _extract_section_from_markdown(text: str, header: str) -> str:
@@ -962,7 +1274,7 @@ def run_skill_extraction_async(
             parsed_skills = _parse_skill_extraction_response(raw_response)
 
             if parsed_skills:
-                outcomes = [_persist_skill_candidate(skill=skill, history_file=history_file) for skill in parsed_skills]
+                outcomes = _persist_skill_candidates(parsed_skills, history_file=history_file)
                 history.append_history(
                     role="SkillExtractor",
                     text=json.dumps({"skills": parsed_skills, "outcomes": outcomes}, ensure_ascii=False),
@@ -1035,19 +1347,63 @@ def _parse_skill_extraction_response(response_text: str) -> list[dict[str, Any]]
     return normalized_candidates
 
 
-def build_relevant_skills_text(query: str, limit: int = 4) -> str:
+def _search_skill_records(
+    query: str,
+    limit: int,
+    retrieval_context: MemoryRetrievalContext | None = None,
+) -> list[MemoryItem]:
+    cleaned_query = (query or "").strip()
+    if not cleaned_query:
+        return []
+
+    normalized_limit = max(1, limit)
+    cache_key = (cleaned_query, normalized_limit)
+    if retrieval_context is not None:
+        cached_records = retrieval_context.skill_search_cache.get(cache_key)
+        if cached_records is not None:
+            return list(cached_records)
+
+    try:
+        skill_store = get_skill_store()
+        if skill_store.count() <= normalized_limit:
+            records = skill_store.read_all_memories(
+                limit=normalized_limit,
+                where={"record_type": "skill"},
+            )
+        else:
+            records = skill_store.search_memories_by_embedding(
+                query_embedding=_resolve_query_embedding(
+                    cleaned_query,
+                    skill_store.embedding_service,
+                    retrieval_context,
+                ),
+                limit=normalized_limit,
+                where={"record_type": "skill"},
+            )
+    except Exception:
+        return []
+
+    if retrieval_context is not None:
+        retrieval_context.skill_search_cache[cache_key] = list(records)
+    return records
+
+
+def build_relevant_skills_text(
+    query: str,
+    limit: int = 4,
+    retrieval_context: MemoryRetrievalContext | None = None,
+) -> str:
     cleaned_query = (query or "").strip()
     if not cleaned_query:
         return ""
 
-    try:
-        skills = get_skill_store().search_memories(
-            cleaned_query,
-            limit=max(1, limit),
-            where={"record_type": "skill"},
-        )
-    except Exception:
-        return ""
+    cache_key = (cleaned_query, max(1, limit))
+    if retrieval_context is not None:
+        cached_text = retrieval_context.relevant_skills_text_cache.get(cache_key)
+        if cached_text is not None:
+            return cached_text
+
+    skills = _search_skill_records(cleaned_query, limit=max(1, limit), retrieval_context=retrieval_context)
 
     sections: list[str] = []
     for item in skills:
@@ -1074,23 +1430,29 @@ def build_relevant_skills_text(query: str, limit: int = 4) -> str:
             )
         )
 
-    return "\n\n".join(sections)
+    rendered_text = "\n\n".join(sections)
+    if retrieval_context is not None:
+        retrieval_context.relevant_skills_text_cache[cache_key] = rendered_text
+    return rendered_text
 
 
-def build_skill_names_text(query: str, limit: int = 10) -> str:
+def build_skill_names_text(
+    query: str,
+    limit: int = 10,
+    retrieval_context: MemoryRetrievalContext | None = None,
+) -> str:
     """Return top relevant skill file paths for planner prompts using semantic search."""
     cleaned_query = (query or "").strip()
     if not cleaned_query:
         return ""
 
-    try:
-        records = get_skill_store().search_memories(
-            cleaned_query,
-            limit=max(1, limit),
-            where={"record_type": "skill"},
-        )
-    except Exception:
-        return ""
+    cache_key = (cleaned_query, max(1, limit))
+    if retrieval_context is not None:
+        cached_text = retrieval_context.skill_names_text_cache.get(cache_key)
+        if cached_text is not None:
+            return cached_text
+
+    records = _search_skill_records(cleaned_query, limit=max(1, limit), retrieval_context=retrieval_context)
 
     # Preserve relevance order from vector search while deduplicating by file path.
     seen: set[str] = set()
@@ -1105,7 +1467,10 @@ def build_skill_names_text(query: str, limit: int = 10) -> str:
     if not skill_files:
         return ""
 
-    return "\n".join(["Available reusable planning skill file paths:", *[f"- {skill_file}" for skill_file in skill_files]])
+    rendered_text = "\n".join(["Available reusable planning skill file paths:", *[f"- {skill_file}" for skill_file in skill_files]])
+    if retrieval_context is not None:
+        retrieval_context.skill_names_text_cache[cache_key] = rendered_text
+    return rendered_text
 
 
 def run_memory_extraction_async(
@@ -1158,6 +1523,7 @@ def run_memory_extraction_async(
             raw_response = (memory_extractor_response or "").strip()
             parsed_candidates = _parse_memory_extraction_response(raw_response)
             if parsed_candidates:
+                semantic_memory_items: list[tuple[str, dict[str, Any]]] = []
                 for candidate in parsed_candidates:
                     metadata = {
                         "source_type": "memory_extractor",
@@ -1166,7 +1532,9 @@ def run_memory_extraction_async(
                     }
                     if candidate["related_file_ids"]:
                         metadata["related_file_ids_json"] = json.dumps(candidate["related_file_ids"], ensure_ascii=False)
-                    write_semantic_memory(candidate["memory"], metadata=metadata)
+                    semantic_memory_items.append((candidate["memory"], metadata))
+
+                write_semantic_memories(semantic_memory_items)
                 history.append_history(
                     role="MemoryExtractor",
                     text=json.dumps({"memories": parsed_candidates}, ensure_ascii=False),
@@ -1255,39 +1623,177 @@ def render_memory_for_prompt(memory_item: MemoryItem) -> str:
     )
 
 
-def search_all_memories(query: str, semantic_limit: int = 5, file_limit: int = 3) -> list[MemoryItem]:
+def search_all_memories(
+    query: str,
+    semantic_limit: int = 5,
+    file_limit: int = 3,
+    retrieval_context: MemoryRetrievalContext | None = None,
+) -> list[MemoryItem]:
     """Query semantic and file memories together."""
-    combined: list[MemoryItem] = []
-    combined.extend(
-        get_default_store().search_memories(
-            query,
-            limit=semantic_limit,
-            where={"record_type": "semantic_memory"},
+    cleaned_query = (query or "").strip()
+    if not cleaned_query:
+        return []
+
+    cache_key = (cleaned_query, semantic_limit, file_limit)
+    if retrieval_context is not None:
+        cached_memories = retrieval_context.search_all_memories_cache.get(cache_key)
+        if cached_memories is not None:
+            _emit_embedding_metric(
+                "search_all_memories_cache_hit",
+                query_chars=len(cleaned_query),
+                semantic_limit=semantic_limit,
+                file_limit=file_limit,
+            )
+            return list(cached_memories)
+
+        _emit_embedding_metric(
+            "search_all_memories_cache_miss",
+            query_chars=len(cleaned_query),
+            semantic_limit=semantic_limit,
+            file_limit=file_limit,
         )
-    )
-    combined.extend(get_attachment_store().search_memories(query, limit=file_limit))
+
+    semantic_store = get_default_store()
+    attachment_store = get_attachment_store()
+    shared_query_embedding: list[float] | None = None
+
+    def _get_shared_query_embedding() -> list[float]:
+        nonlocal shared_query_embedding
+        if shared_query_embedding is None:
+            shared_query_embedding = _resolve_query_embedding(
+                cleaned_query,
+                semantic_store.embedding_service,
+                retrieval_context,
+            )
+        return shared_query_embedding
+
+    combined: list[MemoryItem] = []
+    if semantic_store.count() <= semantic_limit:
+        combined.extend(
+            semantic_store.read_all_memories(
+                limit=semantic_limit,
+                where={"record_type": "semantic_memory"},
+            )
+        )
+    else:
+        combined.extend(
+            semantic_store.search_memories_by_embedding(
+                _get_shared_query_embedding(),
+                limit=semantic_limit,
+                where={"record_type": "semantic_memory"},
+            )
+        )
+
+    if attachment_store.count() <= file_limit:
+        combined.extend(attachment_store.read_all_memories(limit=file_limit))
+    else:
+        combined.extend(
+            attachment_store.search_memories_by_embedding(
+                _get_shared_query_embedding(),
+                limit=file_limit,
+            )
+        )
+    if retrieval_context is not None:
+        retrieval_context.search_all_memories_cache[cache_key] = list(combined)
     return combined
 
 
+def _find_existing_semantic_memory(
+    semantic_store: VectorMemoryStore,
+    normalized_text_hash: str,
+    normalized_text: str,
+) -> MemoryItem | None:
+    existing_memories = semantic_store.read_all_memories(
+        limit=1,
+        where={
+            "$and": [
+                {"record_type": "semantic_memory"},
+                {"normalized_text_hash": normalized_text_hash},
+            ]
+        },
+    )
+    for item in existing_memories:
+        if _normalize_text(item.text) == normalized_text:
+            return item
+    return None
+
+
+def write_semantic_memories(
+    items: list[tuple[str, dict[str, Any] | None]],
+) -> list[str]:
+    """Write semantic memories with exact deduplication and batched embeddings."""
+    semantic_store = get_default_store()
+    pending_writes: list[tuple[str, dict[str, Any], str]] = []
+    seen_hashes: set[str] = set()
+    written_ids: list[str] = []
+
+    for text, metadata in items:
+        cleaned_text = (text or "").strip()
+        if not cleaned_text:
+            continue
+
+        normalized_text = _normalize_text(cleaned_text)
+        normalized_text_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+        if normalized_text_hash in seen_hashes:
+            continue
+        seen_hashes.add(normalized_text_hash)
+
+        existing_memory = _find_existing_semantic_memory(
+            semantic_store=semantic_store,
+            normalized_text_hash=normalized_text_hash,
+            normalized_text=normalized_text,
+        )
+        if existing_memory is not None:
+            written_ids.append(existing_memory.memory_id)
+            continue
+
+        final_metadata = dict(metadata or {})
+        final_metadata.setdefault("record_type", "semantic_memory")
+        final_metadata.setdefault("normalized_text_hash", normalized_text_hash)
+        pending_writes.append((cleaned_text, final_metadata, normalized_text_hash))
+
+    _emit_embedding_metric(
+        "semantic_memory_batch_prepare",
+        input_count=len(items),
+        pending_write_count=len(pending_writes),
+        dedup_hit_count=max(0, len(items) - len(pending_writes)),
+    )
+
+    if not pending_writes:
+        return written_ids
+
+    batched_embeddings = semantic_store.embedding_service.embed_texts(
+        [text for text, _, _ in pending_writes],
+        task_type="RETRIEVAL_DOCUMENT",
+    )
+
+    for index, (cleaned_text, final_metadata, normalized_text_hash) in enumerate(pending_writes):
+        embedding = batched_embeddings[index] if index < len(batched_embeddings) else None
+        memory_id = semantic_store.write_memory(
+            cleaned_text,
+            metadata=final_metadata,
+            memory_id=normalized_text_hash,
+            embedding=embedding,
+        )
+        written_ids.append(memory_id)
+
+    _emit_embedding_metric(
+        "semantic_memory_batch_complete",
+        written_count=len(written_ids),
+        embedded_count=len(pending_writes),
+    )
+
+    return written_ids
+
+
 def write_semantic_memory(text: str, metadata: dict[str, Any] | None = None) -> str | None:
-    """Write a semantic memory if it is not an exact normalized duplicate."""
+    """Write one semantic memory if it is not an exact normalized duplicate."""
     cleaned_text = (text or "").strip()
     if not cleaned_text:
         return None
 
-    existing = get_default_store().search_memories(
-        cleaned_text,
-        limit=5,
-        where={"record_type": "semantic_memory"},
-    )
-    normalized_candidate = _normalize_text(cleaned_text)
-    for item in existing:
-        if _normalize_text(item.text) == normalized_candidate:
-            return item.memory_id
-
-    final_metadata = dict(metadata or {})
-    final_metadata.setdefault("record_type", "semantic_memory")
-    return get_default_store().write_memory(cleaned_text, metadata=final_metadata)
+    written_ids = write_semantic_memories([(cleaned_text, metadata)])
+    return written_ids[0] if written_ids else None
 
 
 def read_all_memory_records(limit: int | None = None) -> list[MemoryItem]:

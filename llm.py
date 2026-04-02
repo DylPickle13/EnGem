@@ -120,6 +120,10 @@ def generate_response(
 
     _append_history_and_update(role="user", text=user_message)
 
+    retrieval_context = memory.create_retrieval_context()
+    retrieval_query = (user_message or "").strip() or current_history_text
+    skills_query = (user_message or "").strip() or retrieval_query
+
     active_history_cache = create_history_context_cache(
         history_file=history_file,
         history_text=current_history_text,
@@ -129,13 +133,15 @@ def generate_response(
 
     if not job:
         relevant_memories_text = memory.build_relevant_memories_text(
-            current_history_text,
+            retrieval_query,
             semantic_limit=5,
             file_limit=3,
+            retrieval_context=retrieval_context,
         )
         relevant_skills_text = memory.build_relevant_skills_text(
-            user_message,
+            skills_query,
             limit=5,
+            retrieval_context=retrieval_context,
         )
 
         intent_system_instructions = INTENT_FILE.read_text(encoding="utf-8") + relevant_memories_text
@@ -170,9 +176,10 @@ def generate_response(
                 )
                 try:
                     relevant_memories_history = memory.build_relevant_memories_text(
-                        current_history_text,
+                        retrieval_query,
                         semantic_limit=10,
                         file_limit=4,
+                        retrieval_context=retrieval_context,
                     )
                     memory.run_memory_extraction_async(
                         history_file=history_file,
@@ -260,7 +267,11 @@ def generate_response(
         if not planner_phase_ready:
             try:
                 planner_history_text = current_history_text
-                planner_skill_names = memory.build_skill_names_text(query=user_message, limit=10)
+                planner_skill_names = memory.build_skill_names_text(
+                    query=skills_query,
+                    limit=10,
+                    retrieval_context=retrieval_context,
+                )
                 planner_system_instructions = PLANNER_FILE.read_text(encoding="utf-8") + history_file
                 if planner_skill_names:
                     planner_system_instructions += "\n\n" + planner_skill_names
@@ -516,9 +527,10 @@ def generate_response(
 
         if not job:
             relevant_memories_history = memory.build_relevant_memories_text(
-                current_history_text,
+                retrieval_query,
                 semantic_limit=10,
                 file_limit=4,
+                retrieval_context=retrieval_context,
             )
             memory.run_memory_extraction_async(
                 history_file=history_file,

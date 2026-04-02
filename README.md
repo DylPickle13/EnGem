@@ -41,7 +41,8 @@ python -m playwright install
 - `PAID_GEMINI_API_KEY` — Gemini API key used for model calls and embeddings.
 - `DISCORD_ALLOWED_CHANNELS` — Optional comma-separated channel names to limit bot activity.
 - `MODEL` — Default model alias (configured in `config.py` with presets like `MINIMAL_MODEL`, `LOW_MODEL`, `MEDIUM_MODEL`, `HIGH_MODEL`).
-- Embedding/memory settings: `GEMINI_EMBEDDING_MODEL`, `GEMINI_EMBEDDING_DIM`, `GEMINI_EMBEDDING_BATCH_SIZE`, `MEMORY_SEMANTIC_COLLECTION_NAME`, `MEMORY_FILE_COLLECTION_NAME`, `MEMORY_ARCHIVE_DIR`.
+- Embedding/memory settings: `GEMINI_EMBEDDING_MODEL`, `GEMINI_EMBEDDING_DIM`, `GEMINI_EMBEDDING_BATCH_SIZE`, `MEMORY_SEMANTIC_COLLECTION_NAME`, `MEMORY_FILE_COLLECTION_NAME`, `MEMORY_ARCHIVE_DIR`, `ATTACHMENT_EMBEDDING_MODE` (`multimodal_fallback_text|text_only|off`), `ATTACHMENT_EMBEDDING_MAX_BYTES`, `ATTACHMENT_MULTIMODAL_MAX_BYTES`.
+- Optional metrics flag: `CACHE_METRICS_ENABLED=1` to emit cache and embedding metrics to `logs/cache_metrics.jsonl`.
 
 Important: `config.py` contains convenience defaults. Keep secrets out of source control — use environment variables or a secrets manager.
 
