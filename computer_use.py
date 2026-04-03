@@ -1,12 +1,23 @@
+import json
+import logging
 import time
 import threading
 from pathlib import Path
+from typing import Any
 from google import genai
 from google.genai import types
 from google.genai.types import Content, Part
 from playwright.sync_api import Browser, Page, Playwright, sync_playwright
 
-from config import get_paid_gemini_api_key as get_paid_gemini_api_key, MEDIUM_MODEL as MEDIUM_MODEL
+from config import (
+    BOT_RUNTIME_STATE_PATH,
+    DEFAULT_INFERENCE_MODE,
+    FLEX_REQUEST_TIMEOUT_MS,
+    INFERENCE_MODE_ALLOWED,
+    INFERENCE_MODE_FLEX,
+    MEDIUM_MODEL,
+    get_paid_gemini_api_key as get_paid_gemini_api_key,
+)
 from api_backoff import call_with_exponential_backoff
 
 BROWSER_FILE = Path(__file__).parent / "agent_instructions/browser.md"
@@ -14,13 +25,18 @@ SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1080
 TURN_LIMIT = 50
 MODEL_NAME = MEDIUM_MODEL
-ALT_MODEL_NAME = "gemini-2.5-computer-use-preview-10-2025"
+ALT_MODEL_NAME = ""
 DEBUG_SCROLL = False
 DEFAULT_SCROLL_DELTA = 600
 DEFAULT_DOCUMENT_SCROLL_AMOUNT = 800
 
 _PLAYWRIGHT_INSTANCES: dict[int, Playwright] = {}
 _BROWSER_INSTANCES: dict[int, Browser] = {}
+BOT_RUNTIME_STATE_FILE = Path(BOT_RUNTIME_STATE_PATH)
+_GENERATE_CONTENT_CONFIG_FIELDS = set(getattr(types.GenerateContentConfig, "__annotations__", {}).keys()) | set(
+    dir(types.GenerateContentConfig)
+)
+_GENERATE_CONTENT_CONFIG_SUPPORTS_SERVICE_TIER = "service_tier" in _GENERATE_CONTENT_CONFIG_FIELDS
 
 
 def _select_model_for_loop(prompt: str) -> str:
@@ -32,6 +48,38 @@ def _select_model_for_loop(prompt: str) -> str:
         return model_pool[0]
     key = f"{threading.get_ident()}::{prompt}"
     return model_pool[abs(hash(key)) % len(model_pool)]
+
+
+def _normalize_inference_mode(raw_mode: object) -> str:
+    if isinstance(raw_mode, str):
+        normalized = raw_mode.strip().lower()
+        if normalized in INFERENCE_MODE_ALLOWED:
+            return normalized
+    return DEFAULT_INFERENCE_MODE
+
+
+def _load_inference_mode_state() -> str:
+    if not BOT_RUNTIME_STATE_FILE.exists():
+        return DEFAULT_INFERENCE_MODE
+
+    try:
+        payload = json.loads(BOT_RUNTIME_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.warning(
+            "Failed to read bot runtime state '%s': %s. Falling back to default mode.",
+            BOT_RUNTIME_STATE_FILE,
+            exc,
+        )
+        return DEFAULT_INFERENCE_MODE
+
+    if not isinstance(payload, dict):
+        logging.warning(
+            "Bot runtime state '%s' is invalid (expected object). Falling back to default mode.",
+            BOT_RUNTIME_STATE_FILE,
+        )
+        return DEFAULT_INFERENCE_MODE
+
+    return _normalize_inference_mode(payload.get("inference_mode"))
 
 
 def denormalize_x(x: int, screen_width: int) -> int:
@@ -471,15 +519,69 @@ def create_client() -> genai.Client:
     return genai.Client(api_key=get_paid_gemini_api_key())
 
 
-def create_model_config() -> types.GenerateContentConfig:
-    config = types.GenerateContentConfig(
-        tools=[types.Tool(computer_use=types.ComputerUse(
-            environment=types.Environment.ENVIRONMENT_BROWSER
-        ))],
-        thinking_config=types.ThinkingConfig(include_thoughts=True),
-        system_instruction=BROWSER_FILE.read_text(encoding="utf-8")
+def _build_flex_http_options(
+    timeout_ms: int,
+    *,
+    include_service_tier_fallback: bool,
+) -> types.HttpOptions | dict[str, Any]:
+    http_options_kwargs: dict[str, Any] = {
+        "timeout": timeout_ms,
+    }
+    if include_service_tier_fallback:
+        http_options_kwargs["extra_body"] = {"service_tier": INFERENCE_MODE_FLEX}
+
+    try:
+        return types.HttpOptions(**http_options_kwargs)
+    except TypeError:
+        return http_options_kwargs
+
+
+def _build_generate_content_config(
+    *,
+    inference_mode: str,
+    base_kwargs: dict[str, Any],
+) -> types.GenerateContentConfig:
+    if inference_mode != INFERENCE_MODE_FLEX:
+        return types.GenerateContentConfig(**base_kwargs)
+
+    if _GENERATE_CONTENT_CONFIG_SUPPORTS_SERVICE_TIER:
+        try:
+            return types.GenerateContentConfig(
+                **base_kwargs,
+                service_tier=INFERENCE_MODE_FLEX,
+                http_options=_build_flex_http_options(
+                    FLEX_REQUEST_TIMEOUT_MS,
+                    include_service_tier_fallback=False,
+                ),
+            )
+        except TypeError:
+            pass
+
+    return types.GenerateContentConfig(
+        **base_kwargs,
+        http_options=_build_flex_http_options(
+            FLEX_REQUEST_TIMEOUT_MS,
+            include_service_tier_fallback=True,
+        ),
     )
-    return config
+
+
+def create_model_config(inference_mode: str | None = None) -> types.GenerateContentConfig:
+    active_inference_mode = _normalize_inference_mode(inference_mode or _load_inference_mode_state())
+    return _build_generate_content_config(
+        inference_mode=active_inference_mode,
+        base_kwargs={
+            "tools": [
+                types.Tool(
+                    computer_use=types.ComputerUse(
+                        environment=types.Environment.ENVIRONMENT_BROWSER,
+                    )
+                )
+            ],
+            "thinking_config": types.ThinkingConfig(include_thoughts=True),
+            "system_instruction": BROWSER_FILE.read_text(encoding="utf-8"),
+        },
+    )
 
 
 def setup_browser() -> tuple[Playwright, Browser, Page]:
@@ -517,7 +619,8 @@ def setup_browser() -> tuple[Playwright, Browser, Page]:
 
 def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
     #print("Prompt:", prompt)
-    config = create_model_config()
+    active_inference_mode = _load_inference_mode_state()
+    config = create_model_config(active_inference_mode)
     initial_screenshot = page.screenshot(type="png")
     model_to_use = _select_model_for_loop(prompt)
     #print(f"Using model for this loop: {model_to_use}")

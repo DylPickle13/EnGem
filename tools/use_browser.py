@@ -1,7 +1,6 @@
 from pathlib import Path
 import sys
 import computer_use
-import llm
 
 # Ensure repository root is on sys.path so top-level modules (like config)
 # can be imported when this module is run directly.

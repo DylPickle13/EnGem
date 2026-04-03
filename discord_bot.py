@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import mimetypes
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -6,8 +7,13 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from config import (
+	BOT_RUNTIME_STATE_PATH,
+	DEFAULT_INFERENCE_MODE,
 	DISCORD_BOT_CHANNELS,
 	DISCORD_BOT_TOKEN,
+	INFERENCE_MODE_ALLOWED,
+	INFERENCE_MODE_FLEX,
+	INFERENCE_MODE_STANDARD,
 )
 
 import discord
@@ -27,6 +33,15 @@ MESSAGE_WORKER_CONCURRENCY = 3
 CALENDAR_EVENT_ENQUEUE_TIMEOUT_SECONDS = 30
 CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+BOT_RUNTIME_STATE_FILE = Path(BOT_RUNTIME_STATE_PATH)
+
+
+def _normalize_inference_mode(mode: object) -> str:
+	if isinstance(mode, str):
+		normalized = mode.strip().lower()
+		if normalized in INFERENCE_MODE_ALLOWED:
+			return normalized
+	return DEFAULT_INFERENCE_MODE
 
 
 def _sanitize_history_filename_component(value: str | None) -> str:
@@ -88,6 +103,9 @@ class DiscordBotWrapper:
 			message_limit=DISCORD_MESSAGE_LIMIT
 		)
 		self._gaming_dogs_helper = gaming_dogs_helper_bot.GamingDogsChannelHelper()
+		self._runtime_state_file = BOT_RUNTIME_STATE_FILE
+		self._inference_mode_lock = asyncio.Lock()
+		self._inference_mode = self._load_inference_mode_state()
 
 		intents = discord.Intents.default()
 		intents.message_content = True
@@ -100,9 +118,56 @@ class DiscordBotWrapper:
 	def _is_job_message(message: object) -> bool:
 		return bool(getattr(message, "job", False))
 
+	def _load_inference_mode_state(self) -> str:
+		if not self._runtime_state_file.exists():
+			return DEFAULT_INFERENCE_MODE
+
+		try:
+			payload = json.loads(self._runtime_state_file.read_text(encoding="utf-8"))
+		except Exception as exc:
+			logging.warning(
+				"Failed to read bot runtime state '%s': %s. Falling back to default mode.",
+				self._runtime_state_file,
+				exc,
+			)
+			return DEFAULT_INFERENCE_MODE
+
+		if not isinstance(payload, dict):
+			logging.warning(
+				"Bot runtime state '%s' is invalid (expected object). Falling back to default mode.",
+				self._runtime_state_file,
+			)
+			return DEFAULT_INFERENCE_MODE
+
+		return _normalize_inference_mode(payload.get("inference_mode"))
+
+	def _save_inference_mode_state(self, mode: str) -> None:
+		normalized_mode = _normalize_inference_mode(mode)
+		self._runtime_state_file.parent.mkdir(parents=True, exist_ok=True)
+
+		payload = {
+			"inference_mode": normalized_mode,
+		}
+		temp_state_file = self._runtime_state_file.with_name(self._runtime_state_file.name + ".tmp")
+		temp_state_file.write_text(
+			json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+			encoding="utf-8",
+		)
+		temp_state_file.replace(self._runtime_state_file)
+
+	async def _set_inference_mode(self, requested_mode: str) -> tuple[bool, str]:
+		normalized_mode = _normalize_inference_mode(requested_mode)
+		async with self._inference_mode_lock:
+			if normalized_mode == self._inference_mode:
+				return False, self._inference_mode
+			self._save_inference_mode_state(normalized_mode)
+			self._inference_mode = normalized_mode
+			return True, self._inference_mode
+
 	async def _default_responder(self, text: str, message: discord.Message) -> llm.LLMResponse:
 		history_file = _get_history_file_key_for_channel(message.channel)
 		is_job = self._is_job_message(message)
+		inference_mode = self._inference_mode
 		media_payloads = await self._read_media_attachments(message)
 		execution_plan_notifier = self._progress_indicator.build_execution_plan_notifier(
 			loop=self.client.loop,
@@ -116,6 +181,7 @@ class DiscordBotWrapper:
 			history_file,
 			media_payloads,
 			execution_plan_notifier,
+			inference_mode,
 		)
 
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
@@ -457,17 +523,76 @@ class DiscordBotWrapper:
 
 	async def _try_handle_command(self, message: discord.Message) -> bool:
 		content = (message.content or "").strip()
+		content_lower = content.lower()
 		history_file = _get_history_file_key_for_channel(message.channel)
 
 		if content == f"{self.command_prefix}commands":
 			await message.channel.send(
 				"Available commands:\n"
 				f"- {self.command_prefix}commands\n"
+				f"- {self.command_prefix}inference mode\n"
+				f"- {self.command_prefix}inference mode standard\n"
+				f"- {self.command_prefix}inference mode flex\n"
 				f"- {self.command_prefix}history length\n"
 				f"- {self.command_prefix}clear history\n"
 				f"- {self.command_prefix}clear memory\n"
 				f"- {self.command_prefix}forget memories {{topic}}\n"
 				f"- {self.command_prefix}list memories [limit]\n"
+			)
+			return True
+
+		if content_lower in {f"{self.command_prefix}inference mode", f"{self.command_prefix}mode"}:
+			await message.channel.send(
+				f"Inference mode is currently '{self._inference_mode}'. This setting persists across restarts."
+			)
+			return True
+
+		if content_lower in {
+			f"{self.command_prefix}inference mode standard",
+			f"{self.command_prefix}set inference mode standard",
+		}:
+			try:
+				changed, active_mode = await self._set_inference_mode(INFERENCE_MODE_STANDARD)
+			except Exception as exc:
+				logging.exception("Failed updating inference mode.")
+				await message.channel.send(f"Failed to set inference mode: {exc}")
+				return True
+
+			if changed:
+				await message.channel.send(
+					f"Inference mode set to {active_mode}. This setting persists across restarts."
+				)
+			else:
+				await message.channel.send(f"Inference mode is already {active_mode}.")
+			return True
+
+		if content_lower in {
+			f"{self.command_prefix}inference mode flex",
+			f"{self.command_prefix}set inference mode flex",
+		}:
+			try:
+				changed, active_mode = await self._set_inference_mode(INFERENCE_MODE_FLEX)
+			except Exception as exc:
+				logging.exception("Failed updating inference mode.")
+				await message.channel.send(f"Failed to set inference mode: {exc}")
+				return True
+
+			if changed:
+				await message.channel.send(
+					f"Inference mode set to {active_mode}. This setting persists across restarts."
+				)
+			else:
+				await message.channel.send(f"Inference mode is already {active_mode}.")
+			return True
+
+		if content_lower.startswith(f"{self.command_prefix}inference mode") or content_lower.startswith(
+			f"{self.command_prefix}set inference mode"
+		):
+			await message.channel.send(
+				"Usage:\n"
+				f"- {self.command_prefix}inference mode\n"
+				f"- {self.command_prefix}inference mode standard\n"
+				f"- {self.command_prefix}inference mode flex"
 			)
 			return True
 

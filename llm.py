@@ -11,6 +11,7 @@ from progress_indicator import normalize_plan_thinking_level as _normalize_plan_
 import attachments
 import collect_generated_media
 from config import get_paid_gemini_api_key as get_paid_gemini_api_key
+from config import DEFAULT_INFERENCE_MODE as DEFAULT_INFERENCE_MODE, FLEX_REQUEST_TIMEOUT_MS as FLEX_REQUEST_TIMEOUT_MS, INFERENCE_MODE_ALLOWED as INFERENCE_MODE_ALLOWED, INFERENCE_MODE_FLEX as INFERENCE_MODE_FLEX
 from config import MINIMAL_MODEL as MINIMAL_MODEL, LOW_MODEL as LOW_MODEL, MEDIUM_MODEL as MEDIUM_MODEL, HIGH_MODEL as HIGH_MODEL
 from api_backoff import call_with_exponential_backoff
 from history_cache import CachedContentProfile, HistoryContextCache, compose_uncached_history_prompt, create_cached_content_profile, create_history_context_cache, emit_cache_metric, resolve_history_cached_prompt
@@ -64,6 +65,10 @@ THINKING_LEVEL_TO_API_LEVEL = {
 }
 
 client = genai.Client(api_key=get_paid_gemini_api_key())
+_GENERATE_CONTENT_CONFIG_FIELDS = set(getattr(types.GenerateContentConfig, "__annotations__", {}).keys()) | set(
+    dir(types.GenerateContentConfig)
+)
+_GENERATE_CONTENT_CONFIG_SUPPORTS_SERVICE_TIER = "service_tier" in _GENERATE_CONTENT_CONFIG_FIELDS
 
 
 @dataclass
@@ -78,6 +83,7 @@ def generate_response(
     history_file: str,
     image: dict[str, bytes | str] | list[dict[str, bytes | str]] | None = None,
     execution_plan_notifier: Callable[..., None] | None = None,
+    inference_mode: str = DEFAULT_INFERENCE_MODE,
 ) -> LLMResponse:
     """
     Main function to generate a response from the model based on the user's message,
@@ -91,6 +97,7 @@ def generate_response(
     default_temperature = 1.0
     temperature = default_temperature
     attempt_number = 1
+    request_inference_mode = _normalize_inference_mode(inference_mode)
     normalized_attachments = attachments.normalize_attachments(image)
     attachment_text, attachment_memory_context = attachments.ingest_attachments_for_memory(
         normalized_attachments,
@@ -160,6 +167,7 @@ def generate_response(
                 thinking_level="low",
                 history_cache=active_history_cache,
                 current_history_text=current_history_text,
+                inference_mode=request_inference_mode,
             )
         except Exception as e:
             print(f"Error generating intent response: {e}")
@@ -267,12 +275,20 @@ def generate_response(
         if not planner_phase_ready:
             try:
                 planner_history_text = current_history_text
+                planner_relevant_memories_text = memory.build_relevant_memories_text(
+                    retrieval_query,
+                    semantic_limit=5,
+                    file_limit=3,
+                    retrieval_context=retrieval_context,
+                )
                 planner_skill_names = memory.build_skill_names_text(
                     query=skills_query,
                     limit=10,
                     retrieval_context=retrieval_context,
                 )
                 planner_system_instructions = PLANNER_FILE.read_text(encoding="utf-8") + history_file
+                if planner_relevant_memories_text:
+                    planner_system_instructions += planner_relevant_memories_text
                 if planner_skill_names:
                     planner_system_instructions += "\n\n" + planner_skill_names
 
@@ -286,10 +302,11 @@ def generate_response(
                     thinking_level="high",
                     history_cache=active_history_cache,
                     current_history_text=planner_history_text,
+                    inference_mode=request_inference_mode,
                 )
                 _append_history_and_update(
                     role=PLANNER_MANAGER_TASK_NAME,
-                    text=f"{planner_order_file} created. \nRelevant skills: {planner_skill_names}",
+                    text=f"{planner_order_file} created. \nRelevant skills: {planner_skill_names} \nRelevant memories: {planner_relevant_memories_text}",
                 )
             except Exception as e:
                 print(f"Error generating planner manager response: {e}")
@@ -340,7 +357,9 @@ def generate_response(
                     default_temperature,
                     history_cache=active_history_cache,
                     current_history_text=latest_history_text,
+                    inference_mode=request_inference_mode,
                 ),
+                inference_mode=request_inference_mode,
             )
 
             if "<ready>" not in (planner_exit_string or "").lower():
@@ -389,6 +408,7 @@ def generate_response(
                 thinking_level="high",
                 history_cache=active_history_cache,
                 current_history_text=execution_history_text,
+                inference_mode=request_inference_mode,
             )
             _append_history_and_update(
                 role=EXECUTION_MANAGER_TASK_NAME,
@@ -452,7 +472,9 @@ def generate_response(
                 default_temperature,
                 history_cache=active_history_cache,
                 current_history_text=latest_history_text,
+                inference_mode=request_inference_mode,
             ),
+            inference_mode=request_inference_mode,
         )
 
         if not exit_string:
@@ -500,6 +522,7 @@ def generate_response(
                 thinking_level="low",
                 history_cache=post_review_cache,
                 current_history_text=post_review_cache.history_text,
+                inference_mode=request_inference_mode,
             )
             media_future = executor.submit(
                 collect_generated_media.select_media_paths,
@@ -753,6 +776,7 @@ def _run_sub_agent_plan(
     history_cache: HistoryContextCache,
     final_agent_task_name: str,
     final_agent_runner: Callable[[str], str],
+    inference_mode: str = DEFAULT_INFERENCE_MODE,
 ) -> tuple[str, str]:
     sub_agent_system_instructions = SUB_AGENT_FILE.read_text(encoding="utf-8")
     final_agent_output = ""
@@ -797,6 +821,7 @@ def _run_sub_agent_plan(
                     thinking_level=api_thinking_level,
                     history_cache=history_cache,
                     current_history_text=stage_history,
+                    inference_mode=inference_mode,
                 )
 
             with ThreadPoolExecutor(max_workers=min(len(agents), 8)) as executor:
@@ -834,6 +859,7 @@ def _run_sub_agent_plan(
                             thinking_level=api_thinking_level,
                             history_cache=history_cache,
                             current_history_text=current_history_text,
+                            inference_mode=inference_mode,
                         )
 
                     _append_history_and_update(role=agent["task_name"], text=sub_agent_response)
@@ -849,6 +875,7 @@ def _run_planner_reviewer(
     temperature: float,
     history_cache: HistoryContextCache | None = None,
     current_history_text: str | None = None,
+    inference_mode: str = DEFAULT_INFERENCE_MODE,
 ) -> str:
     if history_cache is not None:
         return _run_model_api(
@@ -861,6 +888,7 @@ def _run_planner_reviewer(
             thinking_level="low",
             history_cache=history_cache,
             current_history_text=current_history_text,
+            inference_mode=inference_mode,
         )
 
     return _run_model_api(
@@ -871,6 +899,7 @@ def _run_planner_reviewer(
         force_tool="",
         temperature=temperature,
         thinking_level="low",
+        inference_mode=inference_mode,
     )
 
 
@@ -880,6 +909,7 @@ def _run_final_reviewer(
     temperature: float,
     history_cache: HistoryContextCache | None = None,
     current_history_text: str | None = None,
+    inference_mode: str = DEFAULT_INFERENCE_MODE,
 ) -> str:
     if history_cache is not None:
         return _run_model_api(
@@ -892,6 +922,7 @@ def _run_final_reviewer(
             thinking_level="low",
             history_cache=history_cache,
             current_history_text=current_history_text,
+            inference_mode=inference_mode,
         )
 
     return _run_model_api(
@@ -902,6 +933,7 @@ def _run_final_reviewer(
         force_tool="",
         temperature=temperature,
         thinking_level="low",
+        inference_mode=inference_mode,
     )
 
 
@@ -911,6 +943,14 @@ def _normalize_api_thinking_level(raw_level: object) -> str:
         if normalized in {"low", "medium", "high"}:
             return normalized
     return "high"
+
+
+def _normalize_inference_mode(raw_mode: object) -> str:
+    if isinstance(raw_mode, str):
+        normalized = raw_mode.strip().lower()
+        if normalized in INFERENCE_MODE_ALLOWED:
+            return normalized
+    return DEFAULT_INFERENCE_MODE
 
 
 def _normalize_force_tool_name(raw_force_tool: object) -> str:
@@ -1045,6 +1085,7 @@ def _extract_usage_metadata(response: object) -> dict[str, Any]:
         "candidates_token_count",
         "input_token_count",
         "output_token_count",
+        "traffic_type",
     ):
         field_value = getattr(usage_metadata, field_name, None)
         if field_value is not None:
@@ -1065,6 +1106,54 @@ def _extract_usage_metadata(response: object) -> dict[str, Any]:
     return {"raw": str(usage_metadata)}
 
 
+def _build_flex_http_options(
+    timeout_ms: int,
+    *,
+    include_service_tier_fallback: bool,
+) -> types.HttpOptions | dict[str, Any]:
+    http_options_kwargs: dict[str, Any] = {
+        "timeout": timeout_ms,
+    }
+    if include_service_tier_fallback:
+        http_options_kwargs["extra_body"] = {"service_tier": INFERENCE_MODE_FLEX}
+
+    try:
+        return types.HttpOptions(**http_options_kwargs)
+    except TypeError:
+        return http_options_kwargs
+
+
+def _build_generate_content_config(
+    *,
+    config_kwargs: dict[str, Any],
+    inference_mode: str,
+    flex_timeout_ms: int,
+) -> types.GenerateContentConfig:
+    if inference_mode != INFERENCE_MODE_FLEX:
+        return types.GenerateContentConfig(**config_kwargs)
+
+    if _GENERATE_CONTENT_CONFIG_SUPPORTS_SERVICE_TIER:
+        try:
+            return types.GenerateContentConfig(
+                **config_kwargs,
+                service_tier=INFERENCE_MODE_FLEX,
+                http_options=_build_flex_http_options(
+                    flex_timeout_ms,
+                    include_service_tier_fallback=False,
+                ),
+            )
+        except TypeError:
+            pass
+
+    return types.GenerateContentConfig(
+        **config_kwargs,
+        http_options=_build_flex_http_options(
+            flex_timeout_ms,
+            include_service_tier_fallback=True,
+        ),
+    )
+
+
 def _run_model_api(
     text: str,
     system_instructions: str,
@@ -1075,6 +1164,8 @@ def _run_model_api(
     thinking_level: str = "high",
     history_cache: HistoryContextCache | None = None,
     current_history_text: str | None = None,
+    inference_mode: str = DEFAULT_INFERENCE_MODE,
+    flex_timeout_ms: int = FLEX_REQUEST_TIMEOUT_MS,
 ) -> str:
     """
     Helper function to call the model API with the given text and system instructions, and return the generated response.
@@ -1089,6 +1180,7 @@ def _run_model_api(
         tool_use_allowed=tool_use_allowed,
         force_tool=force_tool,
     )
+    active_inference_mode = _normalize_inference_mode(inference_mode)
 
     if model == MINIMAL_MODEL and "2.5" in MINIMAL_MODEL:
         thinking_config = types.ThinkingConfig(thinking_budget=24576)
@@ -1116,21 +1208,33 @@ def _run_model_api(
         prompt_text = compose_uncached_history_prompt(current_history_text, text)
 
     if cached_content_name:
-        config = types.GenerateContentConfig(
-            temperature=temperature,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=bool(forced_tool_name)),
-            thinking_config=thinking_config,
-            cached_content=cached_content_name,
+        config = _build_generate_content_config(
+            config_kwargs={
+                "temperature": temperature,
+                "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                    disable=bool(forced_tool_name)
+                ),
+                "thinking_config": thinking_config,
+                "cached_content": cached_content_name,
+            },
+            inference_mode=active_inference_mode,
+            flex_timeout_ms=flex_timeout_ms,
         )
     else:
-        config = types.GenerateContentConfig(
-            system_instruction=effective_system_instructions,
-            tool_config=cache_tool_config,
-            tools=cache_tools or [],
-            temperature=temperature,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=bool(forced_tool_name)),
-            thinking_config=thinking_config,
-            cached_content=None,
+        config = _build_generate_content_config(
+            config_kwargs={
+                "system_instruction": effective_system_instructions,
+                "tool_config": cache_tool_config,
+                "tools": cache_tools or [],
+                "temperature": temperature,
+                "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                    disable=bool(forced_tool_name)
+                ),
+                "thinking_config": thinking_config,
+                "cached_content": None,
+            },
+            inference_mode=active_inference_mode,
+            flex_timeout_ms=flex_timeout_ms,
         )
 
     function_output = ""
@@ -1143,6 +1247,7 @@ def _run_model_api(
         tool_use_allowed=tool_use_allowed,
         forced_tool_name=forced_tool_name,
         prompt_chars=len(prompt_text or ""),
+        inference_mode=active_inference_mode,
     )
 
     response = call_with_exponential_backoff(
@@ -1159,6 +1264,7 @@ def _run_model_api(
         model=model,
         cached_content_used=bool(cached_content_name),
         usage_metadata=_extract_usage_metadata(response),
+        inference_mode=active_inference_mode,
     )
 
     # The API may return a candidate whose `content` is None (no function-calling parts).

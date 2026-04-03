@@ -14,7 +14,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from config import get_paid_gemini_api_key as get_paid_gemini_api_key
+from config import (
+    FLEX_REQUEST_TIMEOUT_MS as FLEX_REQUEST_TIMEOUT_MS,
+    INFERENCE_MODE_FLEX as INFERENCE_MODE_FLEX,
+    get_paid_gemini_api_key as get_paid_gemini_api_key,
+)
 from api_backoff import call_with_exponential_backoff
 from google import genai
 from google.genai import types
@@ -31,6 +35,16 @@ _ALLOWED_IMAGE_SIZES = {"512", "1K", "2K", "4K"}
 _ALLOWED_PERSON_GENERATION = {"allow_all", "allow_adult", "dont_allow"}
 _ALLOWED_OUTPUT_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
 _ALLOWED_MODALITIES = {"TEXT", "IMAGE"}
+_FLEX_SUPPORTED_MODELS = {
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-image-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-image",
+    "gemini-2.5-flash-lite",
+}
 
 
 def _extract_json_payload(raw_prompt: str) -> dict:
@@ -180,15 +194,22 @@ def _build_image_request(raw_prompt: str) -> dict:
 
     if not request_payload:
         # Backward compatible plain-text mode.
+        model_name = _DEFAULT_IMAGE_MODEL
+        config_kwargs = {
+            "response_modalities": list(_DEFAULT_RESPONSE_MODALITIES),
+            "image_config": types.ImageConfig(aspect_ratio=_DEFAULT_IMAGE_ASPECT_RATIO),
+            "tools": [{"google_search": {}}],
+        }
+        if model_name.lower() in _FLEX_SUPPORTED_MODELS:
+            config_kwargs["http_options"] = types.HttpOptions(
+                timeout=FLEX_REQUEST_TIMEOUT_MS,
+                extra_body={"service_tier": INFERENCE_MODE_FLEX},
+            )
         return {
-            "model": _DEFAULT_IMAGE_MODEL,
+            "model": model_name,
             "contents": [raw_prompt],
             "prompt_for_filename": raw_prompt,
-            "config": types.GenerateContentConfig(
-                response_modalities=list(_DEFAULT_RESPONSE_MODALITIES),
-                image_config=types.ImageConfig(aspect_ratio=_DEFAULT_IMAGE_ASPECT_RATIO),
-                tools=[{"google_search": {}}],
-            ),
+            "config": types.GenerateContentConfig(**config_kwargs),
         }
 
     prompt_text = request_payload.get("prompt")
@@ -248,6 +269,12 @@ def _build_image_request(raw_prompt: str) -> dict:
         use_google_search = True
     if use_google_search:
         config_kwargs["tools"] = [{"google_search": {}}]
+
+    if model_name.lower() in _FLEX_SUPPORTED_MODELS:
+        config_kwargs["http_options"] = types.HttpOptions(
+            timeout=FLEX_REQUEST_TIMEOUT_MS,
+            extra_body={"service_tier": INFERENCE_MODE_FLEX},
+        )
 
     return {
         "model": model_name,

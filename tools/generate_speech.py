@@ -12,7 +12,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
 	sys.path.insert(0, str(_REPO_ROOT))
 
-from config import get_paid_gemini_api_key as get_paid_gemini_api_key
+from config import (
+	FLEX_REQUEST_TIMEOUT_MS as FLEX_REQUEST_TIMEOUT_MS,
+	INFERENCE_MODE_FLEX as INFERENCE_MODE_FLEX,
+	get_paid_gemini_api_key as get_paid_gemini_api_key,
+)
 from api_backoff import call_with_exponential_backoff
 from google import genai
 from google.genai import types
@@ -21,6 +25,16 @@ from google.genai import types
 _DEFAULT_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 _DEFAULT_VOICE_NAME = "Kore"
 _DEFAULT_SAMPLE_RATE_HZ = 24000
+_FLEX_SUPPORTED_MODELS = {
+	"gemini-3.1-flash-lite-preview",
+	"gemini-3.1-pro-preview",
+	"gemini-3-flash-preview",
+	"gemini-3-pro-image-preview",
+	"gemini-2.5-pro",
+	"gemini-2.5-flash",
+	"gemini-2.5-flash-image",
+	"gemini-2.5-flash-lite",
+}
 
 
 def _extract_json_payload(raw_prompt: str) -> dict:
@@ -139,17 +153,24 @@ def _build_speech_request(raw_prompt: str, fallback_voice_name: str = _DEFAULT_V
 	if not request_payload:
 		# Backward compatible plain-text mode.
 		prompt_text = _normalize_text(raw_prompt)
+		model_name = _DEFAULT_TTS_MODEL
+		config_kwargs = {
+			"response_modalities": ["AUDIO"],
+			"speech_config": types.SpeechConfig(
+				voice_config=_build_single_voice_config(fallback_voice_name),
+			),
+		}
+		if model_name.lower() in _FLEX_SUPPORTED_MODELS:
+			config_kwargs["http_options"] = types.HttpOptions(
+				timeout=FLEX_REQUEST_TIMEOUT_MS,
+				extra_body={"service_tier": INFERENCE_MODE_FLEX},
+			)
 		return {
-			"model": _DEFAULT_TTS_MODEL,
+			"model": model_name,
 			"contents": prompt_text,
 			"prompt_for_filename": prompt_text,
 			"sample_rate_hz": _DEFAULT_SAMPLE_RATE_HZ,
-			"config": types.GenerateContentConfig(
-				response_modalities=["AUDIO"],
-				speech_config=types.SpeechConfig(
-					voice_config=_build_single_voice_config(fallback_voice_name),
-				),
-			),
+			"config": types.GenerateContentConfig(**config_kwargs),
 			"request_payload": {},
 		}
 
@@ -209,6 +230,12 @@ def _build_speech_request(raw_prompt: str, fallback_voice_name: str = _DEFAULT_V
 	stop_sequences = _normalize_stop_sequences(request_payload.get("stop_sequences"))
 	if stop_sequences is not None:
 		config_kwargs["stop_sequences"] = stop_sequences
+
+	if model_name.lower() in _FLEX_SUPPORTED_MODELS:
+		config_kwargs["http_options"] = types.HttpOptions(
+			timeout=FLEX_REQUEST_TIMEOUT_MS,
+			extra_body={"service_tier": INFERENCE_MODE_FLEX},
+		)
 
 	return {
 		"model": model_name,

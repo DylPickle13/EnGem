@@ -14,7 +14,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from config import MINIMAL_MODEL as MINIMAL_MODEL, MEDIUM_MODEL as MEDIUM_MODEL
+from config import (
+    DEFAULT_INFERENCE_MODE as DEFAULT_INFERENCE_MODE,
+    INFERENCE_MODE_FLEX as INFERENCE_MODE_FLEX,
+    MINIMAL_MODEL as MINIMAL_MODEL,
+    MEDIUM_MODEL as MEDIUM_MODEL,
+)
 
 try:
     from googleapiclient.discovery import build
@@ -46,6 +51,18 @@ SMOKE_TEST_QUERIES: list[tuple[str, str]] = [
         "Call channels.list with params part=snippet,contentDetails,statistics, mine=true, maxResults=10.",
     ),
 ]
+
+_FLEX_SUPPORTED_MODELS = {
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-image-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-image",
+    "gemini-2.5-flash-lite",
+}
+_MINIMAL_MODEL_SUPPORTS_FLEX = str(MINIMAL_MODEL).strip().lower() in _FLEX_SUPPORTED_MODELS
 
 
 def _get_credentials(client_secrets_file: Optional[str] = None, credentials_file: str = "youtube_token.json", scopes=SCOPES) -> Credentials:
@@ -202,6 +219,9 @@ def _plan_query_payload(query: str, *, feedback: list[dict[str, Any]] | None = N
         force_tool="",
         temperature=0.2,
         thinking_level="low",
+        inference_mode=(
+            INFERENCE_MODE_FLEX if _MINIMAL_MODEL_SUPPORTS_FLEX else DEFAULT_INFERENCE_MODE
+        ),
     )
     return _extract_first_json_object(planner_output), planner_output
 
@@ -382,6 +402,9 @@ def _interpret_query_response(query: str, raw_response: str) -> str:
         force_tool="",
         temperature=0.2,
         thinking_level="low",
+        inference_mode=(
+            INFERENCE_MODE_FLEX if _MINIMAL_MODEL_SUPPORTS_FLEX else DEFAULT_INFERENCE_MODE
+        ),
     )
 
 
