@@ -12,7 +12,7 @@ Call contract (important):
 Preferred JSON shape (Gemini API style):
 {
 	"prompt": "Video description",
-	"model": "veo-3.1-fast-generate-preview",
+	"model": "veo-3.1-lite-generate-preview",
 	"aspectRatio": "16:9",
 	"resolution": "720p",
 	"durationSeconds": 8,
