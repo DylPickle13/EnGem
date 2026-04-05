@@ -47,6 +47,8 @@ THINKING_LEVEL_TO_EMOJI = {
 }
 SUB_AGENT_INSTRUCTION_PREVIEW_CHARS = 200
 VALID_PLAN_THINKING_LEVELS = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
+STOP_BUTTON_LABEL = "Stop"
+STOP_BUTTON_TIMEOUT_SECONDS = 3600
 
 
 def normalize_plan_thinking_level(raw_level: object) -> str:
@@ -133,6 +135,8 @@ class ExecutionPlanProgressIndicator:
         self._execution_plan_progress_tasks: dict[str, asyncio.Task[None]] = {}
         self._execution_plan_progress_messages: dict[str, discord.Message] = {}
         self._execution_plan_started_at: dict[str, float] = {}
+        self._execution_plan_cancellation_events: dict[str, threading.Event] = {}
+        self._execution_plan_stop_views: dict[str, Any] = {}
 
     def get_active_tasks(self) -> list[asyncio.Task[None]]:
         return [
@@ -142,9 +146,17 @@ class ExecutionPlanProgressIndicator:
         ]
 
     def clear_state(self) -> None:
+        for stop_view in self._execution_plan_stop_views.values():
+            try:
+                stop_view.stop()
+            except Exception:
+                pass
+
         self._execution_plan_progress_tasks.clear()
         self._execution_plan_progress_messages.clear()
         self._execution_plan_started_at.clear()
+        self._execution_plan_cancellation_events.clear()
+        self._execution_plan_stop_views.clear()
 
     def build_execution_plan_notifier(
         self,
@@ -152,6 +164,7 @@ class ExecutionPlanProgressIndicator:
         loop: asyncio.AbstractEventLoop,
         channel: discord.abc.Messageable,
         history_file: str,
+        cancellation_event: threading.Event | None = None,
     ) -> Callable[..., None]:
         def _notifier(
             diagram_text: str,
@@ -176,6 +189,7 @@ class ExecutionPlanProgressIndicator:
                         attempt_number=attempt_number,
                         reset_previous_preview=reset_previous_preview,
                         plan_kind=plan_kind,
+                        cancellation_event=cancellation_event,
                     ),
                     loop,
                 )
@@ -210,6 +224,7 @@ class ExecutionPlanProgressIndicator:
         attempt_number: int,
         reset_previous_preview: bool,
         plan_kind: str,
+        cancellation_event: threading.Event | None = None,
     ) -> None:
         _ = reset_previous_preview
         tracker_key = f"{id(channel)}::{history_file}"
@@ -217,6 +232,11 @@ class ExecutionPlanProgressIndicator:
         if existing_task is not None and not existing_task.done():
             existing_task.cancel()
             await asyncio.gather(existing_task, return_exceptions=True)
+
+        if cancellation_event is not None:
+            self._execution_plan_cancellation_events[tracker_key] = cancellation_event
+        else:
+            self._execution_plan_cancellation_events.pop(tracker_key, None)
 
         self._execution_plan_started_at.setdefault(tracker_key, time.monotonic())
 
@@ -259,6 +279,10 @@ class ExecutionPlanProgressIndicator:
             self._execution_plan_started_at[tracker_key] = started_at
 
         while True:
+            cancellation_event = self._execution_plan_cancellation_events.get(tracker_key)
+            if cancellation_event is not None and cancellation_event.is_set():
+                return
+
             elapsed_seconds = time.monotonic() - started_at
             (
                 message_content,
@@ -283,9 +307,14 @@ class ExecutionPlanProgressIndicator:
             )
 
             try:
+                cancellation_event = self._execution_plan_cancellation_events.get(tracker_key)
+                if cancellation_event is not None and cancellation_event.is_set():
+                    return
+
                 if progress_message is None:
                     progress_message, _, embed_enabled = await self._send_progress_message(
                         channel=channel,
+                        tracker_key=tracker_key,
                         history_file=history_file,
                         message_content=effective_message_content,
                         progress_embed=progress_embed,
@@ -296,6 +325,7 @@ class ExecutionPlanProgressIndicator:
                 elif effective_state_signature != last_sent_state_signature:
                     progress_message, _, embed_enabled = await self._edit_progress_message(
                         channel=channel,
+                        tracker_key=tracker_key,
                         history_file=history_file,
                         progress_message=progress_message,
                         message_content=effective_message_content,
@@ -318,13 +348,52 @@ class ExecutionPlanProgressIndicator:
             thinking_step += 1
             await asyncio.sleep(EXECUTION_PLAN_PROGRESS_UPDATE_INTERVAL_SECONDS)
 
-    async def clear_execution_plan_progress_message(
-        self,
-        channel: discord.abc.Messageable,
-        history_file: str,
-    ) -> None:
-        tracker_key = f"{id(channel)}::{history_file}"
+    def _build_stop_view(self, tracker_key: str) -> Any | None:
+        import discord
 
+        existing_view = self._execution_plan_stop_views.get(tracker_key)
+        if existing_view is not None:
+            return existing_view
+
+        view = discord.ui.View(timeout=STOP_BUTTON_TIMEOUT_SECONDS)
+        stop_button = discord.ui.Button(
+            style=discord.ButtonStyle.danger,
+            label=STOP_BUTTON_LABEL,
+        )
+
+        async def _stop_callback(interaction: discord.Interaction) -> None:
+            await self._handle_stop_interaction(interaction=interaction, tracker_key=tracker_key)
+
+        stop_button.callback = _stop_callback
+        view.add_item(stop_button)
+        self._execution_plan_stop_views[tracker_key] = view
+        return view
+
+    @staticmethod
+    async def _send_interaction_response(interaction: Any, message: str) -> None:
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            pass
+
+    async def _handle_stop_interaction(self, interaction: Any, tracker_key: str) -> None:
+        cancellation_event = self._execution_plan_cancellation_events.get(tracker_key)
+        if cancellation_event is None:
+            await self._send_interaction_response(interaction, "No active run to stop.")
+            return
+
+        if cancellation_event.is_set():
+            await self._send_interaction_response(interaction, "Stop was already requested.")
+            return
+
+        cancellation_event.set()
+        await self._clear_execution_plan_progress_tracker_by_key(tracker_key)
+        await self._send_interaction_response(interaction, "Stop requested. Current run is shutting down.")
+
+    async def _clear_execution_plan_progress_tracker_by_key(self, tracker_key: str) -> None:
         task = self._execution_plan_progress_tasks.get(tracker_key)
         if task is not None and not task.done():
             task.cancel()
@@ -332,6 +401,14 @@ class ExecutionPlanProgressIndicator:
 
         self._execution_plan_progress_tasks.pop(tracker_key, None)
         self._execution_plan_started_at.pop(tracker_key, None)
+        self._execution_plan_cancellation_events.pop(tracker_key, None)
+
+        stop_view = self._execution_plan_stop_views.pop(tracker_key, None)
+        if stop_view is not None:
+            try:
+                stop_view.stop()
+            except Exception:
+                pass
 
         progress_message = self._execution_plan_progress_messages.pop(tracker_key, None)
         if progress_message is not None:
@@ -339,6 +416,14 @@ class ExecutionPlanProgressIndicator:
                 await progress_message.delete()
             except Exception:
                 pass
+
+    async def clear_execution_plan_progress_message(
+        self,
+        channel: discord.abc.Messageable,
+        history_file: str,
+    ) -> None:
+        tracker_key = f"{id(channel)}::{history_file}"
+        await self._clear_execution_plan_progress_tracker_by_key(tracker_key)
 
     @staticmethod
     def _truncate_text(value: str, limit: int) -> str:
@@ -618,6 +703,7 @@ class ExecutionPlanProgressIndicator:
         self,
         *,
         channel: discord.abc.Messageable,
+        tracker_key: str,
         history_file: str,
         message_content: str,
         progress_embed: Any | None,
@@ -625,9 +711,11 @@ class ExecutionPlanProgressIndicator:
     ) -> tuple[discord.Message, str, bool]:
         import discord
 
+        stop_view = self._build_stop_view(tracker_key)
+
         if embed_enabled and progress_embed is not None:
             try:
-                message = await channel.send(embed=progress_embed)
+                message = await channel.send(embed=progress_embed, view=stop_view)
                 return message, self._build_payload_signature("", progress_embed), True
             except Exception as embed_exc:
                 logging.warning(
@@ -637,13 +725,14 @@ class ExecutionPlanProgressIndicator:
                 )
 
         fallback_content = message_content or self._build_thinking_indicator(0)
-        message = await channel.send(fallback_content)
+        message = await channel.send(fallback_content, view=stop_view)
         return message, self._build_payload_signature(fallback_content, None), False
 
     async def _edit_progress_message(
         self,
         *,
         channel: discord.abc.Messageable,
+        tracker_key: str,
         history_file: str,
         progress_message: discord.Message,
         message_content: str,
@@ -652,13 +741,16 @@ class ExecutionPlanProgressIndicator:
     ) -> tuple[discord.Message, str, bool]:
         import discord
 
+        stop_view = self._build_stop_view(tracker_key)
+
         if embed_enabled and progress_embed is not None:
             try:
-                await progress_message.edit(content=None, embed=progress_embed)
+                await progress_message.edit(content=None, embed=progress_embed, view=stop_view)
                 return progress_message, self._build_payload_signature("", progress_embed), True
             except discord.NotFound:
                 return await self._send_progress_message(
                     channel=channel,
+                    tracker_key=tracker_key,
                     history_file=history_file,
                     message_content=message_content,
                     progress_embed=progress_embed,
@@ -673,11 +765,12 @@ class ExecutionPlanProgressIndicator:
 
         try:
             fallback_content = message_content or self._build_thinking_indicator(0)
-            await progress_message.edit(content=fallback_content, embed=None)
+            await progress_message.edit(content=fallback_content, embed=None, view=stop_view)
             return progress_message, self._build_payload_signature(fallback_content, None), False
         except discord.NotFound:
             return await self._send_progress_message(
                 channel=channel,
+                tracker_key=tracker_key,
                 history_file=history_file,
                 message_content=message_content,
                 progress_embed=None,

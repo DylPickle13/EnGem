@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
@@ -169,20 +170,26 @@ class DiscordBotWrapper:
 		is_job = self._is_job_message(message)
 		inference_mode = self._inference_mode
 		media_payloads = await self._read_media_attachments(message)
+		cancellation_event = threading.Event()
 		execution_plan_notifier = self._progress_indicator.build_execution_plan_notifier(
 			loop=self.client.loop,
 			channel=message.channel,
 			history_file=history_file,
+			cancellation_event=cancellation_event,
 		)
-		return await asyncio.to_thread(
-			llm.generate_response,
-			text,
-			is_job,
-			history_file,
-			media_payloads,
-			execution_plan_notifier,
-			inference_mode,
-		)
+		try:
+			return await asyncio.to_thread(
+				llm.generate_response,
+				text,
+				is_job,
+				history_file,
+				media_payloads,
+				execution_plan_notifier,
+				inference_mode,
+				cancellation_event,
+			)
+		except llm.GenerationCancelledError:
+			return llm.LLMResponse(text="", media_paths=[])
 
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
 		if not text:

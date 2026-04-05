@@ -2,6 +2,7 @@ from google import genai
 from google.genai import types
 import json
 import inspect
+import threading
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -49,7 +50,7 @@ PLANNER_MANAGER_TASK_NAME = "PlannerManager"
 EXECUTION_MANAGER_TASK_NAME = "ExecutionManager"
 PLANNER_REVIEWER_TASK_NAME = "PlannerReviewer"
 REVIEWER_TASK_NAME = "Reviewer"
-PLANNER_REVIEWER_STAGE_INSTRUCTION = "Review whether planning has enough information. Print only <ready> if complete; otherwise print missing checks."
+PLANNER_REVIEWER_STAGE_INSTRUCTION = "Review planning status. Print only <EXECUTE> if execution agents are needed, <READY> if no execution agents are needed, otherwise print missing checks."
 REVIEWER_STAGE_INSTRUCTION = "Review whether the user's latest request is complete. Print only <yes> if complete; otherwise print what is missing."
 THINKING_LEVEL_TO_MODEL = {
     "MINIMAL": MINIMAL_MODEL,
@@ -77,6 +78,15 @@ class LLMResponse:
     media_paths: list[str] = field(default_factory=list)
 
 
+class GenerationCancelledError(Exception):
+    """Raised when a user requests cancellation of the active generation run."""
+
+
+def _raise_if_generation_cancelled(cancellation_event: threading.Event | None) -> None:
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise GenerationCancelledError("Generation cancelled by user stop request.")
+
+
 def generate_response(
     user_message: str,
     job: bool,
@@ -84,6 +94,7 @@ def generate_response(
     image: dict[str, bytes | str] | list[dict[str, bytes | str]] | None = None,
     execution_plan_notifier: Callable[..., None] | None = None,
     inference_mode: str = DEFAULT_INFERENCE_MODE,
+    cancellation_event: threading.Event | None = None,
 ) -> LLMResponse:
     """
     Main function to generate a response from the model based on the user's message,
@@ -98,6 +109,31 @@ def generate_response(
     temperature = default_temperature
     attempt_number = 1
     request_inference_mode = _normalize_inference_mode(inference_mode)
+    active_history_cache: HistoryContextCache | None = None
+
+    def _check_cancelled() -> None:
+        if cancellation_event is None or not cancellation_event.is_set():
+            return
+        if active_history_cache is not None:
+            active_history_cache.release()
+        raise GenerationCancelledError("Generation cancelled by user stop request.")
+
+    def _call_with_backoff(
+        operation: Callable[[], Any],
+        *,
+        description: str = "Gemini API call",
+        max_attempts: int | None = None,
+    ) -> Any:
+        _check_cancelled()
+        return call_with_exponential_backoff(
+            operation,
+            description=description,
+            max_attempts=max_attempts,
+            cancellation_check=_check_cancelled,
+        )
+
+    _check_cancelled()
+
     normalized_attachments = attachments.normalize_attachments(image)
     attachment_text, attachment_memory_context = attachments.ingest_attachments_for_memory(
         normalized_attachments,
@@ -135,10 +171,11 @@ def generate_response(
         history_file=history_file,
         history_text=current_history_text,
         client=client,
-        backoff_call=call_with_exponential_backoff,
+        backoff_call=_call_with_backoff,
     )
 
     if not job:
+        _check_cancelled()
         relevant_memories_text = memory.build_relevant_memories_text(
             retrieval_query,
             semantic_limit=5,
@@ -168,8 +205,12 @@ def generate_response(
                 history_cache=active_history_cache,
                 current_history_text=current_history_text,
                 inference_mode=request_inference_mode,
+                cancellation_event=cancellation_event,
             )
         except Exception as e:
+            if isinstance(e, GenerationCancelledError):
+                active_history_cache.release()
+                return LLMResponse(text="", media_paths=[])
             print(f"Error generating intent response: {e}")
 
         if "<complex>" not in (intent_response or ""):
@@ -180,9 +221,10 @@ def generate_response(
                     history_file=history_file,
                     history_text=current_history_text,
                     client=client,
-                    backoff_call=call_with_exponential_backoff,
+                    backoff_call=_call_with_backoff,
                 )
                 try:
+                    _check_cancelled()
                     relevant_memories_history = memory.build_relevant_memories_text(
                         retrieval_query,
                         semantic_limit=10,
@@ -210,9 +252,12 @@ def generate_response(
         nonlocal active_history_cache
         nonlocal current_history_text
 
+        _check_cancelled()
+
         _refresh_active_history_cache()
 
         if summarize_history:
+            _check_cancelled()
             history.run_history_summarization(
                 history_file=history_file,
                 temperature=default_temperature,
@@ -222,6 +267,7 @@ def generate_response(
                 current_history_text=current_history_text,
             )
             current_history_text = history.get_conversation_history(history_file=history_file)
+            _check_cancelled()
         _refresh_active_history_cache()
         if temperature < 2.0:
             temperature += 0.1
@@ -230,17 +276,20 @@ def generate_response(
     def _refresh_active_history_cache() -> None:
         nonlocal active_history_cache
 
+        _check_cancelled()
+
         active_history_cache.release()
         active_history_cache = create_history_context_cache(
             history_file=history_file,
             history_text=current_history_text,
             client=client,
-            backoff_call=call_with_exponential_backoff,
+            backoff_call=_call_with_backoff,
         )
 
     planner_phase_ready = False
 
     while True:
+        _check_cancelled()
         exit_string = ""
         planner_exit_string = ""
         planner_order_file = Path(__file__).parent / f"sub-agents/planner_order_{history_file}.json"
@@ -254,6 +303,7 @@ def generate_response(
 
         cleared_plan_files = True
         for plan_file, label in plan_files_to_clear:
+            _check_cancelled()
             if plan_file.exists():
                 try:
                     plan_file.unlink()
@@ -273,6 +323,7 @@ def generate_response(
             continue
 
         if not planner_phase_ready:
+            _check_cancelled()
             try:
                 planner_history_text = current_history_text
                 planner_relevant_memories_text = memory.build_relevant_memories_text(
@@ -303,12 +354,16 @@ def generate_response(
                     history_cache=active_history_cache,
                     current_history_text=planner_history_text,
                     inference_mode=request_inference_mode,
+                    cancellation_event=cancellation_event,
                 )
                 _append_history_and_update(
                     role=PLANNER_MANAGER_TASK_NAME,
                     text=f"{planner_order_file} created. \nRelevant skills: {planner_skill_names} \nRelevant memories: {planner_relevant_memories_text}",
                 )
             except Exception as e:
+                if isinstance(e, GenerationCancelledError):
+                    active_history_cache.release()
+                    return LLMResponse(text="", media_paths=[])
                 print(f"Error generating planner manager response: {e}")
 
             if not planner_order_file.exists():
@@ -345,34 +400,46 @@ def generate_response(
                 plan_kind="planner",
             )
 
-            planner_exit_string, current_history_text = _run_sub_agent_plan(
-                execution_plan=planner_plan,
-                history_file=history_file,
-                temperature=temperature,
-                history_cache=active_history_cache,
-                final_agent_task_name=PLANNER_REVIEWER_TASK_NAME,
-                final_agent_runner=lambda latest_history_text: _run_planner_reviewer(
-                    history_file,
-                    user_message,
-                    default_temperature,
+            try:
+                planner_exit_string, current_history_text = _run_sub_agent_plan(
+                    execution_plan=planner_plan,
+                    history_file=history_file,
+                    temperature=temperature,
                     history_cache=active_history_cache,
-                    current_history_text=latest_history_text,
+                    final_agent_task_name=PLANNER_REVIEWER_TASK_NAME,
+                    final_agent_runner=lambda latest_history_text: _run_planner_reviewer(
+                        history_file,
+                        user_message,
+                        default_temperature,
+                        history_cache=active_history_cache,
+                        current_history_text=latest_history_text,
+                        inference_mode=request_inference_mode,
+                        cancellation_event=cancellation_event,
+                    ),
                     inference_mode=request_inference_mode,
-                ),
-                inference_mode=request_inference_mode,
-            )
+                    cancellation_event=cancellation_event,
+                )
+            except GenerationCancelledError:
+                active_history_cache.release()
+                return LLMResponse(text="", media_paths=[])
+            _check_cancelled()
 
-            if "<ready>" not in (planner_exit_string or "").lower():
-                print("Planner phase did not report readiness. Retrying planner attempt without summarization.")
+            normalized_planner_exit = (planner_exit_string or "").lower()
+            if "<execute>" in normalized_planner_exit:
+                planner_phase_ready = True
+
+                # Planner results are now stable context; rebuild history cache so execution
+                # manager/sub-agents can reuse a static cached prefix from this point onward.
+                _refresh_active_history_cache()
+            elif "<ready>" in normalized_planner_exit:
+                print("Planner phase marked request as ready for final response. Skipping execution phase.")
+                break
+            else:
+                print("Planner phase did not report <EXECUTE> or <READY>. Retrying planner attempt without summarization.")
                 _advance_attempt(PLANNER_MANAGER_TASK_NAME, summarize_history=False)
                 continue
 
-            planner_phase_ready = True
-
-            # Planner results are now stable context; rebuild history cache so execution
-            # manager/sub-agents can reuse a static cached prefix from this point onward.
-            _refresh_active_history_cache()
-
+        _check_cancelled()
         try:
             execution_history_text = current_history_text
             execution_manager_system_instructions = EXECUTION_MANAGER_FILE.read_text(encoding="utf-8") + history_file
@@ -409,12 +476,16 @@ def generate_response(
                 history_cache=active_history_cache,
                 current_history_text=execution_history_text,
                 inference_mode=request_inference_mode,
+                cancellation_event=cancellation_event,
             )
             _append_history_and_update(
                 role=EXECUTION_MANAGER_TASK_NAME,
                 text=f"{execution_order_file} created.",
             )
         except Exception as e:
+            if isinstance(e, GenerationCancelledError):
+                active_history_cache.release()
+                return LLMResponse(text="", media_paths=[])
             print(f"Error generating execution manager response: {e}")
 
         if not execution_order_file.exists():
@@ -460,22 +531,29 @@ def generate_response(
             plan_kind="execution",
         )
 
-        exit_string, current_history_text = _run_sub_agent_plan(
-            execution_plan=execution_plan,
-            history_file=history_file,
-            temperature=temperature,
-            history_cache=active_history_cache,
-            final_agent_task_name=REVIEWER_TASK_NAME,
-            final_agent_runner=lambda latest_history_text: _run_final_reviewer(
-                history_file,
-                user_message,
-                default_temperature,
+        try:
+            exit_string, current_history_text = _run_sub_agent_plan(
+                execution_plan=execution_plan,
+                history_file=history_file,
+                temperature=temperature,
                 history_cache=active_history_cache,
-                current_history_text=latest_history_text,
+                final_agent_task_name=REVIEWER_TASK_NAME,
+                final_agent_runner=lambda latest_history_text: _run_final_reviewer(
+                    history_file,
+                    user_message,
+                    default_temperature,
+                    history_cache=active_history_cache,
+                    current_history_text=latest_history_text,
+                    inference_mode=request_inference_mode,
+                    cancellation_event=cancellation_event,
+                ),
                 inference_mode=request_inference_mode,
-            ),
-            inference_mode=request_inference_mode,
-        )
+                cancellation_event=cancellation_event,
+            )
+        except GenerationCancelledError:
+            active_history_cache.release()
+            return LLMResponse(text="", media_paths=[])
+        _check_cancelled()
 
         if not exit_string:
             print("Final Reviewer agent did not produce an exit string.")
@@ -495,13 +573,15 @@ def generate_response(
     text_response = ""
     media_paths: list[str] = []
 
+    _check_cancelled()
     active_history_cache.release()
     post_review_cache = create_history_context_cache(
         history_file=history_file,
         history_text=current_history_text,
         client=client,
-        backoff_call=call_with_exponential_backoff,
+        backoff_call=_call_with_backoff,
     )
+    _check_cancelled()
     history.run_history_summarization_async(
         history_file=history_file,
         temperature=default_temperature,
@@ -523,6 +603,7 @@ def generate_response(
                 history_cache=post_review_cache,
                 current_history_text=post_review_cache.history_text,
                 inference_mode=request_inference_mode,
+                cancellation_event=cancellation_event,
             )
             media_future = executor.submit(
                 collect_generated_media.select_media_paths,
@@ -536,6 +617,8 @@ def generate_response(
                 text_response = text_future.result()
                 _append_history_and_update(role="Texter", text=text_response)
             except Exception as e:
+                if isinstance(e, GenerationCancelledError):
+                    return LLMResponse(text="", media_paths=[])
                 print(f"Error generating texter response: {e}")
 
             try:
@@ -545,10 +628,13 @@ def generate_response(
                     text=json.dumps({"media_paths": media_paths}, ensure_ascii=False),
                 )
             except Exception as e:
+                if isinstance(e, GenerationCancelledError):
+                    return LLMResponse(text="", media_paths=[])
                 print(f"Error selecting media paths: {e}")
                 media_paths = []
 
         if not job:
+            _check_cancelled()
             relevant_memories_history = memory.build_relevant_memories_text(
                 retrieval_query,
                 semantic_limit=10,
@@ -777,6 +863,7 @@ def _run_sub_agent_plan(
     final_agent_task_name: str,
     final_agent_runner: Callable[[str], str],
     inference_mode: str = DEFAULT_INFERENCE_MODE,
+    cancellation_event: threading.Event | None = None,
 ) -> tuple[str, str]:
     sub_agent_system_instructions = SUB_AGENT_FILE.read_text(encoding="utf-8")
     final_agent_output = ""
@@ -797,6 +884,7 @@ def _run_sub_agent_plan(
         current_history_text = history.get_conversation_history(history_file=history_file)
 
     for stage_index, stage in enumerate(execution_plan):
+        _raise_if_generation_cancelled(cancellation_event)
         mode = stage["mode"]
         agents = stage["sub_agents"]
 
@@ -810,6 +898,7 @@ def _run_sub_agent_plan(
             )
 
             def _run_parallel_agent(agent: dict[str, Any], stage_history: str) -> str:
+                _raise_if_generation_cancelled(cancellation_event)
                 model_name, api_thinking_level, force_tool_name = _resolve_sub_agent_model_config(agent)
                 return _run_model_api(
                     text=agent["instruction"],
@@ -822,6 +911,7 @@ def _run_sub_agent_plan(
                     history_cache=history_cache,
                     current_history_text=stage_history,
                     inference_mode=inference_mode,
+                    cancellation_event=cancellation_event,
                 )
 
             with ThreadPoolExecutor(max_workers=min(len(agents), 8)) as executor:
@@ -831,17 +921,21 @@ def _run_sub_agent_plan(
                 }
 
                 for future in as_completed(future_to_index):
+                    _raise_if_generation_cancelled(cancellation_event)
                     idx = future_to_index[future]
                     agent = agents[idx]
                     sub_agent_response = ""
                     try:
                         sub_agent_response = future.result()
                     except Exception as e:
+                        if isinstance(e, GenerationCancelledError):
+                            raise
                         print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
 
                     _append_history_and_update(role=agent["task_name"], text=sub_agent_response)
         else:
             for agent_index, agent in enumerate(agents):
+                _raise_if_generation_cancelled(cancellation_event)
                 sub_agent_response = ""
                 try:
                     if _is_final_plan_agent(execution_plan, stage_index, agent_index, final_agent_task_name):
@@ -860,10 +954,13 @@ def _run_sub_agent_plan(
                             history_cache=history_cache,
                             current_history_text=current_history_text,
                             inference_mode=inference_mode,
+                            cancellation_event=cancellation_event,
                         )
 
                     _append_history_and_update(role=agent["task_name"], text=sub_agent_response)
                 except Exception as e:
+                    if isinstance(e, GenerationCancelledError):
+                        raise
                     print(f"Error generating response for sub-agent '{agent['task_name']}': {e}")
 
     return final_agent_output, current_history_text
@@ -876,10 +973,12 @@ def _run_planner_reviewer(
     history_cache: HistoryContextCache | None = None,
     current_history_text: str | None = None,
     inference_mode: str = DEFAULT_INFERENCE_MODE,
+    cancellation_event: threading.Event | None = None,
 ) -> str:
+    _raise_if_generation_cancelled(cancellation_event)
     if history_cache is not None:
         return _run_model_api(
-            text="Review whether planning has gathered enough information to proceed to execution.",
+            text="Review planning status and decide whether execution agents are required (<EXECUTE>) or no execution phase is needed (<READY>).",
             system_instructions=PLANNER_REVIEWER_FILE.read_text(encoding="utf-8") + user_message,
             model=LOW_MODEL,
             tool_use_allowed=False,
@@ -889,6 +988,7 @@ def _run_planner_reviewer(
             history_cache=history_cache,
             current_history_text=current_history_text,
             inference_mode=inference_mode,
+            cancellation_event=cancellation_event,
         )
 
     return _run_model_api(
@@ -900,6 +1000,7 @@ def _run_planner_reviewer(
         temperature=temperature,
         thinking_level="low",
         inference_mode=inference_mode,
+        cancellation_event=cancellation_event,
     )
 
 
@@ -910,7 +1011,9 @@ def _run_final_reviewer(
     history_cache: HistoryContextCache | None = None,
     current_history_text: str | None = None,
     inference_mode: str = DEFAULT_INFERENCE_MODE,
+    cancellation_event: threading.Event | None = None,
 ) -> str:
+    _raise_if_generation_cancelled(cancellation_event)
     if history_cache is not None:
         return _run_model_api(
             text="Review the conversation context and determine whether the user's request is complete.",
@@ -923,6 +1026,7 @@ def _run_final_reviewer(
             history_cache=history_cache,
             current_history_text=current_history_text,
             inference_mode=inference_mode,
+            cancellation_event=cancellation_event,
         )
 
     return _run_model_api(
@@ -934,6 +1038,7 @@ def _run_final_reviewer(
         temperature=temperature,
         thinking_level="low",
         inference_mode=inference_mode,
+        cancellation_event=cancellation_event,
     )
 
 
@@ -1042,6 +1147,8 @@ def _prewarm_parallel_stage_cache_profiles(
             )
             unique_profiles.setdefault(profile.profile_key, (model_name, profile))
         except Exception as e:
+            if isinstance(e, GenerationCancelledError):
+                raise
             print(f"Error preparing cache prewarm profile for parallel agent '{agent.get('task_name', 'unknown')}': {e}")
 
     if not unique_profiles:
@@ -1061,6 +1168,8 @@ def _prewarm_parallel_stage_cache_profiles(
                 current_history_text=stage_history,
             )
         except Exception as e:
+            if isinstance(e, GenerationCancelledError):
+                raise
             print(f"Error prewarming parallel cache profile '{profile.profile_label}' for model '{model_name}': {e}")
 
     emit_cache_metric(
@@ -1166,6 +1275,7 @@ def _run_model_api(
     current_history_text: str | None = None,
     inference_mode: str = DEFAULT_INFERENCE_MODE,
     flex_timeout_ms: int = FLEX_REQUEST_TIMEOUT_MS,
+    cancellation_event: threading.Event | None = None,
 ) -> str:
     """
     Helper function to call the model API with the given text and system instructions, and return the generated response.
@@ -1174,6 +1284,8 @@ def _run_model_api(
     tool_use_allowed: whether to allow the model to use tools for this generation (default: True)
     temperature: the temperature to use for this generation (default: 1)
     """
+
+    _raise_if_generation_cancelled(cancellation_event)
 
     effective_system_instructions, cache_tools, cache_tool_config, forced_tool_name = _build_cache_profile_settings(
         system_instructions=system_instructions,
@@ -1257,7 +1369,10 @@ def _run_model_api(
             contents=prompt_text,
         ),
         description=f"Gemini generate_content ({model})",
+        cancellation_check=lambda: _raise_if_generation_cancelled(cancellation_event),
     )
+
+    _raise_if_generation_cancelled(cancellation_event)
 
     emit_cache_metric(
         "generate_content_response",
@@ -1288,4 +1403,5 @@ def _run_model_api(
     else:
         output = response.text or ""
         output += "\n\n" + function_output
+    _raise_if_generation_cancelled(cancellation_event)
     return output

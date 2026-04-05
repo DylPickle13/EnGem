@@ -94,9 +94,26 @@ def call_with_exponential_backoff(
     *,
     description: str = "Gemini API call",
     max_attempts: int | None = DEFAULT_MAX_ATTEMPTS,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> T:
+    def _sleep_with_cancellation(delay_seconds: float) -> None:
+        if delay_seconds <= 0:
+            if cancellation_check is not None:
+                cancellation_check()
+            return
+
+        remaining = delay_seconds
+        while remaining > 0:
+            if cancellation_check is not None:
+                cancellation_check()
+            sleep_for = min(0.1, remaining)
+            time.sleep(sleep_for)
+            remaining -= sleep_for
+
     attempt_number = 1
     while True:
+        if cancellation_check is not None:
+            cancellation_check()
         try:
             return operation()
         except Exception as exc:
@@ -114,7 +131,7 @@ def call_with_exponential_backoff(
                 f"{description} failed on attempt {attempt_number}{max_display}: {exc}. "
                 f"Retrying in {delay_seconds:.1f}s..."
             )
-            time.sleep(delay_seconds)
+            _sleep_with_cancellation(delay_seconds)
             attempt_number += 1
 
 

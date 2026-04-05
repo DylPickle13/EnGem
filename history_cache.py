@@ -90,7 +90,7 @@ def _json_safe(value):
     return str(value)
 
 
-HISTORY_CACHE_TTL = os.getenv("HISTORY_CACHE_TTL", "900s")
+HISTORY_CACHE_TTL = os.getenv("HISTORY_CACHE_TTL", "300s")
 MIN_HISTORY_CACHE_CHARS = _get_int_env("MIN_HISTORY_CACHE_CHARS", 4096, minimum=0)
 DEFAULT_MIN_CACHE_TOKENS = _get_int_env("DEFAULT_MIN_CACHE_TOKENS", 1024, minimum=1)
 TOKEN_ESTIMATE_LOWER_FACTOR = _get_float_env("TOKEN_ESTIMATE_LOWER_FACTOR", 0.75, minimum=0.05)
