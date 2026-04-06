@@ -737,15 +737,28 @@ def _normalize_execution_plan(execution_order_dict: dict, plan_key: str = "execu
     return []
 
 
-def _get_skill(function_name: str, function_args: dict) -> str:
+def _get_skill(
+    function_name: str,
+    function_args: dict,
+    cancellation_event: threading.Event | None = None,
+) -> str:
     """Helper function to execute a tool function based on its name and arguments, and return the output as a string."""
+    _raise_if_generation_cancelled(cancellation_event)
     function_output = ""
     for tool_file in (Path(__file__).parent / "tools").glob("*.py"):
         module_name = tool_file.stem
         module = __import__(f"tools.{module_name}", fromlist=[module_name])
         for _, attr in inspect.getmembers(module, inspect.isfunction):
             if attr.__module__ == module.__name__ and attr.__name__ == function_name:
-                result = attr(function_args[next(iter(function_args))])
+                _raise_if_generation_cancelled(cancellation_event)
+
+                primary_arg = function_args[next(iter(function_args))] if function_args else ""
+                if "cancellation_event" in inspect.signature(attr).parameters:
+                    result = attr(primary_arg, cancellation_event=cancellation_event)
+                else:
+                    result = attr(primary_arg)
+
+                _raise_if_generation_cancelled(cancellation_event)
                 function_output += result
     return function_output
 
@@ -1394,7 +1407,11 @@ def _run_model_api(
     if parts:
         for part in parts:
             if getattr(part, "function_call", None):
-                function_output += _get_skill(part.function_call.name, part.function_call.args)
+                function_output += _get_skill(
+                    part.function_call.name,
+                    part.function_call.args,
+                    cancellation_event=cancellation_event,
+                )
                     
     output = ""
 

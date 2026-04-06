@@ -7,7 +7,7 @@ from typing import Any
 from google import genai
 from google.genai import types
 from google.genai.types import Content, Part
-from playwright.sync_api import Browser, Page, Playwright, sync_playwright
+from playwright.sync_api import Browser, Page, Playwright, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from config import (
     BOT_RUNTIME_STATE_PATH,
@@ -37,6 +37,15 @@ _GENERATE_CONTENT_CONFIG_FIELDS = set(getattr(types.GenerateContentConfig, "__an
     dir(types.GenerateContentConfig)
 )
 _GENERATE_CONTENT_CONFIG_SUPPORTS_SERVICE_TIER = "service_tier" in _GENERATE_CONTENT_CONFIG_FIELDS
+
+
+class BrowserRunCancelledError(Exception):
+    """Raised when a user requests cancellation of an active browser-tool run."""
+
+
+def _raise_if_browser_cancelled(cancellation_event: threading.Event | None) -> None:
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise BrowserRunCancelledError("Browser run cancelled by user stop request.")
 
 
 def _select_model_for_loop(prompt: str) -> str:
@@ -269,13 +278,45 @@ def _is_scroll_state_changed(before_state: dict, after_state: dict) -> bool:
     )
 
 
+def _sleep_with_cancellation(seconds: float, cancellation_event: threading.Event | None) -> None:
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        _raise_if_browser_cancelled(cancellation_event)
+        sleep_for = min(0.1, remaining)
+        time.sleep(sleep_for)
+        remaining -= sleep_for
+
+
+def _wait_for_load_state_with_cancellation(
+    page: Page,
+    timeout_ms: int,
+    cancellation_event: threading.Event | None,
+) -> None:
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000
+    while True:
+        _raise_if_browser_cancelled(cancellation_event)
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            return
+
+        try:
+            page.wait_for_load_state(timeout=min(250, remaining_ms))
+            return
+        except PlaywrightTimeoutError:
+            if time.monotonic() >= deadline:
+                return
+
+
 def _execute_single_action(
     page: Page,
     fname: str,
     args: dict,
     screen_width: int,
     screen_height: int,
+    cancellation_event: threading.Event | None = None,
 ) -> dict:
+    _raise_if_browser_cancelled(cancellation_event)
+
     if fname == "open_web_browser":
         target_url = args.get("url") or args.get("target_url") or args.get("website")
         if target_url:
@@ -434,11 +475,11 @@ def _execute_single_action(
 
     if fname == "wait":
         seconds = float(args.get("seconds", 1))
-        time.sleep(max(0, seconds))
+        _sleep_with_cancellation(seconds, cancellation_event)
         return {}
 
     if fname == "wait_5_seconds":
-        time.sleep(5)
+        _sleep_with_cancellation(5, cancellation_event)
         return {}
 
     if fname == "go_back":
@@ -457,7 +498,13 @@ def _execute_single_action(
     return {"warning": f"Unimplemented or custom function: {fname}"}
 
 
-def execute_function_calls(candidate, page: Page, screen_width: int, screen_height: int):
+def execute_function_calls(
+    candidate,
+    page: Page,
+    screen_width: int,
+    screen_height: int,
+    cancellation_event: threading.Event | None = None,
+):
     results = []
     function_calls = []
     for part in candidate.content.parts:
@@ -465,6 +512,7 @@ def execute_function_calls(candidate, page: Page, screen_width: int, screen_heig
             function_calls.append(part.function_call)
 
     for function_call in function_calls:
+        _raise_if_browser_cancelled(cancellation_event)
         extra_fr_fields = {}
         # Check for safety decision
         if 'safety_decision' in function_call.args:
@@ -479,10 +527,20 @@ def execute_function_calls(candidate, page: Page, screen_width: int, screen_heig
         #print(f"  -> Executing: {fname}")
 
         try:
-            action_result = _execute_single_action(page, fname, args, screen_width, screen_height)
+            action_result = _execute_single_action(
+                page,
+                fname,
+                args,
+                screen_width,
+                screen_height,
+                cancellation_event=cancellation_event,
+            )
 
             # Wait for potential navigations/renders
-            page.wait_for_load_state(timeout=5000)
+            _wait_for_load_state_with_cancellation(page, timeout_ms=5000, cancellation_event=cancellation_event)
+
+        except BrowserRunCancelledError:
+            raise
 
         except Exception as e:
             print(f"Error executing {fname}: {e}")
@@ -617,8 +675,14 @@ def setup_browser() -> tuple[Playwright, Browser, Page]:
     return pw, br, page
 
 
-def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
+def run_agent_loop(
+    client: genai.Client,
+    page: Page,
+    prompt: str,
+    cancellation_event: threading.Event | None = None,
+) -> str:
     #print("Prompt:", prompt)
+    _raise_if_browser_cancelled(cancellation_event)
     active_inference_mode = _load_inference_mode_state()
     config = create_model_config(active_inference_mode)
     initial_screenshot = page.screenshot(type="png")
@@ -635,6 +699,7 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
     responses = ""
     for i in range(TURN_LIMIT):
         #print(f"\n--- Turn {i+1} ---")
+        _raise_if_browser_cancelled(cancellation_event)
         response = call_with_exponential_backoff(
             lambda: client.models.generate_content(
                 model=model_to_use,
@@ -642,7 +707,9 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
                 config=config,
             ),
             description=f"Gemini browser agent turn {i + 1}",
+            cancellation_check=lambda: _raise_if_browser_cancelled(cancellation_event),
         )
+        _raise_if_browser_cancelled(cancellation_event)
 
         candidate = response.candidates[0]
         contents.append(candidate.content)
@@ -653,7 +720,14 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
             responses += "".join(part.text for part in candidate.content.parts if part.text)
             break
 
-        results = execute_function_calls(candidate, page, SCREEN_WIDTH, SCREEN_HEIGHT)
+        results = execute_function_calls(
+            candidate,
+            page,
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT,
+            cancellation_event=cancellation_event,
+        )
+        _raise_if_browser_cancelled(cancellation_event)
 
         function_responses = get_function_responses(page, results)
 
@@ -661,4 +735,5 @@ def run_agent_loop(client: genai.Client, page: Page, prompt: str) -> str:
             Content(role="user", parts=[Part(function_response=fr) for fr in function_responses])
         )
         responses += "".join(part.text for part in candidate.content.parts if part.text)
+        _raise_if_browser_cancelled(cancellation_event)
     return responses
