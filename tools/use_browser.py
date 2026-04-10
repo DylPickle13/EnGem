@@ -13,12 +13,30 @@ from config import MINIMAL_MODEL as MINIMAL_MODEL
 
 # Browser Summarizer file located alongside this module
 BROWSER_SUMMARIZER_FILE = Path(__file__).parent.parent / "agent_instructions/browser_summarizer.md"
+_TOOL_RUNTIME_CONTEXT = threading.local()
 
-def use_browser(prompt: str, cancellation_event: threading.Event | None = None) -> str:
+
+def _set_tool_cancellation_event(cancellation_event: threading.Event | None) -> None:
+    _TOOL_RUNTIME_CONTEXT.cancellation_event = cancellation_event
+
+
+def _clear_tool_cancellation_event() -> None:
+    if hasattr(_TOOL_RUNTIME_CONTEXT, "cancellation_event"):
+        delattr(_TOOL_RUNTIME_CONTEXT, "cancellation_event")
+
+
+def _get_tool_cancellation_event() -> threading.Event | None:
+    event = getattr(_TOOL_RUNTIME_CONTEXT, "cancellation_event", None)
+    return event if isinstance(event, threading.Event) else None
+
+
+def use_browser(prompt: str) -> str:
     """
     Runs actions based on the provided prompt using the computer_use agent.
     Returns the output of the agent's actions as a string.
     """
+    cancellation_event = _get_tool_cancellation_event()
+
     if cancellation_event is not None and cancellation_event.is_set():
         return ""
 

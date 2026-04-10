@@ -752,14 +752,20 @@ def _get_skill(
             if attr.__module__ == module.__name__ and attr.__name__ == function_name:
                 _raise_if_generation_cancelled(cancellation_event)
 
-                primary_arg = function_args[next(iter(function_args))] if function_args else ""
-                if "cancellation_event" in inspect.signature(attr).parameters:
-                    result = attr(primary_arg, cancellation_event=cancellation_event)
-                else:
+                set_cancellation_hook = getattr(module, "_set_tool_cancellation_event", None)
+                clear_cancellation_hook = getattr(module, "_clear_tool_cancellation_event", None)
+                if callable(set_cancellation_hook):
+                    set_cancellation_hook(cancellation_event)
+
+                try:
+                    primary_arg = function_args[next(iter(function_args))] if function_args else ""
                     result = attr(primary_arg)
 
-                _raise_if_generation_cancelled(cancellation_event)
-                function_output += result
+                    _raise_if_generation_cancelled(cancellation_event)
+                    function_output += result
+                finally:
+                    if callable(clear_cancellation_hook):
+                        clear_cancellation_hook()
     return function_output
 
 
