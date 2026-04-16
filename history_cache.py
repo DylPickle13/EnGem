@@ -485,6 +485,44 @@ class HistoryContextCache:
                 cache_name=entry.cache_name,
             )
 
+    def invalidate_cached_content(
+        self,
+        *,
+        profile_key: str | None = None,
+        cache_name: str | None = None,
+    ) -> None:
+        normalized_cache_name = (cache_name or "").strip()
+        removed_cache_names: set[str] = set()
+
+        with self._lock:
+            if self._released:
+                return
+
+            if profile_key:
+                removed_entry = self.cache_entries_by_profile.pop(profile_key, None)
+                if removed_entry is not None and removed_entry.cache_name:
+                    removed_cache_names.add(removed_entry.cache_name)
+
+            if normalized_cache_name:
+                for existing_profile_key, entry in list(self.cache_entries_by_profile.items()):
+                    if entry.cache_name == normalized_cache_name:
+                        self.cache_entries_by_profile.pop(existing_profile_key, None)
+                        removed_cache_names.add(entry.cache_name)
+
+            if normalized_cache_name:
+                removed_cache_names.add(normalized_cache_name)
+
+        for removed_cache_name in removed_cache_names:
+            _remove_global_entry(removed_cache_name)
+
+        if removed_cache_names:
+            emit_cache_metric(
+                "history_cache_invalidated",
+                history_file=self.history_file,
+                cache_names=sorted(removed_cache_names),
+                profile_key=profile_key or "",
+            )
+
     def get_cached_content_entry(
         self,
         model: str,

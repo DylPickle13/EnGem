@@ -92,6 +92,7 @@ def run_python(code: str) -> str:
             [sys.executable, filename],
             capture_output=True,
             text=True,
+            timeout=300
         )
         stdout = result.stdout or ""
         stderr = result.stderr or ""

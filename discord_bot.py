@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import mimetypes
+import subprocess
+import sys
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
@@ -32,8 +34,13 @@ DISCORD_ATTACHMENT_BATCH_MAX_BYTES = 24 * 1024 * 1024
 DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
 MESSAGE_WORKER_CONCURRENCY = 3
 CALENDAR_EVENT_ENQUEUE_TIMEOUT_SECONDS = 30
-CHANNEL_HISTORY_DIR = Path(__file__).parent / "memory" / "channel_history"
-PROMPTS_DIR = Path(__file__).parent / "prompts"
+CRON_JOBS_INTERVAL_SECONDS = 10 * 60
+CRON_JOBS_SCRIPT_TIMEOUT_SECONDS = 5 * 60
+CRON_JOBS_ENQUEUE_TIMEOUT_SECONDS = 30
+REPO_ROOT = Path(__file__).parent
+CHANNEL_HISTORY_DIR = REPO_ROOT / "memory" / "channel_history"
+PROMPTS_DIR = REPO_ROOT / "prompts"
+CRON_JOBS_DIR = REPO_ROOT / "scripts" / "cron_jobs"
 BOT_RUNTIME_STATE_FILE = Path(BOT_RUNTIME_STATE_PATH)
 
 
@@ -107,6 +114,10 @@ class DiscordBotWrapper:
 		self._runtime_state_file = BOT_RUNTIME_STATE_FILE
 		self._inference_mode_lock = asyncio.Lock()
 		self._inference_mode = self._load_inference_mode_state()
+		self._cron_jobs_stop_event = threading.Event()
+		self._cron_jobs_thread: threading.Thread | None = None
+		self._cron_jobs_start_lock = threading.Lock()
+		self._cron_jobs_cycle_lock = threading.Lock()
 
 		intents = discord.Intents.default()
 		intents.message_content = True
@@ -708,11 +719,211 @@ class DiscordBotWrapper:
 				CHANNEL_HISTORY_DIR,
 			)
 
+	def _find_first_text_channel_by_name(self, channel_name: str) -> Optional[discord.TextChannel]:
+		for guild in self.client.guilds:
+			for channel in guild.text_channels:
+				if channel.name == channel_name:
+					return channel
+		return None
+
+	def _discover_cron_job_scripts(self) -> list[Path]:
+		if not CRON_JOBS_DIR.is_dir():
+			return []
+		return sorted(path for path in CRON_JOBS_DIR.glob("*.py") if path.is_file())
+
+	@staticmethod
+	def _channel_name_for_cron_script(script_path: Path) -> str:
+		raw_name = (script_path.stem or "").strip().lower()
+		if not raw_name:
+			return "cron-job"
+
+		normalized_chars: list[str] = []
+		last_was_hyphen = False
+		for ch in raw_name:
+			if ch.isalnum():
+				normalized_chars.append(ch)
+				last_was_hyphen = False
+			elif ch in {"-", "_", " ", "."}:
+				if not last_was_hyphen:
+					normalized_chars.append("-")
+					last_was_hyphen = True
+			else:
+				if not last_was_hyphen:
+					normalized_chars.append("-")
+					last_was_hyphen = True
+
+		channel_name = "".join(normalized_chars).strip("-")
+		return channel_name or "cron-job"
+
+	@staticmethod
+	def _run_cron_job_script(script_path: Path) -> tuple[int | None, str, str]:
+		try:
+			result = subprocess.run(
+				[sys.executable, str(script_path)],
+				capture_output=True,
+				text=True,
+				timeout=CRON_JOBS_SCRIPT_TIMEOUT_SECONDS,
+				cwd=str(REPO_ROOT),
+			)
+			return (
+				result.returncode,
+				(result.stdout or "").strip(),
+				(result.stderr or "").strip(),
+			)
+		except subprocess.TimeoutExpired as exc:
+			stdout = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else str(exc.stdout or "").strip()
+			stderr = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else str(exc.stderr or "").strip()
+			timeout_message = f"Timed out after {CRON_JOBS_SCRIPT_TIMEOUT_SECONDS} seconds."
+			if stderr:
+				stderr = f"{stderr}\n{timeout_message}"
+			else:
+				stderr = timeout_message
+			return None, stdout, stderr
+		except Exception as exc:
+			return None, "", f"Unhandled exception while starting script '{script_path.name}': {exc}"
+
+	@staticmethod
+	def _build_cron_job_report(script_name: str, return_code: int | None, stdout: str, stderr: str) -> str | None:
+		stdout = (stdout or "").strip()
+		stderr = (stderr or "").strip()
+		failed = return_code is None or return_code != 0
+		if not failed and not stdout and not stderr:
+			return None
+
+		lines = [f"[cron-job] {script_name}"]
+		if return_code is None:
+			lines.append("Status: failure")
+		elif return_code == 0:
+			lines.append("Status: success")
+		else:
+			lines.append(f"Status: failure (exit code {return_code})")
+
+		if stdout:
+			lines.append("stdout:")
+			lines.append(stdout)
+
+		if stderr:
+			lines.append("stderr:")
+			lines.append(stderr)
+
+		return "\n".join(lines).strip()
+
+	def _send_cron_report(self, channel_name: str, report: str, *, script_name: str) -> None:
+		channel_name = (channel_name or "").strip()
+		report = (report or "").strip()
+		if not channel_name or not report:
+			return
+
+		channel = self._find_first_text_channel_by_name(channel_name)
+		if channel is None:
+			logging.warning(
+				"No Discord channel named '%s' found for cron job script '%s'.",
+				channel_name,
+				script_name,
+			)
+			return
+
+		loop = self.client.loop
+		if not loop.is_running():
+			logging.info(
+				"Deferring cron report for script '%s': Discord loop is not running yet.",
+				script_name,
+			)
+			return
+
+		async def _send_report() -> None:
+			await self._send_long_message(channel, report)
+
+		future = None
+		try:
+			future = asyncio.run_coroutine_threadsafe(_send_report(), loop)
+			future.result(timeout=CRON_JOBS_ENQUEUE_TIMEOUT_SECONDS)
+		except FutureTimeoutError:
+			if future is not None:
+				future.cancel()
+			logging.warning(
+				"Timed out enqueueing cron report after %d seconds.",
+				CRON_JOBS_ENQUEUE_TIMEOUT_SECONDS,
+			)
+		except Exception:
+			logging.exception("Failed to send cron report to Discord.")
+
+	def _run_cron_jobs_cycle(self) -> None:
+		if not self._cron_jobs_cycle_lock.acquire(blocking=False):
+			logging.warning("Skipping cron job cycle because a previous cycle is still running.")
+			return
+
+		try:
+			scripts = self._discover_cron_job_scripts()
+			if not scripts:
+				logging.info("No cron job scripts found in %s.", CRON_JOBS_DIR)
+				return
+
+			stop_event = self._cron_jobs_stop_event
+			for script_path in scripts:
+				if stop_event is not None and stop_event.is_set():
+					break
+
+				return_code, stdout, stderr = self._run_cron_job_script(script_path)
+				report = self._build_cron_job_report(script_path.name, return_code, stdout, stderr)
+				if report:
+					channel_name = self._channel_name_for_cron_script(script_path)
+					self._send_cron_report(channel_name, report, script_name=script_path.name)
+		finally:
+			self._cron_jobs_cycle_lock.release()
+
+	def _cron_jobs_worker(self) -> None:
+		logging.info("Cron jobs runner started.")
+		stop_event = self._cron_jobs_stop_event
+		if stop_event is None:
+			logging.warning("Cron jobs runner exiting because stop event was not initialized.")
+			return
+
+		while not stop_event.is_set():
+			try:
+				self._run_cron_jobs_cycle()
+			except Exception:
+				logging.exception("Unhandled error while running cron jobs cycle.")
+			if stop_event.wait(CRON_JOBS_INTERVAL_SECONDS):
+				break
+
+		logging.info("Cron jobs runner stopped.")
+
+	def _start_cron_jobs_runner(self) -> None:
+		with self._cron_jobs_start_lock:
+			if self._cron_jobs_thread is not None and self._cron_jobs_thread.is_alive():
+				return
+
+			self._cron_jobs_stop_event = threading.Event()
+			self._cron_jobs_thread = threading.Thread(
+				target=self._cron_jobs_worker,
+				name="cron-jobs-runner",
+				daemon=False,
+			)
+			self._cron_jobs_thread.start()
+			logging.info("Started cron jobs runner with %d script(s) from %s.", len(self._discover_cron_job_scripts()), CRON_JOBS_DIR)
+
+	def stop_cron_jobs_runner(self, join_timeout_seconds: float = 5.0) -> None:
+		with self._cron_jobs_start_lock:
+			stop_event = self._cron_jobs_stop_event
+			thread = self._cron_jobs_thread
+			if stop_event is not None:
+				stop_event.set()
+
+		if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+			thread.join(timeout=join_timeout_seconds)
+
+		with self._cron_jobs_start_lock:
+			if self._cron_jobs_thread is thread and (thread is None or not thread.is_alive()):
+				self._cron_jobs_thread = None
+				self._cron_jobs_stop_event = None
+
 	def _register_events(self) -> None:
 		@self.client.event
 		async def on_ready() -> None:
 			logging.info("Discord bot logged in as %s", self.client.user)
 			self._ensure_channel_history_files()
+			self._start_cron_jobs_runner()
 
 		@self.client.event
 		async def on_message(message: discord.Message) -> None:
@@ -846,5 +1057,6 @@ if __name__ == "__main__":
 		print("Starting EnGem...")
 		bot.run()
 	finally:
+		bot.stop_cron_jobs_runner()
 		calendar_stop_event.set()
 		calendar_thread.join(5)

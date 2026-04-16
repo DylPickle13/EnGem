@@ -49,6 +49,7 @@ SUB_AGENT_INSTRUCTION_PREVIEW_CHARS = 200
 VALID_PLAN_THINKING_LEVELS = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
 STOP_BUTTON_LABEL = "Stop"
 STOP_BUTTON_TIMEOUT_SECONDS = 3600
+DISCORD_PROGRESS_OPERATION_TIMEOUT_SECONDS = 15
 
 
 def normalize_plan_thinking_level(raw_level: object) -> str:
@@ -273,6 +274,7 @@ class ExecutionPlanProgressIndicator:
         last_sent_state_signature: str | None = None
         embed_enabled = True
         thinking_step = 0
+        progress_updates_suspended = False
         started_at = self._execution_plan_started_at.get(tracker_key)
         if started_at is None:
             started_at = time.monotonic()
@@ -306,41 +308,44 @@ class ExecutionPlanProgressIndicator:
                 else self._build_payload_signature(effective_message_content, None)
             )
 
-            try:
-                cancellation_event = self._execution_plan_cancellation_events.get(tracker_key)
-                if cancellation_event is not None and cancellation_event.is_set():
-                    return
+            if not progress_updates_suspended:
+                try:
+                    cancellation_event = self._execution_plan_cancellation_events.get(tracker_key)
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        return
 
-                if progress_message is None:
-                    progress_message, _, embed_enabled = await self._send_progress_message(
-                        channel=channel,
-                        tracker_key=tracker_key,
-                        history_file=history_file,
-                        message_content=effective_message_content,
-                        progress_embed=progress_embed,
-                        embed_enabled=embed_enabled,
+                    if progress_message is None:
+                        progress_message, sent_state_signature, embed_enabled = await self._send_progress_message(
+                            channel=channel,
+                            tracker_key=tracker_key,
+                            history_file=history_file,
+                            message_content=effective_message_content,
+                            progress_embed=progress_embed,
+                            embed_enabled=embed_enabled,
+                        )
+                        last_sent_state_signature = sent_state_signature
+                        self._execution_plan_progress_messages[tracker_key] = progress_message
+                    elif effective_state_signature != last_sent_state_signature:
+                        progress_message, sent_state_signature, embed_enabled = await self._edit_progress_message(
+                            channel=channel,
+                            tracker_key=tracker_key,
+                            history_file=history_file,
+                            progress_message=progress_message,
+                            message_content=effective_message_content,
+                            progress_embed=progress_embed,
+                            embed_enabled=embed_enabled,
+                        )
+                        last_sent_state_signature = sent_state_signature
+                        self._execution_plan_progress_messages[tracker_key] = progress_message
+                except Exception as exc:
+                    logging.exception(
+                        "Failed to send/edit execution progress message for history '%s': %s. "
+                        "Suspending progress updates for this run while execution continues.",
+                        history_file,
+                        exc,
                     )
-                    last_sent_state_signature = effective_state_signature
-                    self._execution_plan_progress_messages[tracker_key] = progress_message
-                elif effective_state_signature != last_sent_state_signature:
-                    progress_message, _, embed_enabled = await self._edit_progress_message(
-                        channel=channel,
-                        tracker_key=tracker_key,
-                        history_file=history_file,
-                        progress_message=progress_message,
-                        message_content=effective_message_content,
-                        progress_embed=progress_embed,
-                        embed_enabled=embed_enabled,
-                    )
-                    last_sent_state_signature = effective_state_signature
-                    self._execution_plan_progress_messages[tracker_key] = progress_message
-            except Exception as exc:
-                logging.exception(
-                    "Failed to send/edit execution progress message for history '%s': %s",
-                    history_file,
-                    exc,
-                )
-                return
+                    embed_enabled = False
+                    progress_updates_suspended = True
 
             if all_completed:
                 return
@@ -413,7 +418,10 @@ class ExecutionPlanProgressIndicator:
         progress_message = self._execution_plan_progress_messages.pop(tracker_key, None)
         if progress_message is not None:
             try:
-                await progress_message.delete()
+                await asyncio.wait_for(
+                    progress_message.delete(),
+                    timeout=DISCORD_PROGRESS_OPERATION_TIMEOUT_SECONDS,
+                )
             except Exception:
                 pass
 
@@ -715,7 +723,10 @@ class ExecutionPlanProgressIndicator:
 
         if embed_enabled and progress_embed is not None:
             try:
-                message = await channel.send(embed=progress_embed, view=stop_view)
+                message = await asyncio.wait_for(
+                    channel.send(embed=progress_embed, view=stop_view),
+                    timeout=DISCORD_PROGRESS_OPERATION_TIMEOUT_SECONDS,
+                )
                 return message, self._build_payload_signature("", progress_embed), True
             except Exception as embed_exc:
                 logging.warning(
@@ -725,7 +736,10 @@ class ExecutionPlanProgressIndicator:
                 )
 
         fallback_content = message_content or self._build_thinking_indicator(0)
-        message = await channel.send(fallback_content, view=stop_view)
+        message = await asyncio.wait_for(
+            channel.send(fallback_content, view=stop_view),
+            timeout=DISCORD_PROGRESS_OPERATION_TIMEOUT_SECONDS,
+        )
         return message, self._build_payload_signature(fallback_content, None), False
 
     async def _edit_progress_message(
@@ -745,7 +759,10 @@ class ExecutionPlanProgressIndicator:
 
         if embed_enabled and progress_embed is not None:
             try:
-                await progress_message.edit(content=None, embed=progress_embed, view=stop_view)
+                await asyncio.wait_for(
+                    progress_message.edit(content=None, embed=progress_embed, view=stop_view),
+                    timeout=DISCORD_PROGRESS_OPERATION_TIMEOUT_SECONDS,
+                )
                 return progress_message, self._build_payload_signature("", progress_embed), True
             except discord.NotFound:
                 return await self._send_progress_message(
@@ -765,7 +782,10 @@ class ExecutionPlanProgressIndicator:
 
         try:
             fallback_content = message_content or self._build_thinking_indicator(0)
-            await progress_message.edit(content=fallback_content, embed=None, view=stop_view)
+            await asyncio.wait_for(
+                progress_message.edit(content=fallback_content, embed=None, view=stop_view),
+                timeout=DISCORD_PROGRESS_OPERATION_TIMEOUT_SECONDS,
+            )
             return progress_message, self._build_payload_signature(fallback_content, None), False
         except discord.NotFound:
             return await self._send_progress_message(

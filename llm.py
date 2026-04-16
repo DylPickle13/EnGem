@@ -1084,6 +1084,24 @@ def _normalize_force_tool_name(raw_force_tool: object) -> str:
     return normalized if normalized else ""
 
 
+def _is_cached_content_not_found_error(error: Exception) -> bool:
+    normalized_error = str(error or "").strip().lower()
+    if not normalized_error:
+        return False
+
+    if "cachedcontent not found" in normalized_error:
+        return True
+    if "cached content not found" in normalized_error:
+        return True
+    if "cached content" in normalized_error and "not found" in normalized_error:
+        return True
+    if "permission_denied" in normalized_error and "cachedcontent" in normalized_error:
+        return True
+    if "permission denied" in normalized_error and "cachedcontent" in normalized_error:
+        return True
+    return False
+
+
 def _get_forced_tool_instructions(forced_tool_name: str) -> str:
     normalized_tool_name = _normalize_force_tool_name(forced_tool_name)
     if not normalized_tool_name:
@@ -1321,6 +1339,10 @@ def _run_model_api(
     prompt_text = text
     cached_content_name = None
     cache_profile: CachedContentProfile | None = None
+    working_history_text = current_history_text
+    if history_cache is not None and working_history_text is None:
+        working_history_text = history_cache.history_text
+
     if history_cache is not None:
         cache_profile = create_cached_content_profile(
             model=model,
@@ -1333,10 +1355,10 @@ def _run_model_api(
             profile=cache_profile,
             model=model,
             dynamic_text=text,
-            current_history_text=current_history_text,
+            current_history_text=working_history_text,
         )
-    elif current_history_text is not None:
-        prompt_text = compose_uncached_history_prompt(current_history_text, text)
+    elif working_history_text is not None:
+        prompt_text = compose_uncached_history_prompt(working_history_text, text)
 
     if cached_content_name:
         config = _build_generate_content_config(
@@ -1381,15 +1403,71 @@ def _run_model_api(
         inference_mode=active_inference_mode,
     )
 
-    response = call_with_exponential_backoff(
-        lambda: client.models.generate_content(
+    try:
+        response = call_with_exponential_backoff(
+            lambda: client.models.generate_content(
+                model=model,
+                config=config,
+                contents=prompt_text,
+            ),
+            description=f"Gemini generate_content ({model})",
+            cancellation_check=lambda: _raise_if_generation_cancelled(cancellation_event),
+        )
+    except Exception as e:
+        if not cached_content_name or not _is_cached_content_not_found_error(e):
+            raise
+
+        if history_cache is not None:
+            history_cache.invalidate_cached_content(
+                profile_key=cache_profile.profile_key if cache_profile is not None else None,
+                cache_name=cached_content_name,
+            )
+
+        emit_cache_metric(
+            "generate_content_cached_content_not_found_retry_uncached",
             model=model,
-            config=config,
-            contents=prompt_text,
-        ),
-        description=f"Gemini generate_content ({model})",
-        cancellation_check=lambda: _raise_if_generation_cancelled(cancellation_event),
-    )
+            cached_content_name=cached_content_name,
+            inference_mode=active_inference_mode,
+        )
+
+        prompt_text = compose_uncached_history_prompt(working_history_text or "", text)
+        cached_content_name = None
+        config = _build_generate_content_config(
+            config_kwargs={
+                "system_instruction": effective_system_instructions,
+                "tool_config": cache_tool_config,
+                "tools": cache_tools or [],
+                "temperature": temperature,
+                "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                    disable=bool(forced_tool_name)
+                ),
+                "thinking_config": thinking_config,
+                "cached_content": None,
+            },
+            inference_mode=active_inference_mode,
+            flex_timeout_ms=flex_timeout_ms,
+        )
+
+        emit_cache_metric(
+            "generate_content_request",
+            model=model,
+            cached_content_used=False,
+            cached_content_name="",
+            tool_use_allowed=tool_use_allowed,
+            forced_tool_name=forced_tool_name,
+            prompt_chars=len(prompt_text or ""),
+            inference_mode=active_inference_mode,
+        )
+
+        response = call_with_exponential_backoff(
+            lambda: client.models.generate_content(
+                model=model,
+                config=config,
+                contents=prompt_text,
+            ),
+            description=f"Gemini generate_content ({model})",
+            cancellation_check=lambda: _raise_if_generation_cancelled(cancellation_event),
+        )
 
     _raise_if_generation_cancelled(cancellation_event)
 
