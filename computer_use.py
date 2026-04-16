@@ -264,6 +264,104 @@ def _resolve_scroll_target(args: dict, screen_width: int, screen_height: int) ->
     return screen_width // 2, screen_height // 2
 
 
+def _normalize_key_token(raw_key: object) -> str:
+    key = str(raw_key).strip()
+    if not key:
+        return ""
+
+    compact = key.replace("_", "").replace("-", "").replace(" ", "").lower()
+    key_map = {
+        "ctrl": "Control",
+        "control": "Control",
+        "ctl": "Control",
+        "cmd": "Meta",
+        "command": "Meta",
+        "meta": "Meta",
+        "win": "Meta",
+        "windows": "Meta",
+        "super": "Meta",
+        "alt": "Alt",
+        "option": "Alt",
+        "opt": "Alt",
+        "shift": "Shift",
+        "enter": "Enter",
+        "return": "Enter",
+        "esc": "Escape",
+        "escape": "Escape",
+        "space": "Space",
+        "spacebar": "Space",
+        "tab": "Tab",
+        "backspace": "Backspace",
+        "delete": "Delete",
+        "del": "Delete",
+        "insert": "Insert",
+        "home": "Home",
+        "end": "End",
+        "pageup": "PageUp",
+        "pagedown": "PageDown",
+        "up": "ArrowUp",
+        "arrowup": "ArrowUp",
+        "down": "ArrowDown",
+        "arrowdown": "ArrowDown",
+        "left": "ArrowLeft",
+        "arrowleft": "ArrowLeft",
+        "right": "ArrowRight",
+        "arrowright": "ArrowRight",
+    }
+
+    if compact in key_map:
+        return key_map[compact]
+
+    if len(key) == 1:
+        return key.lower()
+
+    if compact.startswith("f") and compact[1:].isdigit():
+        return f"F{int(compact[1:])}"
+
+    return key
+
+
+def _normalize_shortcut(shortcut: object) -> str | None:
+    if shortcut is None:
+        return None
+
+    if isinstance(shortcut, (list, tuple)):
+        parts = [_normalize_key_token(part) for part in shortcut]
+    else:
+        text = str(shortcut).strip()
+        if not text:
+            return None
+        parts = [_normalize_key_token(part) for part in text.split("+")]
+
+    parts = [part for part in parts if part]
+    if not parts:
+        return None
+    return "+".join(parts)
+
+
+def _press_key_sequence(page: Page, raw_keys: object) -> list[str]:
+    if raw_keys is None:
+        return []
+
+    if isinstance(raw_keys, (list, tuple)):
+        key_chunks = [raw_keys]
+    else:
+        text = str(raw_keys).strip()
+        if not text:
+            return []
+        key_chunks = [chunk.strip() for chunk in text.split(",") if chunk.strip()]
+
+    pressed_combinations: list[str] = []
+    for chunk in key_chunks:
+        normalized = _normalize_shortcut(chunk)
+        if not normalized:
+            continue
+        page.keyboard.press(normalized)
+        pressed_combinations.append(normalized)
+
+    return pressed_combinations
+
+
 def _is_scroll_state_changed(before_state: dict, after_state: dict) -> bool:
     numeric_before = isinstance(before_state.get("docTop"), (int, float))
     numeric_after = isinstance(after_state.get("docTop"), (int, float))
@@ -415,11 +513,47 @@ def _execute_single_action(
             page.keyboard.press("Enter")
         return {}
 
+    if fname == "search":
+        search_text = args.get("query") or args.get("text") or args.get("search_query")
+        if search_text:
+            page.keyboard.type(str(search_text))
+
+        key_override = args.get("keys") or args.get("key")
+        if key_override:
+            pressed = _press_key_sequence(page, key_override)
+            if not pressed:
+                page.keyboard.press("Enter")
+        else:
+            should_submit = bool(args.get("submit", args.get("press_enter", True)))
+            if should_submit:
+                page.keyboard.press("Enter")
+
+        return {}
+
+    if fname == "key_combination":
+        raw_keys = (
+            args.get("keys")
+            or args.get("combination")
+            or args.get("key_combination")
+            or args.get("shortcut")
+            or args.get("key")
+        )
+        if raw_keys is None:
+            return {"error": "Missing keys argument"}
+
+        pressed = _press_key_sequence(page, raw_keys)
+        if not pressed:
+            return {"error": "No valid key combinations found"}
+        return {"pressed": pressed}
+
     if fname in {"press_key", "keyboard_press"}:
         key = args.get("key")
         if not key:
             return {"error": "Missing key argument"}
-        page.keyboard.press(key)
+        normalized_key = _normalize_shortcut(key)
+        if not normalized_key:
+            return {"error": "Invalid key argument"}
+        page.keyboard.press(normalized_key)
         return {}
 
     if fname in {

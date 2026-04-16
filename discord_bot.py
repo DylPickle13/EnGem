@@ -20,6 +20,7 @@ from config import (
 )
 
 import discord
+import api_backoff
 import calendar_events
 import history
 import llm
@@ -37,6 +38,7 @@ CALENDAR_EVENT_ENQUEUE_TIMEOUT_SECONDS = 30
 CRON_JOBS_INTERVAL_SECONDS = 10 * 60
 CRON_JOBS_SCRIPT_TIMEOUT_SECONDS = 5 * 60
 CRON_JOBS_ENQUEUE_TIMEOUT_SECONDS = 30
+DISCORD_SEND_MAX_ATTEMPTS = 5
 REPO_ROOT = Path(__file__).parent
 CHANNEL_HISTORY_DIR = REPO_ROOT / "memory" / "channel_history"
 PROMPTS_DIR = REPO_ROOT / "prompts"
@@ -202,11 +204,32 @@ class DiscordBotWrapper:
 		except llm.GenerationCancelledError:
 			return llm.LLMResponse(text="", media_paths=[])
 
+	async def _call_discord_api_with_backoff(
+		self,
+		operation: Callable[[], Awaitable[Any]],
+		*,
+		description: str,
+	) -> Any:
+		return await api_backoff.async_call_with_exponential_backoff(
+			operation,
+			description=description,
+			max_attempts=DISCORD_SEND_MAX_ATTEMPTS,
+		)
+
+	async def _send_text_with_backoff(self, channel: discord.abc.Messageable, text: str) -> None:
+		async def _send() -> None:
+			await channel.send(text)
+
+		await self._call_discord_api_with_backoff(
+			_send,
+			description="Discord text message send",
+		)
+
 	async def _send_long_message(self, channel: discord.abc.Messageable, text: str) -> None:
 		if not text:
 			return
 		for start in range(0, len(text), DISCORD_MESSAGE_LIMIT):
-			await channel.send(text[start : start + DISCORD_MESSAGE_LIMIT])
+			await self._send_text_with_backoff(channel, text[start : start + DISCORD_MESSAGE_LIMIT])
 
 	@staticmethod
 	def _normalize_response_payload(response: llm.LLMResponse | str) -> llm.LLMResponse:
@@ -354,11 +377,24 @@ class DiscordBotWrapper:
 		if not batch_paths:
 			return []
 
-		files: list[discord.File] = []
+		async def _send_batch_once() -> None:
+			files: list[discord.File] = []
+			try:
+				for path in batch_paths:
+					files.append(discord.File(str(path), filename=path.name))
+				await channel.send(files=files)
+			finally:
+				for file_obj in files:
+					try:
+						file_obj.close()
+					except Exception:
+						pass
+
 		try:
-			for path in batch_paths:
-				files.append(discord.File(str(path), filename=path.name))
-			await channel.send(files=files)
+			await self._call_discord_api_with_backoff(
+				_send_batch_once,
+				description="Discord media batch send",
+			)
 			return []
 		except discord.HTTPException as exc:
 			if getattr(exc, "code", None) == 40005:
@@ -372,12 +408,6 @@ class DiscordBotWrapper:
 				logging.warning("Skipping attachment '%s': Discord rejected the file as too large.", single_path)
 				return [str(single_path)]
 			raise
-		finally:
-			for file_obj in files:
-				try:
-					file_obj.close()
-				except Exception:
-					pass
 
 	@staticmethod
 	def _build_prompt(content: str, attachment_text: str) -> str:
@@ -535,7 +565,10 @@ class DiscordBotWrapper:
 				raise
 			except Exception as exc:
 				logging.exception("Error handling Discord message: %s", exc)
-				await message.channel.send("Error processing your message: " + str(exc))
+				try:
+					await self._send_long_message(message.channel, "Error processing your message: " + str(exc))
+				except Exception:
+					logging.exception("Failed to send error-processing message to Discord.")
 			finally:
 				self._message_queue.task_done()
 
@@ -545,7 +578,8 @@ class DiscordBotWrapper:
 		history_file = _get_history_file_key_for_channel(message.channel)
 
 		if content == f"{self.command_prefix}commands":
-			await message.channel.send(
+			await self._send_long_message(
+				message.channel,
 				"Available commands:\n"
 				f"- {self.command_prefix}commands\n"
 				f"- {self.command_prefix}inference mode\n"
@@ -560,7 +594,8 @@ class DiscordBotWrapper:
 			return True
 
 		if content_lower in {f"{self.command_prefix}inference mode", f"{self.command_prefix}mode"}:
-			await message.channel.send(
+			await self._send_long_message(
+				message.channel,
 				f"Inference mode is currently '{self._inference_mode}'. This setting persists across restarts."
 			)
 			return True
@@ -573,15 +608,16 @@ class DiscordBotWrapper:
 				changed, active_mode = await self._set_inference_mode(INFERENCE_MODE_STANDARD)
 			except Exception as exc:
 				logging.exception("Failed updating inference mode.")
-				await message.channel.send(f"Failed to set inference mode: {exc}")
+				await self._send_long_message(message.channel, f"Failed to set inference mode: {exc}")
 				return True
 
 			if changed:
-				await message.channel.send(
+				await self._send_long_message(
+					message.channel,
 					f"Inference mode set to {active_mode}. This setting persists across restarts."
 				)
 			else:
-				await message.channel.send(f"Inference mode is already {active_mode}.")
+				await self._send_long_message(message.channel, f"Inference mode is already {active_mode}.")
 			return True
 
 		if content_lower in {
@@ -592,21 +628,23 @@ class DiscordBotWrapper:
 				changed, active_mode = await self._set_inference_mode(INFERENCE_MODE_FLEX)
 			except Exception as exc:
 				logging.exception("Failed updating inference mode.")
-				await message.channel.send(f"Failed to set inference mode: {exc}")
+				await self._send_long_message(message.channel, f"Failed to set inference mode: {exc}")
 				return True
 
 			if changed:
-				await message.channel.send(
+				await self._send_long_message(
+					message.channel,
 					f"Inference mode set to {active_mode}. This setting persists across restarts."
 				)
 			else:
-				await message.channel.send(f"Inference mode is already {active_mode}.")
+				await self._send_long_message(message.channel, f"Inference mode is already {active_mode}.")
 			return True
 
 		if content_lower.startswith(f"{self.command_prefix}inference mode") or content_lower.startswith(
 			f"{self.command_prefix}set inference mode"
 		):
-			await message.channel.send(
+			await self._send_long_message(
+				message.channel,
 				"Usage:\n"
 				f"- {self.command_prefix}inference mode\n"
 				f"- {self.command_prefix}inference mode standard\n"
@@ -616,15 +654,16 @@ class DiscordBotWrapper:
 
 		if content == f"{self.command_prefix}history length":
 			history_text = history.get_conversation_history(history_file=history_file)
-			await message.channel.send(f"Conversation history length: {len(history_text)}")
+			await self._send_long_message(message.channel, f"Conversation history length: {len(history_text)}")
 			return True
 		if content == f"{self.command_prefix}clear history":
 			history.clear_history(history_file=history_file)
-			await message.channel.send("Conversation history cleared.")
+			await self._send_long_message(message.channel, "Conversation history cleared.")
 			return True
 		if content in {f"{self.command_prefix}clear memory", f"{self.command_prefix}clear_memory"}:
 			cleared_counts = memory.clear_all_memory_stores()
-			await message.channel.send(
+			await self._send_long_message(
+				message.channel,
 				"Memory cleared. Removed "
 				f"{cleared_counts['total']} entr{'y' if cleared_counts['total'] == 1 else 'ies'} "
 				f"({cleared_counts['semantic']} semantic, {cleared_counts['files']} file, {cleared_counts.get('skills', 0)} skill)."
@@ -633,7 +672,7 @@ class DiscordBotWrapper:
 		if content.startswith(f"{self.command_prefix}forget memories"):
 			topic = content[len(f"{self.command_prefix}forget memories"):].strip()
 			if not topic:
-				await message.channel.send(f"Usage: {self.command_prefix}forget memories {{topic}}")
+				await self._send_long_message(message.channel, f"Usage: {self.command_prefix}forget memories {{topic}}")
 				return True
 
 			result = await asyncio.to_thread(memory.forget_memories, topic)
@@ -646,13 +685,14 @@ class DiscordBotWrapper:
 				try:
 					limit = int(parts[2])
 				except Exception:
-					await message.channel.send(
+					await self._send_long_message(
+						message.channel,
 						f"Usage: {self.command_prefix}list memories [limit] — limit must be an integer."
 					)
 					return True
 			memories = memory.read_all_memory_records(limit=limit)
 			if not memories:
-				await message.channel.send("No memories stored.")
+				await self._send_long_message(message.channel, "No memories stored.")
 				return True
 			formatted = []
 			for m in memories:
@@ -692,7 +732,7 @@ class DiscordBotWrapper:
 				attachment_text = await self._read_text_attachment(text_attachment)
 
 			if not attachment_text:
-				await message.channel.send("Could not read .txt attachment (empty result).")
+				await self._send_long_message(message.channel, "Could not read .txt attachment (empty result).")
 				return
 
 			prompt = self._build_prompt(content, attachment_text)
@@ -790,7 +830,7 @@ class DiscordBotWrapper:
 		if not failed and not stdout and not stderr:
 			return None
 
-		lines = [f"[cron-job] {script_name}"]
+		lines = [f"{script_name}"]
 		if return_code is None:
 			lines.append("Status: failure")
 		elif return_code == 0:
