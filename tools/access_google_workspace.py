@@ -21,10 +21,14 @@ from config import (
     DEFAULT_INFERENCE_MODE as DEFAULT_INFERENCE_MODE,
     INFERENCE_MODE_FLEX as INFERENCE_MODE_FLEX,
     MINIMAL_MODEL as MINIMAL_MODEL,
+    GOOGLE_API_KEY as GOOGLE_API_KEY,
+    GOOGLE_API_KEY_PATH as GOOGLE_API_KEY_PATH,
 )
 
 PLANNER_INSTRUCTIONS_FILE = _REPO_ROOT / "agent_instructions" / "google_workspace_planner.md"
 RUNTIME_SETTING_KEYS = [
+    "api_key",
+    "api_key_file",
     "token",
     "credentials_file",
     "client_id",
@@ -67,10 +71,70 @@ _FLEX_SUPPORTED_MODELS = {
     "gemini-2.5-flash-lite",
 }
 _MINIMAL_MODEL_SUPPORTS_FLEX = str(MINIMAL_MODEL).strip().lower() in _FLEX_SUPPORTED_MODELS
+DEFAULT_API_KEY_FILE = str(GOOGLE_API_KEY_PATH or "").strip() or "google_api_key.txt"
 
 
 def _repo_root() -> Path:
     return _REPO_ROOT
+
+
+def _read_api_key_file(path_value: Any) -> str:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return ""
+
+    key_path = Path(path_text).expanduser()
+    if not key_path.exists():
+        return ""
+
+    try:
+        key_contents = key_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+    for line in key_contents.splitlines():
+        candidate = line.strip()
+        if candidate:
+            return candidate
+    return ""
+
+
+def _resolve_api_key_from_payload(payload: dict[str, Any]) -> str:
+    direct_api_key = str(payload.get("api_key") or "").strip()
+    if direct_api_key:
+        return direct_api_key
+
+    env_api_key = str(os.getenv("GOOGLE_API_KEY") or GOOGLE_API_KEY or "").strip()
+    if env_api_key:
+        return env_api_key
+
+    api_key_file = str(payload.get("api_key_file") or DEFAULT_API_KEY_FILE).strip() or DEFAULT_API_KEY_FILE
+    return _read_api_key_file(api_key_file)
+
+
+def _merge_api_key_into_params(
+    params_value: dict[str, Any] | str | None,
+    *,
+    api_key: str,
+) -> dict[str, Any] | str | None:
+    if not api_key:
+        return params_value
+
+    if params_value is None:
+        return {"key": api_key}
+
+    if isinstance(params_value, dict):
+        merged = dict(params_value)
+        merged.setdefault("key", api_key)
+        return merged
+
+    if isinstance(params_value, str):
+        parsed = _parse_json_response(params_value)
+        if isinstance(parsed, dict):
+            parsed.setdefault("key", api_key)
+            return parsed
+
+    return params_value
 
 
 def _json_dumps(value: Any) -> str:
@@ -195,6 +259,11 @@ def _build_gws_env(runtime_data: dict[str, Any]) -> dict[str, str]:
         value = runtime_data.get(payload_key)
         if value is not None and value != "":
             env[env_key] = str(value)
+
+    api_key = _resolve_api_key_from_payload(runtime_data)
+    if api_key:
+        env.setdefault("GOOGLE_API_KEY", api_key)
+
     return env
 
 
@@ -487,6 +556,7 @@ def _build_call_args(payload: dict[str, Any]) -> tuple[list[str], str | None] | 
     params_value, error = _combine_params(payload)
     if error:
         return error
+    params_value = _merge_api_key_into_params(params_value, api_key=_resolve_api_key_from_payload(payload))
     _append_params_flag(args, params_value)
 
     json_error = _append_json_flag(args, payload.get("json", payload.get("body")))
@@ -523,6 +593,10 @@ def _build_raw_args(payload: dict[str, Any]) -> tuple[list[str], str | None] | s
     params_value, error = _combine_params(payload)
     if error:
         return error
+
+    if args and args[0] not in {"auth", "schema"} and "--help" not in args:
+        params_value = _merge_api_key_into_params(params_value, api_key=_resolve_api_key_from_payload(payload))
+
     _append_params_flag(args, params_value)
 
     json_error = _append_json_flag(args, payload.get("json", payload.get("body")))
@@ -1949,6 +2023,17 @@ def access_google_workspace(query: str = "") -> str:
     return interpreted
 
 
+def _build_runtime_data(args: Any) -> dict[str, Any]:
+    runtime_data: dict[str, Any] = {}
+    if getattr(args, "timeout", None) is not None:
+        runtime_data["timeout"] = int(args.timeout)
+    if getattr(args, "api_key", None):
+        runtime_data["api_key"] = str(args.api_key)
+    if getattr(args, "api_key_file", None):
+        runtime_data["api_key_file"] = str(args.api_key_file)
+    return runtime_data
+
+
 def main() -> None:
     import argparse
 
@@ -1961,8 +2046,16 @@ def main() -> None:
     parser.add_argument("-f", "--file", dest="query_file", help="Path to a plain-text query file")
     parser.add_argument("--smoke", action="store_true", help="Run the built-in smoke suite")
     parser.add_argument("-t", "--timeout", type=int, help="Override timeout in seconds")
+    parser.add_argument("--api-key", help="Google API key (same key used by access_youtube)")
+    parser.add_argument(
+        "--api-key-file",
+        default=DEFAULT_API_KEY_FILE,
+        help="Path to text file containing Google API key",
+    )
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output when possible")
     args = parser.parse_args()
+
+    runtime_data = _build_runtime_data(args)
 
     try:
         if args.smoke:
@@ -1980,10 +2073,6 @@ def main() -> None:
             query_text = sys.stdin.read()
         else:
             raise SystemExit(_run_smoke_suite(pretty=args.pretty, timeout=args.timeout))
-
-        runtime_data: dict[str, Any] = {}
-        if args.timeout is not None:
-            runtime_data["timeout"] = int(args.timeout)
 
         output = _run_query_action(query_text, runtime_data=runtime_data)
         print(_format_output(output, pretty=args.pretty))

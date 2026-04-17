@@ -19,24 +19,24 @@ from config import (
     INFERENCE_MODE_FLEX as INFERENCE_MODE_FLEX,
     MINIMAL_MODEL as MINIMAL_MODEL,
     MEDIUM_MODEL as MEDIUM_MODEL,
+    GOOGLE_API_KEY as GOOGLE_API_KEY,
+    GOOGLE_API_KEY_PATH as GOOGLE_API_KEY_PATH,
 )
 
 try:
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
 except Exception as e:  # pragma: no cover - helpful import-time error
     raise ImportError(
         "Missing Google API dependencies. Install with:\n"
-        "pip install google-api-python-client google-auth-oauthlib google-auth-httplib2"
+        "pip install google-api-python-client"
     ) from e
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
+DEFAULT_API_KEY_FILE = str(GOOGLE_API_KEY_PATH or "").strip() or "google_api_key.txt"
 SMOKE_TEST_QUERIES: list[tuple[str, str]] = [
     (
         "search via api",
@@ -47,8 +47,8 @@ SMOKE_TEST_QUERIES: list[tuple[str, str]] = [
         "Call videos.list with params part=snippet,contentDetails,statistics and id=dQw4w9WgXcQ.",
     ),
     (
-        "my channels via api",
-        "Call channels.list with params part=snippet,contentDetails,statistics, mine=true, maxResults=10.",
+        "channel details via api",
+        "Call channels.list with params part=snippet,contentDetails,statistics and id=UC_x5XG1OV2P6uZZ5FSM9Ttw.",
     ),
 ]
 
@@ -65,43 +65,54 @@ _FLEX_SUPPORTED_MODELS = {
 _MINIMAL_MODEL_SUPPORTS_FLEX = str(MINIMAL_MODEL).strip().lower() in _FLEX_SUPPORTED_MODELS
 
 
-def _get_credentials(client_secrets_file: Optional[str] = None, credentials_file: str = "youtube_token.json", scopes=SCOPES) -> Credentials:
-    creds: Optional[Credentials] = None
-    if credentials_file and os.path.exists(credentials_file):
-        try:
-            creds = Credentials.from_authorized_user_file(credentials_file, scopes)
-        except Exception:
-            creds = None
+def _read_api_key_file(path_value: Any) -> str:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return ""
 
-    if creds and creds.valid:
-        return creds
+    key_path = Path(path_text).expanduser()
+    if not key_path.exists():
+        return ""
 
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        if credentials_file:
-            with open(credentials_file, "w") as f:
-                f.write(creds.to_json())
-        return creds
+    try:
+        key_contents = key_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
 
-    if not client_secrets_file:
-        raise ValueError("No valid credentials found and no client_secrets_file provided to run OAuth flow.")
-
-    flow = InstalledAppFlow.from_client_secrets_file(client_secrets_file, scopes)
-    creds = flow.run_local_server(port=0)
-    if credentials_file:
-        with open(credentials_file, "w") as f:
-            f.write(creds.to_json())
-    return creds
+    for line in key_contents.splitlines():
+        candidate = line.strip()
+        if candidate:
+            return candidate
+    return ""
 
 
-def _build_service(client_secrets_file: Optional[str] = None, credentials_file: Optional[str] = None):
-    """Return an authenticated YouTube API service object using OAuth credentials.
+def _resolve_api_key(*, runtime_data: dict[str, Any], payload: dict[str, Any]) -> tuple[str, str]:
+    direct_api_key = str(runtime_data.get("api_key") or payload.get("api_key") or "").strip()
+    if direct_api_key:
+        return direct_api_key, "--api-key"
 
-    The function will try to load existing credentials from `credentials_file`.
-    If none are present or valid, it will run the OAuth flow using `client_secrets_file`.
-    """
-    creds = _get_credentials(client_secrets_file, credentials_file or "youtube_token.json")
-    return build("youtube", "v3", credentials=creds)
+    env_api_key = str(os.getenv("GOOGLE_API_KEY") or GOOGLE_API_KEY or "").strip()
+    if env_api_key:
+        return env_api_key, "GOOGLE_API_KEY"
+
+    api_key_file = str(
+        runtime_data.get("api_key_file")
+        or payload.get("api_key_file")
+        or DEFAULT_API_KEY_FILE
+    ).strip() or DEFAULT_API_KEY_FILE
+    file_api_key = _read_api_key_file(api_key_file)
+    if file_api_key:
+        return file_api_key, api_key_file
+
+    raise ValueError(
+        f"No Google API key found. Provide --api-key, set GOOGLE_API_KEY, or place the key in {api_key_file}."
+    )
+
+
+def _build_service(*, runtime_data: dict[str, Any], payload: dict[str, Any]) -> tuple[Any, str]:
+    """Return an authenticated YouTube API service object using API-key auth."""
+    api_key, api_key_source = _resolve_api_key(runtime_data=runtime_data, payload=payload)
+    return build("youtube", "v3", developerKey=api_key), api_key_source
 
 
 def _coerce_max_results(value: Any, default: int = 5, minimum: int = 1, maximum: int = 50) -> int:
@@ -189,18 +200,25 @@ def _error_payload(message: str, **extra: Any) -> str:
     return _json_dumps(payload)
 
 
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _plan_query_payload(query: str, *, feedback: list[dict[str, Any]] | None = None) -> tuple[dict | None, str]:
     import llm
 
     system_instructions = (
         "You are a YouTube API planner. Given a user request, return a single JSON object describing the action to take. "
         "Allowed actions: 'api' only. "
+        "This tool uses API key auth (not OAuth), so prefer public read-only list calls. "
         "Return only one JSON object using these fields: action, "
         "resource, method, params, body, media_file, media_mime, page_all, max_pages. "
         "The JSON object MUST be the first and only JSON object in your response. Examples:\n"
         "{\"action\":\"api\",\"resource\":\"search\",\"method\":\"list\",\"params\":{\"part\":\"snippet\",\"q\":\"funny cats\",\"type\":\"video\",\"maxResults\":5}}\n"
-        "{\"action\":\"api\",\"resource\":\"channels\",\"method\":\"list\",\"params\":{\"part\":\"snippet,contentDetails,statistics\",\"mine\":true,\"maxResults\":10}}\n"
-        "{\"action\":\"api\",\"resource\":\"playlists\",\"method\":\"list\",\"params\":{\"part\":\"snippet,contentDetails\",\"mine\":true,\"maxResults\":10}}\n"
+        "{\"action\":\"api\",\"resource\":\"channels\",\"method\":\"list\",\"params\":{\"part\":\"snippet,contentDetails,statistics\",\"id\":\"UC_x5XG1OV2P6uZZ5FSM9Ttw\"}}\n"
+        "{\"action\":\"api\",\"resource\":\"videos\",\"method\":\"list\",\"params\":{\"part\":\"snippet,contentDetails,statistics\",\"id\":\"dQw4w9WgXcQ\"}}\n"
         "Map every request to the correct YouTube Data API resource and method."
     )
 
@@ -246,6 +264,24 @@ def _validate_planned_payload(payload: dict) -> str | None:
     media_file = payload.get("media_file")
     if media_file is not None and not str(media_file).strip():
         return "api action `media_file` must be a non-empty string when provided."
+    return None
+
+
+def _validate_api_key_action(payload: dict) -> str | None:
+    method = str(payload.get("method", "")).strip().lower()
+    if method != "list":
+        return "API-key mode supports read-only *.list methods only."
+
+    if str(payload.get("media_file") or "").strip():
+        return "API-key mode does not support media uploads."
+
+    if payload.get("body") not in (None, {}):
+        return "API-key mode does not support request bodies."
+
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    if _is_truthy(params.get("mine")) or _is_truthy(params.get("forMine")):
+        return "API-key mode does not support mine=true/forMine=true. Use explicit public IDs instead."
+
     return None
 
 
@@ -371,17 +407,23 @@ def _execute_generic_api_action(service, payload: dict) -> dict[str, Any]:
 def _execute_structured_payload(payload: dict, *, runtime_data: dict[str, Any]) -> str:
     action = str(payload.get("action", "")).strip().lower()
     if action == "api":
-        client_secrets = runtime_data.get("client_secrets") or payload.get("client_secrets")
-        creds_file = runtime_data.get("credentials_file") or payload.get("credentials_file") or "youtube_token.json"
+        api_key_mode_error = _validate_api_key_action(payload)
+        if api_key_mode_error:
+            return _error_payload("api action failed", error=api_key_mode_error)
+
         try:
-            service = _build_service(client_secrets_file=client_secrets, credentials_file=creds_file)
+            service, api_key_source = _build_service(runtime_data=runtime_data, payload=payload)
         except Exception as exc:
-            return _error_payload("api action requires OAuth client secrets via `--client-secrets` or a valid credentials file.", error=str(exc))
+            return _error_payload(
+                "api action requires a Google API key via --api-key, GOOGLE_API_KEY, or --api-key-file.",
+                error=str(exc),
+                api_key_file=str(runtime_data.get("api_key_file") or DEFAULT_API_KEY_FILE),
+            )
         try:
             result = _execute_generic_api_action(service, payload)
         except Exception as exc:
             return _error_payload("api action failed", error=str(exc))
-        return _json_dumps({"ok": True, "result": result})
+        return _json_dumps({"ok": True, "auth_mode": "api_key", "api_key_source": api_key_source, "result": result})
 
     return _error_payload(f"Unsupported action: {action}")
 
@@ -498,8 +540,8 @@ def access_youtube(query: str = "") -> str:
     Examples:
     - Call search.list with params part=snippet, q="python automation", type=video, maxResults=5.
     - Call videos.list with params part=snippet,contentDetails,statistics and id=dQw4w9WgXcQ.
-    - Call channels.list with params part=snippet,contentDetails,statistics, mine=true, maxResults=10.
-    - Call playlists.list with params part=snippet,contentDetails, mine=true, maxResults=15.
+    - Call channels.list with params part=snippet,contentDetails,statistics and id=UC_x5XG1OV2P6uZZ5FSM9Ttw.
+    - API-key mode supports public, read-only *.list requests.
     """
     output = _run_query_action(query, runtime_data={})
     parsed_output = _parse_json_response(output)
@@ -529,10 +571,10 @@ def access_youtube(query: str = "") -> str:
 
 def _build_runtime_data(args: argparse.Namespace) -> dict[str, Any]:
     runtime_data: dict[str, Any] = {}
-    if getattr(args, "client_secrets", None):
-        runtime_data["client_secrets"] = args.client_secrets
-    if getattr(args, "credentials_file", None):
-        runtime_data["credentials_file"] = args.credentials_file
+    if getattr(args, "api_key", None):
+        runtime_data["api_key"] = args.api_key
+    if getattr(args, "api_key_file", None):
+        runtime_data["api_key_file"] = args.api_key_file
     return runtime_data
 
 
@@ -565,8 +607,12 @@ def _main():
     )
     parser.add_argument("-f", "--file", dest="query_file", help="Path to a plain-text query file")
     parser.add_argument("--smoke", action="store_true", help="Run the built-in smoke suite")
-    parser.add_argument("--client-secrets", help="Path to OAuth client_secrets.json")
-    parser.add_argument("--credentials-file", help="Where to save/load OAuth token", default="youtube_token.json")
+    parser.add_argument("--api-key", help="Google API key")
+    parser.add_argument(
+        "--api-key-file",
+        help="Path to a text file containing the Google API key",
+        default=DEFAULT_API_KEY_FILE,
+    )
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output when possible")
     args = parser.parse_args()
 
