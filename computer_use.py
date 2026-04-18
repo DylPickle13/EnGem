@@ -1,13 +1,18 @@
 import json
 import logging
+import os
+import shutil
+import subprocess
 import time
 import threading
+from urllib.parse import urlparse
+from urllib.request import urlopen
 from pathlib import Path
 from typing import Any
 from google import genai
 from google.genai import types
 from google.genai.types import Content, Part
-from playwright.sync_api import Browser, Page, Playwright, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Page, Playwright, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from config import (
     BOT_RUNTIME_STATE_PATH,
@@ -20,6 +25,34 @@ from config import (
 )
 from api_backoff import call_with_exponential_backoff
 
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _get_float_env(name: str, default: float, *, minimum: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    if parsed < minimum:
+        return default
+    return parsed
+
 BROWSER_FILE = Path(__file__).parent / "agent_instructions/browser.md"
 SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1080
@@ -29,9 +62,34 @@ ALT_MODEL_NAME = ""
 DEBUG_SCROLL = False
 DEFAULT_SCROLL_DELTA = 600
 DEFAULT_DOCUMENT_SCROLL_AMOUNT = 800
+DEFAULT_CHROME_USER_DATA_DIR = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+CHROME_USER_DATA_DIR = Path(os.getenv("BROWSER_CHROME_USER_DATA_DIR", str(DEFAULT_CHROME_USER_DATA_DIR))).expanduser()
+CHROME_PROFILE_DIRECTORY = os.getenv("BROWSER_CHROME_PROFILE_DIRECTORY", "Default").strip() or "Default"
+CHROME_CHANNEL = os.getenv("BROWSER_CHROME_CHANNEL", "chrome").strip() or "chrome"
+BROWSER_CDP_ENDPOINT = os.getenv("BROWSER_CDP_ENDPOINT", "http://127.0.0.1:9222").strip() or "http://127.0.0.1:9222"
+BROWSER_LAUNCH_MODE = os.getenv("BROWSER_LAUNCH_MODE", "auto").strip().lower() or "auto"
+BROWSER_CDP_PREFER_ATTACH = _get_bool_env("BROWSER_CDP_PREFER_ATTACH", False)
+BROWSER_CDP_ATTACH_ON_PROFILE_LOCK = _get_bool_env("BROWSER_CDP_ATTACH_ON_PROFILE_LOCK", True)
+BROWSER_CDP_OPEN_NEW_TAB = _get_bool_env("BROWSER_CDP_OPEN_NEW_TAB", True)
+DEFAULT_CHROME_BINARY_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+DEFAULT_CDP_COMPANION_USER_DATA_DIR = Path.home() / "Library" / "Application Support" / "Google" / "Chrome-CDP-Automation"
+BROWSER_CDP_AUTO_LAUNCH_COMPANION = _get_bool_env("BROWSER_CDP_AUTO_LAUNCH_COMPANION", True)
+BROWSER_CDP_CLONE_DEFAULT_PROFILE_ON_FIRST_RUN = _get_bool_env(
+    "BROWSER_CDP_CLONE_DEFAULT_PROFILE_ON_FIRST_RUN",
+    True,
+)
+BROWSER_CDP_COMPANION_USER_DATA_DIR = Path(
+    os.getenv("BROWSER_CDP_COMPANION_USER_DATA_DIR", str(DEFAULT_CDP_COMPANION_USER_DATA_DIR))
+).expanduser()
+BROWSER_CDP_COMPANION_PROFILE_DIRECTORY = os.getenv("BROWSER_CDP_COMPANION_PROFILE_DIRECTORY", "Default").strip() or "Default"
+BROWSER_CDP_COMPANION_CHROME_BINARY = os.getenv("BROWSER_CDP_COMPANION_CHROME_BINARY", DEFAULT_CHROME_BINARY_PATH).strip() or DEFAULT_CHROME_BINARY_PATH
+BROWSER_CDP_CONNECT_TIMEOUT_SECONDS = _get_float_env("BROWSER_CDP_CONNECT_TIMEOUT_SECONDS", 12.0, minimum=1.0)
+BROWSER_CDP_CONNECT_RETRY_INTERVAL_SECONDS = _get_float_env("BROWSER_CDP_CONNECT_RETRY_INTERVAL_SECONDS", 0.25, minimum=0.1)
+_CDP_COMPANION_PROFILE_MARKER_NAME = ".engem_cdp_profile_initialized"
 
-_PLAYWRIGHT_INSTANCES: dict[int, Playwright] = {}
-_BROWSER_INSTANCES: dict[int, Browser] = {}
+_NON_OWNED_BROWSER_HANDLES: set[int] = set()
+_OWNED_PAGE_HANDLES: set[int] = set()
+_NON_OWNED_PAGE_HANDLES: set[int] = set()
 BOT_RUNTIME_STATE_FILE = Path(BOT_RUNTIME_STATE_PATH)
 _GENERATE_CONTENT_CONFIG_FIELDS = set(getattr(types.GenerateContentConfig, "__annotations__", {}).keys()) | set(
     dir(types.GenerateContentConfig)
@@ -405,6 +463,29 @@ def _wait_for_load_state_with_cancellation(
                 return
 
 
+def _navigate_history_with_graceful_timeout(page: Page, *, direction: str, timeout_ms: int = 8000) -> dict:
+    before_url = page.url
+    navigate = page.go_back if direction == "back" else page.go_forward
+
+    try:
+        navigate(wait_until="domcontentloaded", timeout=timeout_ms)
+        return {}
+    except PlaywrightTimeoutError:
+        # Some sites keep loading trackers/resources and can exceed navigation
+        # waits even though the history change already happened.
+        after_url = page.url
+        if after_url != before_url:
+            return {
+                "warning": f"{direction} navigation timed out waiting for domcontentloaded; URL changed.",
+                "from_url": before_url,
+                "to_url": after_url,
+            }
+        return {
+            "warning": f"{direction} navigation timed out with no URL change.",
+            "url": before_url,
+        }
+
+
 def _execute_single_action(
     page: Page,
     fname: str,
@@ -617,12 +698,10 @@ def _execute_single_action(
         return {}
 
     if fname == "go_back":
-        page.go_back()
-        return {}
+        return _navigate_history_with_graceful_timeout(page, direction="back")
 
     if fname == "go_forward":
-        page.go_forward()
-        return {}
+        return _navigate_history_with_graceful_timeout(page, direction="forward")
 
     if fname in {"reload", "refresh_page"}:
         page.reload()
@@ -776,37 +855,349 @@ def create_model_config(inference_mode: str | None = None) -> types.GenerateCont
     )
 
 
-def setup_browser() -> tuple[Playwright, Browser, Page]:
-    """
-    Always start a fresh Playwright and Browser for the current thread.
-    This avoids reusing existing browser instances while keeping the pattern
-    that each browser is created on the calling thread.
-    """
-    tid = threading.get_ident()
+def close_browser_handle(browser_handle: Browser | BrowserContext | None) -> None:
+    if browser_handle is None:
+        return
 
-    # If there are any leftover instances for this thread, close them first
-    # to ensure we don't reuse or leak resources.
-    old_br = _BROWSER_INSTANCES.pop(tid, None)
-    old_pw = _PLAYWRIGHT_INSTANCES.pop(tid, None)
-    if old_br:
-        try:
-            old_br.close()
-        except Exception:
-            pass
-    if old_pw:
-        try:
-            old_pw.stop()
-        except Exception:
-            pass
+    handle_id = id(browser_handle)
+    if handle_id in _NON_OWNED_BROWSER_HANDLES:
+        _NON_OWNED_BROWSER_HANDLES.discard(handle_id)
+        return
 
+    browser_handle.close()
+
+
+def _mark_page_owned(page: Page) -> None:
+    page_id = id(page)
+    _NON_OWNED_PAGE_HANDLES.discard(page_id)
+    _OWNED_PAGE_HANDLES.add(page_id)
+
+
+def _mark_page_non_owned(page: Page) -> None:
+    page_id = id(page)
+    _OWNED_PAGE_HANDLES.discard(page_id)
+    _NON_OWNED_PAGE_HANDLES.add(page_id)
+
+
+def close_page_handle(page_handle: Page | None) -> None:
+    if page_handle is None:
+        return
+
+    page_id = id(page_handle)
+    if page_id in _NON_OWNED_PAGE_HANDLES:
+        _NON_OWNED_PAGE_HANDLES.discard(page_id)
+        return
+
+    if page_id not in _OWNED_PAGE_HANDLES:
+        return
+
+    _OWNED_PAGE_HANDLES.discard(page_id)
+    try:
+        page_handle.close()
+    except Exception:
+        # A page may already be closed by navigation/teardown logic.
+        pass
+
+
+def _is_profile_lock_error(error: Exception) -> bool:
+    message = str(error).lower()
+    markers = (
+        "user data directory is already in use",
+        "profile appears to be in use",
+        "already in use by another instance of chromium",
+        "failed to create a processsingleton",
+        "singleton lock",
+        "another process",
+        "file exists (17)",
+        "already running",
+        "cannot read and write to its data directory",
+    )
+    return any(marker in message for marker in markers)
+
+
+def _build_cdp_enablement_hint() -> str:
+    return (
+        "To attach to an existing Chrome session, launch Chrome with remote debugging enabled and "
+        f"set BROWSER_CDP_ENDPOINT if needed (current: {BROWSER_CDP_ENDPOINT}).\n"
+        "Chrome 136+ requires remote debugging to use a non-default user-data-dir.\n"
+        f"Companion CDP profile dir in this runtime: {BROWSER_CDP_COMPANION_USER_DATA_DIR}\n"
+        "macOS example:\n"
+        "  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222"
+    )
+
+
+def _build_setup_browser_error(
+    *,
+    persistent_error: Exception | None,
+    cdp_error: Exception | None,
+) -> RuntimeError:
+    lines = ["Could not start a browser session."]
+    if persistent_error is not None:
+        lines.append(f"Persistent profile launch failed: {persistent_error}")
+    if cdp_error is not None:
+        lines.append(f"CDP attach failed: {cdp_error}")
+    lines.append(_build_cdp_enablement_hint())
+    return RuntimeError("\n".join(lines))
+
+
+def _launch_with_persistent_profile(pw: Playwright) -> tuple[BrowserContext, Page]:
+    launch_args = [f"--profile-directory={CHROME_PROFILE_DIRECTORY}", "--start-maximized"]
+    context = pw.chromium.launch_persistent_context(
+        user_data_dir=str(CHROME_USER_DATA_DIR),
+        channel=CHROME_CHANNEL,
+        headless=False,
+        viewport={"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT},
+        args=launch_args,
+    )
+    page = context.pages[-1] if context.pages else context.new_page()
+    _mark_page_owned(page)
+    return context, page
+
+
+def _extract_cdp_port(endpoint: str) -> int:
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"http", "https", "ws", "wss"}:
+        raise ValueError(f"Unsupported BROWSER_CDP_ENDPOINT scheme: {parsed.scheme!r}")
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError(
+            "Auto-launching a CDP companion only supports local endpoints. "
+            f"Current endpoint host: {parsed.hostname!r}"
+        )
+    if parsed.port is None:
+        if parsed.scheme in {"https", "wss"}:
+            return 443
+        return 80
+    return int(parsed.port)
+
+
+def _is_cdp_endpoint_ready(endpoint: str) -> bool:
+    endpoint = endpoint.rstrip("/")
+    if endpoint.startswith("ws://") or endpoint.startswith("wss://"):
+        parsed = urlparse(endpoint)
+        endpoint = f"http://{parsed.hostname}:{parsed.port}/json/version"
+    elif not endpoint.endswith("/json/version"):
+        endpoint = endpoint + "/json/version"
+
+    try:
+        with urlopen(endpoint, timeout=1.5) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def _copy_default_profile_for_cdp_companion() -> None:
+    marker_path = BROWSER_CDP_COMPANION_USER_DATA_DIR / _CDP_COMPANION_PROFILE_MARKER_NAME
+    if marker_path.exists():
+        return
+
+    BROWSER_CDP_COMPANION_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    source_local_state = CHROME_USER_DATA_DIR / "Local State"
+    target_local_state = BROWSER_CDP_COMPANION_USER_DATA_DIR / "Local State"
+    if source_local_state.is_file() and not target_local_state.exists():
+        try:
+            shutil.copy2(source_local_state, target_local_state)
+        except Exception as error:
+            logging.warning("Failed copying Chrome Local State for CDP companion profile: %s", error)
+
+    source_profile_dir = CHROME_USER_DATA_DIR / CHROME_PROFILE_DIRECTORY
+    target_profile_dir = BROWSER_CDP_COMPANION_USER_DATA_DIR / BROWSER_CDP_COMPANION_PROFILE_DIRECTORY
+    if source_profile_dir.is_dir() and not target_profile_dir.exists():
+        try:
+            shutil.copytree(source_profile_dir, target_profile_dir, dirs_exist_ok=True)
+        except Exception as error:
+            logging.warning("Failed cloning Chrome profile directory for CDP companion: %s", error)
+
+    marker_path.write_text("initialized\n", encoding="utf-8")
+
+
+def _launch_cdp_companion_if_needed() -> None:
+    if _is_cdp_endpoint_ready(BROWSER_CDP_ENDPOINT):
+        return
+
+    if not BROWSER_CDP_AUTO_LAUNCH_COMPANION:
+        return
+
+    if BROWSER_CDP_CLONE_DEFAULT_PROFILE_ON_FIRST_RUN:
+        _copy_default_profile_for_cdp_companion()
+    else:
+        BROWSER_CDP_COMPANION_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    cdp_port = _extract_cdp_port(BROWSER_CDP_ENDPOINT)
+    launch_args = [
+        BROWSER_CDP_COMPANION_CHROME_BINARY,
+        f"--remote-debugging-port={cdp_port}",
+        f"--user-data-dir={BROWSER_CDP_COMPANION_USER_DATA_DIR}",
+        f"--profile-directory={BROWSER_CDP_COMPANION_PROFILE_DIRECTORY}",
+        "--start-maximized",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+
+    subprocess.Popen(
+        launch_args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    deadline = time.monotonic() + BROWSER_CDP_CONNECT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if _is_cdp_endpoint_ready(BROWSER_CDP_ENDPOINT):
+            return
+        time.sleep(BROWSER_CDP_CONNECT_RETRY_INTERVAL_SECONDS)
+
+    raise RuntimeError(
+        "CDP companion Chrome was launched but endpoint did not become ready. "
+        f"Endpoint: {BROWSER_CDP_ENDPOINT}"
+    )
+
+
+def _attach_to_running_chrome_via_cdp(pw: Playwright) -> tuple[Browser, Page]:
+    _launch_cdp_companion_if_needed()
+    browser = pw.chromium.connect_over_cdp(BROWSER_CDP_ENDPOINT)
+    contexts = browser.contexts
+    if not contexts:
+        raise RuntimeError("Connected over CDP but no browser contexts were available.")
+
+    context = contexts[0]
+    created_new_page = False
+    if BROWSER_CDP_OPEN_NEW_TAB:
+        page = context.new_page()
+        created_new_page = True
+    else:
+        if context.pages:
+            page = context.pages[-1]
+        else:
+            page = context.new_page()
+            created_new_page = True
+
+    if created_new_page:
+        _mark_page_owned(page)
+    else:
+        _mark_page_non_owned(page)
+
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    return browser, page
+
+
+def _should_try_cdp_first() -> bool:
+    return BROWSER_CDP_PREFER_ATTACH or BROWSER_CDP_AUTO_LAUNCH_COMPANION or _is_cdp_endpoint_ready(BROWSER_CDP_ENDPOINT)
+
+
+def setup_browser() -> tuple[Playwright, Browser | BrowserContext, Page]:
+    """
+    Start a fresh Playwright session and initialize browser automation in one
+    of these modes:
+    - persistent profile launch (local Chrome profile reuse)
+    - CDP attach to an already-running Chrome instance
+    - auto mode with fallback behavior
+
+    Profile launch environment options:
+    - BROWSER_CHROME_USER_DATA_DIR
+    - BROWSER_CHROME_PROFILE_DIRECTORY
+    - BROWSER_CHROME_CHANNEL
+
+    CDP attach environment options:
+    - BROWSER_CDP_ENDPOINT
+    - BROWSER_CDP_PREFER_ATTACH
+    - BROWSER_CDP_ATTACH_ON_PROFILE_LOCK
+    - BROWSER_CDP_OPEN_NEW_TAB
+    - BROWSER_LAUNCH_MODE (auto|persistent|cdp)
+    """
     pw = sync_playwright().start()
-    br = pw.chromium.launch(headless=False)
 
-    # Do not store the new instances for reuse — callers should close them
-    # when finished. Returning fresh instances ensures no reuse occurs.
-    context = br.new_context(viewport={"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT})
-    page = context.new_page()
-    return pw, br, page
+    launch_mode = BROWSER_LAUNCH_MODE
+    if launch_mode not in {"auto", "persistent", "cdp"}:
+        launch_mode = "auto"
+
+    if launch_mode == "cdp":
+        try:
+            browser, page = _attach_to_running_chrome_via_cdp(pw)
+            _NON_OWNED_BROWSER_HANDLES.add(id(browser))
+            return pw, browser, page
+        except Exception as cdp_error:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            raise _build_setup_browser_error(persistent_error=None, cdp_error=cdp_error) from cdp_error
+
+    if launch_mode == "persistent":
+        try:
+            context, page = _launch_with_persistent_profile(pw)
+            return pw, context, page
+        except Exception as persistent_error:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            raise _build_setup_browser_error(persistent_error=persistent_error, cdp_error=None) from persistent_error
+
+    if launch_mode == "auto" and _should_try_cdp_first():
+        cdp_attach_error: Exception | None = None
+        try:
+            browser, page = _attach_to_running_chrome_via_cdp(pw)
+            _NON_OWNED_BROWSER_HANDLES.add(id(browser))
+            return pw, browser, page
+        except Exception as cdp_error:
+            cdp_attach_error = cdp_error
+            logging.info(
+                "CDP attach failed at '%s'; falling back to persistent profile launch: %s",
+                BROWSER_CDP_ENDPOINT,
+                cdp_error,
+            )
+
+        try:
+            context, page = _launch_with_persistent_profile(pw)
+            return pw, context, page
+        except Exception as persistent_error:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            raise _build_setup_browser_error(
+                persistent_error=persistent_error,
+                cdp_error=cdp_attach_error,
+            ) from persistent_error
+
+    try:
+        context, page = _launch_with_persistent_profile(pw)
+        return pw, context, page
+    except Exception as persistent_error:
+        should_try_cdp = BROWSER_CDP_ATTACH_ON_PROFILE_LOCK and (
+            _is_profile_lock_error(persistent_error)
+            or BROWSER_CDP_AUTO_LAUNCH_COMPANION
+            or _is_cdp_endpoint_ready(BROWSER_CDP_ENDPOINT)
+        )
+        if should_try_cdp:
+            logging.info(
+                "Persistent profile launch failed; trying CDP attach at '%s'.",
+                BROWSER_CDP_ENDPOINT,
+            )
+            try:
+                browser, page = _attach_to_running_chrome_via_cdp(pw)
+                _NON_OWNED_BROWSER_HANDLES.add(id(browser))
+                return pw, browser, page
+            except Exception as cdp_error:
+                try:
+                    pw.stop()
+                except Exception:
+                    pass
+                raise _build_setup_browser_error(
+                    persistent_error=persistent_error,
+                    cdp_error=cdp_error,
+                ) from cdp_error
+
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        raise _build_setup_browser_error(persistent_error=persistent_error, cdp_error=None) from persistent_error
 
 
 def run_agent_loop(
