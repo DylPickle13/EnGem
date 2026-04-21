@@ -14,6 +14,7 @@ from config import (
 	DEFAULT_INFERENCE_MODE,
 	DISCORD_BOT_CHANNELS,
 	DISCORD_BOT_TOKEN,
+	GOOGLE_CALENDAR_ID,
 	INFERENCE_MODE_ALLOWED,
 	INFERENCE_MODE_FLEX,
 	INFERENCE_MODE_STANDARD,
@@ -1089,6 +1090,7 @@ if __name__ == "__main__":
 		logging.exception("Failed to sync skills from folder on startup")
 
 	calendar_thread, calendar_stop_event = calendar_events.check_active_events(
+		calendar_id=GOOGLE_CALENDAR_ID,
 		poll_interval_seconds=5.0,
 		daemon=False,
 		event_processor=_process_calendar_event,

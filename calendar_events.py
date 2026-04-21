@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import logging
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Callable
 
+from config import GOOGLE_API_KEY, GOOGLE_API_KEY_PATH
 from tools.access_google_workspace import _run_gws_command
 
 
@@ -19,9 +22,53 @@ class GoogleWorkspaceAuthError(RuntimeError):
 def _auth_failure_message(details: str) -> str:
 	return (
 		"Google Workspace authentication failed while polling calendar. "
-		"Run `gws auth logout` and then `gws auth login` in a terminal, then restart the bot. "
+		"If you are using API-key auth, ensure GOOGLE_API_KEY is set and GOOGLE_CALENDAR_ID points to a public calendar (not `primary`). "
+		"If you need private calendar access (including `primary`), run `gws auth logout` and then `gws auth login`, then restart the bot. "
 		f"Details: {details or 'No output'}"
 	)
+
+
+def _calendar_not_found_message(calendar_id: str, *, details: str, use_api_key_mode: bool) -> str:
+	base = (
+		f"Google Calendar ID '{calendar_id}' was not found or is not accessible. "
+		"This is not retryable, so calendar polling has been stopped. "
+	)
+	if use_api_key_mode:
+		return (
+			base
+			+ "With API-key auth, the calendar must be public and you must use its exact calendar ID. "
+			+ "To use this private calendar, switch to OAuth via `gws auth login`. "
+			+ f"Details: {details or 'No output'}"
+		)
+	return base + f"Details: {details or 'No output'}"
+
+
+def _read_api_key_file(path_value: Any) -> str:
+	path_text = str(path_value or "").strip()
+	if not path_text:
+		return ""
+
+	key_path = Path(path_text).expanduser()
+	if not key_path.exists():
+		return ""
+
+	try:
+		key_contents = key_path.read_text(encoding="utf-8")
+	except Exception:
+		return ""
+
+	for line in key_contents.splitlines():
+		candidate = line.strip()
+		if candidate:
+			return candidate
+	return ""
+
+
+def _resolve_google_api_key() -> str:
+	env_api_key = str(os.getenv("GOOGLE_API_KEY") or GOOGLE_API_KEY or "").strip()
+	if env_api_key:
+		return env_api_key
+	return _read_api_key_file(GOOGLE_API_KEY_PATH)
 
 
 def _extract_gws_failure_details(result: dict[str, Any]) -> str:
@@ -55,9 +102,15 @@ def _is_gws_auth_error(details: str) -> bool:
 	return (
 		"autherror" in text
 		or "invalid authentication credentials" in text
+		or "no credentials provided" in text
 		or "authentication failed" in text
 		or "unauthorized" in text
 	)
+
+
+def _is_gws_not_found_error(details: str) -> bool:
+	text = (details or "").lower()
+	return "not found" in text or "notfound" in text
 
 
 def _sync_check_active_events(
@@ -108,13 +161,18 @@ def _sync_check_active_events(
 		return None
 
 	now_utc = datetime.now(timezone.utc)
+	api_key = _resolve_google_api_key()
+	normalized_calendar_id = str(calendar_id or "").strip() or "primary"
+	use_api_key_mode = bool(api_key) and normalized_calendar_id.lower() != "primary"
 	params = {
-		"calendarId": calendar_id,
+		"calendarId": normalized_calendar_id,
 		"timeMin": _to_rfc3339_utc(now_utc - timedelta(hours=lookback_hours)),
 		"timeMax": _to_rfc3339_utc(now_utc + timedelta(hours=lookahead_hours)),
 		"singleEvents": True,
 		"orderBy": "startTime",
 	}
+	if use_api_key_mode:
+		params["key"] = api_key
 
 	# Attempt the gws call with retries and exponential backoff.
 	attempt = 0
@@ -135,6 +193,14 @@ def _sync_check_active_events(
 
 		if _is_gws_auth_error(details):
 			raise GoogleWorkspaceAuthError(_auth_failure_message(details))
+		if _is_gws_not_found_error(details):
+			raise GoogleWorkspaceAuthError(
+				_calendar_not_found_message(
+					normalized_calendar_id,
+					details=details,
+					use_api_key_mode=use_api_key_mode,
+				)
+			)
 
 		logging.warning(
 			"gws command failed (attempt %d/%d): %s; command: %s",
@@ -200,6 +266,7 @@ def check_active_events(
 	Returns (thread, stop_event).
 	"""
 	stop_signal = stop_event or threading.Event()
+	handled_event_ids: set[str] = set()
 
 	def _worker() -> None:
 		while not stop_signal.is_set():
@@ -216,6 +283,10 @@ def check_active_events(
 				# Process and delete each active event
 				for ev in active_events:
 					try:
+						event_id = str(ev.get("id") or "").strip()
+						if event_id and event_id in handled_event_ids:
+							continue
+
 						processed = False
 						if event_processor is not None:
 							processed = bool(event_processor(ev))
@@ -226,10 +297,17 @@ def check_active_events(
 						if not processed:
 							continue
 
-						event_id = ev.get("id")
 						if not event_id:
 							logging.warning("Skipping event without id: %s", ev)
 							continue
+
+						api_key = _resolve_google_api_key()
+						use_api_key_mode = bool(api_key) and str(calendar_id or "").strip().lower() != "primary"
+						if use_api_key_mode:
+							# API-key access is read-only for public calendars; mark handled instead of delete.
+							handled_event_ids.add(event_id)
+							continue
+
 						params = {"calendarId": calendar_id, "eventId": event_id}
 						delete_result = _run_gws_command(
 							["calendar", "events", "delete", "--params", json.dumps(params)], runtime_data={}, timeout=timeout_seconds
