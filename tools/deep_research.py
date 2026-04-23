@@ -1,4 +1,3 @@
-import os
 import sys
 import time
 from pathlib import Path
@@ -22,7 +21,7 @@ def deep_research(query: str) -> str:
         interaction = call_with_exponential_backoff(
             lambda: client.interactions.create(
                 input=query,
-                agent="deep-research-pro-preview-12-2025",
+                agent="deep-research-preview-04-2026",
                 background=True,
             ),
             description="Gemini deep research start",
